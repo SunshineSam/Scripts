@@ -532,7 +532,7 @@ end {
             Store-RecoveryKey -v $blv
         }
         # Backup to AD if set
-        if ($UpdateRecoveryKeys) {
+        if ($UpdateRecoveryKeys -and $BackupToAD) {
             Write-Log "INFO" "Backing up $drive recovery key to Intune/AD"
             Backup-KeyToAD -v $blv
         }
