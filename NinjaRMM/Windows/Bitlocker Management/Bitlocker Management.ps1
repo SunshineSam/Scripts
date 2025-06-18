@@ -1,9 +1,10 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-19-2025
+    Last Edit: 06-18-2025
     
     Note:
+    06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic
     06-02-2025: Addressed a sanitization issue that prevented non-os drives from being disabled individually without the OS Drive
     05-28-2025: Address suspend logic and validated 
     05-27-2025: Status (Custom Field, Secure Field) update for all fixed drives, regardless of management as a safety precaution. Zero overriding of keys, etc.
@@ -206,7 +207,7 @@ begin {
     
     # Validate SuspensionRebootCount
     if ($SuspensionRebootCount -lt 0 -or $SuspensionRebootCount -gt 10) {
-        Write-Host "[WARNING] SuspensionRebootCount must be between 0 and 10; setting to 1"
+        Write-Host "[WARNING] SuspensionRebootCount must be between 1 and 10; setting to 1"
         $SuspensionRebootCount = 1
     }
     
@@ -288,7 +289,6 @@ begin {
     # BitLocker Protection Status sanitization
     if ($BitLockerProtection -eq "Disable") {
         Write-Host "[INFO] Protection action 'Disable' selected; validating possible conflicting settings"
-        $BackupToAD = $false # disable AD backup
         if ($RecoveryKeyAction -in @("Ensure", "Rotate")) {
             Write-Host "[WARNING] RecoveryKeyAction was '$RecoveryKeyAction', but 'Disable' only allows 'Remove'. Setting RecoveryKeyAction to 'Remove'."
             $RecoveryKeyAction = "Remove"
@@ -479,18 +479,18 @@ begin {
         param($volume)
         # Log only if not suppressed and not already logged for this drive
         if (-not $script:SuppressRecoveryProtectorScanLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
-            Write-Log "INFO" "Scanning for valid RecoveryPassword protectors for $($volume.MountPoint)..."
+            Write-Log "INFO" "Scanning for valid RecoveryPassword protectors..."
         }
         if (-not $volume.KeyProtector) {
             if (-not $script:SuppressRecoveryProtectorScanLog) {
-                Write-Log "WARNING" "No KeyProtector array found on volume $($volume.MountPoint)"
+                Write-Log "WARNING" "No KeyProtector array found"
             }
             return @()
         }
         $candidates = $volume.KeyProtector | Where-Object { $_.KeyProtectorType -ieq 'RecoveryPassword' }
         if (-not $candidates) {
             if (-not $script:SuppressRecoveryProtectorScanLog) {
-                Write-Log "INFO" "No RecoveryPassword entries found for $($volume.MountPoint)"
+                Write-Log "INFO" "No RecoveryPassword entries found"
             }
             return @()
         }
@@ -501,12 +501,12 @@ begin {
             }
             else {
                 if (-not $script:SuppressRecoveryProtectorScanLog) {
-                    Write-Log "WARNING" "Ignoring invalid protector ID: $($keypair.KeyProtectorId) for $($volume.MountPoint)"
+                    Write-Log "WARNING" "Ignoring invalid protector ID: $($keypair.KeyProtectorId)"
                 }
             }
         }
         if ($valid.Count -gt 0 -and -not $script:SuppressRecoveryProtectorScanLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
-            Write-Log "INFO" "Found $($valid.Count) valid recovery key protector(s) for $($volume.MountPoint)"
+            Write-Log "INFO" "Found $($valid.Count) valid recovery key protector(s)"
         }
         return $valid
     }
@@ -514,7 +514,7 @@ begin {
     # Helper function: Ensure a recovery key exists (only 1)
     function Ensure-RecoveryKey {
         param($volume)
-        Write-Log "INFO" "Ensuring single numeric recovery protector for $($volume.MountPoint)"
+        Write-Log "INFO" "Ensuring single numeric recovery protector"
         try {
             $maxAttempts = 3
             $attempt = 0
@@ -530,7 +530,7 @@ begin {
                 $latestProtector = $existingProtectors | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
                 foreach ($protector in $existingProtectors | Where-Object { $_.KeyProtectorId -ne $latestProtector.KeyProtectorId }) {
                     Remove-BitLockerKeyProtector -MountPoint $volume.MountPoint -KeyProtectorId $protector.KeyProtectorId -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
-                    Write-Log "INFO" "Removed duplicate protector $($protector.KeyProtectorId) for $($volume.MountPoint)"
+                    Write-Log "INFO" "Removed duplicate protector $($protector.KeyProtectorId)"
                 }
                 # Refresh volume state
                 $volume = Get-BitLockerVolume -MountPoint $volume.MountPoint
@@ -541,14 +541,14 @@ begin {
             }
             
             if ($existingProtectors.Count -gt 1) {
-                Write-Log "ERROR" "Failed to reduce recovery protectors to one after $maxAttempts attempts for $($volume.MountPoint)"
+                Write-Log "ERROR" "Failed to reduce recovery protectors to one after $maxAttempts attempts"
                 return
             }
             
             # If one protector exists, confirm it and exit
             if ($existingProtectors.Count -eq 1) {
                 if (-not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
-                    Write-Log "INFO" "Confirmed 1 valid recovery key protector for $($volume.MountPoint)"
+                    Write-Log "INFO" "Confirmed 1 valid recovery key protector"
                     $script:LoggedRecoveryFound[$volume.MountPoint] = $true
                 }
                 return
@@ -557,10 +557,10 @@ begin {
             # Add a new recovery protector if none exist
             $result = Add-BitLockerKeyProtector -MountPoint $volume.MountPoint -RecoveryPasswordProtector -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue
             $script:NumericProtectorCreated = $true
-            Write-Log "SUCCESS" "Numeric recovery protector added for $($volume.MountPoint)"
+            Write-Log "SUCCESS" "Numeric recovery protector added"
         }
         catch {
-            Write-Log "ERROR" "Failed to ensure recovery key for $($volume.MountPoint): $_"
+            Write-Log "ERROR" "Failed to ensure recovery key: $_"
         }
     }
 
@@ -764,63 +764,6 @@ begin {
         }
     }
     
-    # Helper function: Save key to AD & AAD if applicable
-    function Backup-KeyToAD {
-        param($volume)
-        Write-Log "INFO" "Determining backup location for recovery key"
-        
-        # Get BitLocker protectors
-        $protectors = Get-ValidRecoveryProtectors -v $volume
-        if (-not $protectors) {
-            Write-Log "WARNING" "No numeric recovery protectors found; nothing to back up"
-            return
-        }
-        
-        # Check join status with dsregcmd.exe
-        $DSRegOutput = [PSObject]::New()
-        & dsregcmd.exe /status | Where-Object { $_ -match ' : ' } | ForEach-Object {
-            $Item = $_.Trim() -split '\s:\s'
-            $DSRegOutput | Add-Member -MemberType NoteProperty -Name $($Item[0] -replace '[:\s]', '') -Value $Item[1] -ErrorAction SilentlyContinue
-        }
-        
-        # Backup logic based on join status
-        if ($DSRegOutput.AzureADJoined -eq 'YES') {
-            Write-Log "INFO" "Device is AAD-joined; backing up to AAD"
-            foreach ($keypair in $protectors) {
-                Write-Log "INFO" "Backing up protector ID $($keypair.KeyProtectorId) to AAD"
-                try {
-                    BackupToAAD-BitLockerKeyProtector `
-                        -MountPoint $volume.MountPoint `
-                        -KeyProtectorId $keypair.KeyProtectorId `
-                        -ErrorAction Stop
-                    Write-Log "SUCCESS" "Protector ID $($keypair.KeyProtectorId) backed up to AAD"
-                }
-                catch {
-                    Write-Log "ERROR" "Failed to back up protector $($keypair.KeyProtectorId) to AAD: $_"
-                }
-            }
-        }
-        elseif ($DSRegOutput.DomainJoined -eq 'YES') {
-            Write-Log "INFO" "Device is domain-joined; backing up to AD"
-            foreach ($keypair in $protectors) {
-                Write-Log "INFO" "Backing up protector ID $($keypair.KeyProtectorId) to AD"
-                try {
-                    Backup-BitLockerKeyProtector `
-                        -MountPoint $volume.MountPoint `
-                        -KeyProtectorId $keypair.KeyProtectorId `
-                        -ErrorAction Stop
-                    Write-Log "SUCCESS" "Protector ID $($keypair.KeyProtectorId) backed up to AD"
-                }
-                catch {
-                    Write-Log "ERROR" "Failed to back up protector $($keypair.KeyProtectorId) to AD: $_"
-                }
-            }
-        }
-        else {
-            Write-Log "WARNING" "Device is not joined to AD or AAD; skipping backup"
-        }
-    }
-    
     # Helper function: Check TPM pending status
     function Test-TpmPending {
         param($volume)
@@ -838,10 +781,10 @@ begin {
         param($volume)
         # Check if the volume is the OS drive
         if ($volume.MountPoint -ne $osDrive) {
-            Write-Log "WARNING" "TPM protectors can only be used on the OS drive. Skipping for $($volume.MountPoint)"
+            Write-Log "WARNING" "TPM protectors can only be used on the OS drive. Skipping"
             return
         }
-        Write-Log "INFO" "Ensuring TPM protector exists for $($volume.MountPoint)"
+        Write-Log "INFO" "Ensuring TPM protector exists"
         # Sublogic: Verify TPM availability
         try {
             $tpm = Get-Tpm
@@ -978,7 +921,7 @@ begin {
             $latestProtector = $protectors | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
             # Format the key information in a single-line string
             $keyInfo = "$($volume.MountPoint) - Protector ID: $($latestProtector.KeyProtectorId) | Recovery Key: $($latestProtector.RecoveryPassword)"
-            Write-Log "INFO" "Collected recovery key for $($volume.MountPoint)"
+            Write-Log "INFO" "Collected recovery key"
             # Overwrite the recovery keys collection (no appending)
             $script:RecoveryKeys[$volume.MountPoint] = $keyInfo
             # Clear sensitive param per call
@@ -989,42 +932,118 @@ begin {
             $script:RecoveryKeys[$volume.MountPoint] = "Drive: $($volume.MountPoint) - None"
         }
     }
-
+    
+    # Helper function: Save key to AD & AAD if applicable
+    function Backup-KeyToAD {
+        param($volume)
+        
+        # Turn off all Write-Log calls inside the function
+        $script:SuppressRecoveryProtectorScanLog = $true
+        # Call with no Get-ValidRecoveryProtectors logging 
+        $protectors = Get-ValidRecoveryProtectors -v $volume
+        # Turn logging back on
+        $script:SuppressRecoveryProtectorScanLog = $false
+        
+        if (-not $protectors) {
+            Write-Log "WARNING" "No numeric recovery protectors found; nothing to back up"
+            return
+        }
+        
+        # Check join status with dsregcmd.exe
+        $DSRegOutput = [PSObject]::New()
+        & dsregcmd.exe /status | Where-Object { $_ -match ' : ' } | ForEach-Object {
+            $Item = $_.Trim() -split '\s:\s'
+            $DSRegOutput | Add-Member -MemberType NoteProperty -Name $($Item[0] -replace '[:\s]', '') -Value $Item[1] -ErrorAction SilentlyContinue
+        }
+        
+        # Backup logic based on join status
+        if ($DSRegOutput.AzureADJoined -eq 'YES') {
+            Write-Log "INFO" "Device is AAD-joined; backing up to AAD"
+            foreach ($keypair in $protectors) {
+                Write-Log "INFO" "Backing up protector ID $($keypair.KeyProtectorId) to AAD"
+                try {
+                    BackupToAAD-BitLockerKeyProtector `
+                        -MountPoint $volume.MountPoint `
+                        -KeyProtectorId $keypair.KeyProtectorId `
+                        -ErrorAction Stop
+                    Write-Log "SUCCESS" "Protector ID $($keypair.KeyProtectorId) backed up to AAD"
+                }
+                catch {
+                    Write-Log "ERROR" "Failed to back up protector $($keypair.KeyProtectorId) to AAD: $_"
+                }
+            }
+        }
+        elseif ($DSRegOutput.DomainJoined -eq 'YES') {
+            Write-Log "INFO" "Device is domain-joined; backing up to AD"
+            foreach ($keypair in $protectors) {
+                Write-Log "INFO" "Backing up protector ID $($keypair.KeyProtectorId) to AD"
+                try {
+                    Backup-BitLockerKeyProtector `
+                        -MountPoint $volume.MountPoint `
+                        -KeyProtectorId $keypair.KeyProtectorId `
+                        -ErrorAction Stop
+                    Write-Log "SUCCESS" "Protector ID $($keypair.KeyProtectorId) backed up to AD"
+                }
+                catch {
+                    Write-Log "ERROR" "Failed to back up protector $($keypair.KeyProtectorId) to AD: $_"
+                }
+            }
+        }
+        else {
+            Write-Log "WARNING" "Device is not joined to AD or AAD; skipping backup"
+        }
+    }
+    
     # Helper function: Retrieve the remaining reboot count for a suspended BitLocker volume
     function Get-RebootCount {
         param (
             [Parameter(Mandatory)][string]$MountPoint
         )
         try {
-            # Feed the direct mount point string into the filter
             $driveLetter = $MountPoint
-            
-            # Retrieve the CIM instance for the specified drive letter
             $volume = Get-CimInstance `
-                -Namespace "ROOT/CIMV2/Security/MicrosoftVolumeEncryption" `
+                -Namespace 'ROOT/CIMV2/Security/MicrosoftVolumeEncryption' `
                 -Class Win32_EncryptableVolume `
-                -Filter "DriveLetter='$driveLetter'" -ErrorAction Stop
+                -Filter "DriveLetter='$driveLetter'" `
+                -ErrorAction Stop
             
-            if ($volume) {
-                # Invoke the GetSuspendCount method to get the suspension count
-                $result = $volume | Invoke-CimMethod -MethodName "GetSuspendCount" -ErrorAction Stop
-                if ($result.ReturnValue -eq 0) {
-                    # Return the SuspendCount if the method call was successful
-                    Write-Log "INFO" "Drive $MountPoint Reboot Count: $($result.SuspendCount)"
-                    return $result.SuspendCount
-                }
-                else {
-                    Write-Log "WARNING" "GetSuspendCount returned non-zero value: $($result.ReturnValue) for $MountPoint"
-                    return 0
-                }
-            }
-            else {
+            if (-not $volume) {
                 Write-Log "WARNING" "No encryptable volume found for drive letter $driveLetter"
                 return $null
             }
+            
+            $result = $volume | Invoke-CimMethod -MethodName GetSuspendCount -ErrorAction Stop
+            
+            # Stored return values
+            $returnValue    = $result.ReturnValue
+            $suspendedCount = $result.SuspendCount
+            
+            switch ($returnValue) {
+                0 {
+                    if ($suspendedCount -gt 0) {
+                        # real suspend with N reboots left
+                        Write-Log "INFO" "Drive $MountPoint Reboot Count: $suspendedCount"
+                        return $count
+                    }
+                    else {
+                        # suspendedCount == 0 -> indefinitely suspended
+                        Write-Log "INFO" "Drive $MountPoint is indefinitely suspended (SuspendCount=0)."
+                        return 0
+                    }
+                }
+                2147942450 {
+                    # enabled and not suspended
+                    Write-Log "INFO" "Drive $MountPoint is not suspended"
+                    return 0
+                }
+                default {
+                    Write-Log "ERROR" "GetSuspendCount returned: $returnValue for $MountPoint"
+                    return 0
+                }
+            }
         }
         catch {
-            Write-Log "ERROR" "Error retrieving suspend count for $(MountPoint): $_"
+            Write-Log "ERROR" "Failed retrieving state/count for ${MountPoint}: $_"
             return $null
         }
     }
@@ -1391,13 +1410,6 @@ process {
             Get-VolumeObject
         }
         
-        # Backup to AD if set
-        if ($BackupToAD) {
-            Write-Host "`n=== AD/Intune Key Backup ==="
-            Write-Log "INFO" "Backing up key for $MountPoint"
-            Backup-KeyToAD -v $blv
-        }
-        
         # Separate each volume in output
         Write-Host ""
         
@@ -1456,7 +1468,11 @@ end {
                             if ($null -ne $rebootCount -and $rebootCount -gt 0) {
                                 '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     Reboot(s) Left: ' + $rebootCount
                             }
-                            # Dont include reboot count if 0
+                            # Indefinitely suspended
+                            elseif ($null -ne $rebootCount -and $rebootCount -eq 0) {
+                                '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     Indefinitely'
+                            }
+                            # Dont include reboot count if anything else
                             else {
                                 '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended'
                             }
@@ -1516,15 +1532,21 @@ end {
     }
     
     # Collect recovery keys for all fixed drives
+    Write-Host "`n=== Recovery Key Backup ==="
     foreach ($drive in $allFixedDrives) {
         $blv = Get-BitLockerVolume -MountPoint $drive -ErrorAction SilentlyContinue
         if ($blv) {
             Store-RecoveryKey -v $blv
         }
+        # Backup to AD if set
+        if ($BackupToAD) {
+            Write-Log "INFO" "Backing up $drive recovery key to Intune/AD"
+            Backup-KeyToAD -v $blv
+        }
     }
     
     # Store all recovery keys in single-line format
-    Write-Log "INFO" "Storing all collected recovery keys in secure field"
+    Write-Log "INFO" "Storing recovery key(s) in secure field"
     try {
         if ($script:RecoveryKeys.Count -eq 0) {
             Write-Log "INFO" "No recovery keys collected; setting secure field to N/A"
