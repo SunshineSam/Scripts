@@ -4,9 +4,10 @@
     Last Edit: 06-18-2025
     
     Note:
+    06-28-2025: @seravous in the NinjaOne discord helped dtermine an unlikely outcome that was not accounted for. Also addresses the possibillity of more than one numerical password during a enablement/resume process in with a niche initial starting point.
     06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic
     06-02-2025: Addressed a sanitization issue that prevented non-os drives from being disabled individually without the OS Drive
-    05-28-2025: Address suspend logic and validated 
+    05-28-2025: Address suspend logic and validated
     05-27-2025: Status (Custom Field, Secure Field) update for all fixed drives, regardless of management as a safety precaution. Zero overriding of keys, etc.
     05-23-2025: Cleanup, big fixes, and consistency, testing
     05-22-2025: Rewrite for multi-volume handling, improved safety, and use case
@@ -437,7 +438,7 @@ begin {
         }
     }
     
-    # Helper Function: Safe variable management 
+    # Helper Function: Safe variable management
     function Clear-Memory {
         [CmdletBinding()]
         param(
@@ -458,9 +459,7 @@ begin {
     function Test-IsKeyBackupRequired {
         param($volume)
         # Sublogic: Suppress logging from nested recovery protector scans
-        $script:SuppressRecoveryProtectorScanLog = $true
-        $valid = Get-ValidRecoveryProtectors -v $volume
-        $script:SuppressRecoveryProtectorScanLog = $false
+        $valid = Get-ValidRecoveryProtectors -v $volume -SuppressLog
         
         # Sublogic: Check if volume is fully encrypted with protection off and a recovery protector exists
         if ($volume.VolumeStatus -eq 'FullyEncrypted' -and $volume.ProtectionStatus -eq 0 -and $valid.Count -gt 0) {
@@ -476,20 +475,23 @@ begin {
     
     # Helper function: Return the list of valid protectors; list
     function Get-ValidRecoveryProtectors {
-        param($volume)
+        param(
+            [Parameter(Mandatory)]$volume,
+            [switch]$SuppressLog
+        )
         # Log only if not suppressed and not already logged for this drive
-        if (-not $script:SuppressRecoveryProtectorScanLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
+        if (-not $SuppressLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
             Write-Log "INFO" "Scanning for valid RecoveryPassword protectors..."
         }
         if (-not $volume.KeyProtector) {
-            if (-not $script:SuppressRecoveryProtectorScanLog) {
+            if (-not $SuppressLog) {
                 Write-Log "WARNING" "No KeyProtector array found"
             }
             return @()
         }
         $candidates = $volume.KeyProtector | Where-Object { $_.KeyProtectorType -ieq 'RecoveryPassword' }
         if (-not $candidates) {
-            if (-not $script:SuppressRecoveryProtectorScanLog) {
+            if (-not $SuppressLog) {
                 Write-Log "INFO" "No RecoveryPassword entries found"
             }
             return @()
@@ -500,12 +502,12 @@ begin {
                 $valid += $keypair
             }
             else {
-                if (-not $script:SuppressRecoveryProtectorScanLog) {
+                if (-not $SuppressLog) {
                     Write-Log "WARNING" "Ignoring invalid protector ID: $($keypair.KeyProtectorId)"
                 }
             }
         }
-        if ($valid.Count -gt 0 -and -not $script:SuppressRecoveryProtectorScanLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
+        if ($valid.Count -gt 0 -and -not $SuppressLog -and -not $script:LoggedRecoveryFound.ContainsKey($volume.MountPoint)) {
             Write-Log "INFO" "Found $($valid.Count) valid recovery key protector(s)"
         }
         return $valid
@@ -521,9 +523,7 @@ begin {
             $existingProtectors = $null
             
             # Check for existing protectors only once at the start
-            $script:SuppressRecoveryProtectorScanLog = $true
-            $existingProtectors = Get-ValidRecoveryProtectors -volume $volume
-            $script:SuppressRecoveryProtectorScanLog = $false
+            $existingProtectors = Get-ValidRecoveryProtectors -volume $volume -SuppressLog
             
             # Handle multiple protectors
             while ($attempt -lt $maxAttempts -and $existingProtectors.Count -gt 1) {
@@ -534,9 +534,7 @@ begin {
                 }
                 # Refresh volume state
                 $volume = Get-BitLockerVolume -MountPoint $volume.MountPoint
-                $script:SuppressRecoveryProtectorScanLog = $true
-                $existingProtectors = Get-ValidRecoveryProtectors -volume $volume
-                $script:SuppressRecoveryProtectorScanLog = $false
+                $existingProtectors = Get-ValidRecoveryProtectors -volume $volume -SuppressLog
                 $attempt++
             }
             
@@ -566,13 +564,11 @@ begin {
 
     # Helper function: If there is an existing recovery password; bool
     function Test-RecoveryPasswordPresent {
-        param($volume, [switch]$SuppressLog)
-        # Sublogic: Suppress nested recovery protector scan logs
-        $script:SuppressRecoveryProtectorScanLog = $true
-        $valid = Get-ValidRecoveryProtectors -v $volume
-        $script:SuppressRecoveryProtectorScanLog = $false
-        
-        # Sublogic: Determine if a valid recovery password protector exists and log relevant status
+        param(
+            [Parameter(Mandatory)]$volume,
+            [switch]$SuppressLog
+        )
+        $valid = Get-ValidRecoveryProtectors -volume $volume -SuppressLog:$SuppressLog
         if ($valid.Count -gt 0) {
             if (-not $SuppressLog -and -not $script:LastLogContext.ContainsKey("RecoveryPresent-$($volume.MountPoint)")) {
                 if ($volume.VolumeStatus -eq 'EncryptionInProgress' -or $volume.VolumeStatus -eq 'EncryptionPaused') {
@@ -611,6 +607,7 @@ begin {
         Write-Log "INFO" "Rotating numeric recovery protector"
         # Sublogic: Remove existing numeric protectors
         Write-Log "INFO" "Removing existing numeric protectors before rotation..."
+        # Unsupressed
         $existing = Get-ValidRecoveryProtectors -v $volume
         if (-not $existing) {
             Write-Log "WARNING" "No protectors to rotate; adding a new one"
@@ -650,7 +647,7 @@ begin {
     function Remove-RecoveryKey {
         param($volume)
         Write-Log "INFO" "Removing numeric recovery protector(s)"
-        
+        # Unsupressed
         $existing = Get-ValidRecoveryProtectors -v $volume
         
         # Sublogic: Check if there are any valid recovery protectors to remove
@@ -675,6 +672,7 @@ begin {
         }
         
         # Sublogic: Verify all protectors were removed
+        # Unsupressed
         $remaining = Get-ValidRecoveryProtectors -v $volume
         if ($remaining.Count -eq 0) {
             Write-Log "SUCCESS" "All valid numeric protectors removed"
@@ -724,12 +722,12 @@ begin {
                 }
                 else {
                     # Ensure only one RecoveryPassword protector by removing extras before adding
-                    $existingProtectors = Get-ValidRecoveryProtectors -v $volume
+                    $existingProtectors = Get-ValidRecoveryProtectors -volume $volume -SuppressLog:$SuppressLog
                     if ($existingProtectors.Count -gt 1) {
                         $latestProtector = $existingProtectors | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
                         foreach ($protector in $existingProtectors | Where-Object { $_.KeyProtectorId -ne $latestProtector.KeyProtectorId }) {
                             Remove-BitLockerKeyProtector -MountPoint $volume.MountPoint -KeyProtectorId $protector.KeyProtectorId -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
-                            Write-Log "INFO" "Removed duplicate protector $($protector.KeyProtectorId) to ensure single protector"
+                            if (-not $SuppressLog) { Write-Log "INFO" "Removed duplicate protector $($protector.KeyProtectorId) to ensure single protector" }
                         }
                     }
                     elseif ($existingProtectors.Count -eq 1) {
@@ -761,6 +759,27 @@ begin {
                     Remove-RecoveryKey -v $volume
                 }
             }
+        }
+    }
+    
+    # Helper Function: Check if a hardware test is pending using manage-bde
+    function Test-HardwareTestPending {
+        param (
+            [Parameter(Mandatory)]$MountPoint
+        )
+        try {
+            # Run manage-bde -status and capture output
+            $statusOutput = & manage-bde -status $MountPoint 2>&1
+            # Check for the specific instruction indicating a hardware test is required
+            if ($statusOutput -match "Restart the computer to run a hardware test") {
+                Write-Log "WARNING" "Hardware test required for $MountPoint before BitLocker can proceed."
+                return $true
+            }
+            return $false
+        }
+        catch {
+            Write-Log "ERROR" "Failed to check hardware test status for $(MountPoint): $_"
+            return $false
         }
     }
     
@@ -877,7 +896,7 @@ begin {
     }
     
     # Helper function: Collect recovery key for later storage
-    function Store-RecoveryKey {
+    function Collect-RecoveryKey {
         param($volume)
         Write-Log "INFO" "Collecting recovery key for $($volume.MountPoint)"
         
@@ -937,12 +956,8 @@ begin {
     function Backup-KeyToAD {
         param($volume)
         
-        # Turn off all Write-Log calls inside the function
-        $script:SuppressRecoveryProtectorScanLog = $true
-        # Call with no Get-ValidRecoveryProtectors logging 
-        $protectors = Get-ValidRecoveryProtectors -v $volume
-        # Turn logging back on
-        $script:SuppressRecoveryProtectorScanLog = $false
+        # Call with no Get-ValidRecoveryProtectors logging
+        $protectors = Get-ValidRecoveryProtectors -v $volume -SuppressLog
         
         if (-not $protectors) {
             Write-Log "WARNING" "No numeric recovery protectors found; nothing to back up"
@@ -1143,7 +1158,7 @@ process {
                     Write-Log "INFO" "BitLocker is suspended; resuming protection"
                     if ($PreventKeyPromptOnEveryBoot) {
                         Ensure-TpmProtector -v $blv
-                        Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction -SuppressLog
+                        Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction
                         Get-VolumeObject
                     }
                     try {
@@ -1183,7 +1198,7 @@ process {
                             Resume-BitLocker -MountPoint $MountPoint -ErrorAction Stop | Out-Null
                             Write-Log "SUCCESS" "Protection resumed"
                             Get-VolumeObject
-                            Invoke-RecoveryAction -v $blv -Action 'Ensure' -SuppressLog
+                            Invoke-RecoveryAction -v $blv -Action 'Ensure'
                             # Set state
                             $finalEnableState = "resumed"
                         }
@@ -1199,47 +1214,83 @@ process {
                         Write-Log "WARNING" "Volume is decrypting; skipping enablement for safety"
                         continue
                     }
-                    if ($blv.VolumeStatus -eq 'FullyDecrypted') {
-                        Remove-AllProtectors -v $blv
+                    elseif ($blv.VolumeStatus -eq 'EncryptionInProgress') {
+                        Write-Log "INFO" "Volume is already encrypting; ensuring protectors are correct"
+                        if ($PreventKeyPromptOnEveryBoot) {
+                            Ensure-TpmProtector -v $blv
+                            Invoke-RecoveryAction -v $blv -Action 'Ensure' -SuppressLog
+                        }
+                        else {
+                            Invoke-RecoveryAction -v $blv -Action 'Ensure'
+                            if ($UseTpmProtector) { Ensure-TpmProtector -v $blv }
+                        }
+                        Get-VolumeObject
+                        $finalEnableState = "reconciled"
                     }
-                    if ($UseUsedSpaceOnly) {
-                        Write-Log "INFO" "Enabling BitLocker with -UsedSpaceOnly"
+                    elseif ($blv.VolumeStatus -eq 'FullyDecrypted') {
+                        Write-Log "INFO" "Volume is fully decrypted; removing all protectors and enabling BitLocker"
+                        Remove-AllProtectors -v $blv
+                        if ($UseUsedSpaceOnly) {
+                            Write-Log "INFO" "Enabling BitLocker with -UsedSpaceOnly"
+                        }
+                        else {
+                            Write-Log "INFO" "Enabling BitLocker without -UsedSpaceOnly (full disk encryption)"
+                        }
+                        try {
+                            Enable-BitLocker `
+                                -MountPoint $MountPoint `
+                                -EncryptionMethod $BitlockerEncryptionMethod `
+                                -RecoveryPasswordProtector `
+                                -SkipHardwareTest `
+                                -ErrorAction Stop `
+                                -WarningAction SilentlyContinue `
+                                -InformationAction SilentlyContinue `
+                                -UsedSpaceOnly:$UseUsedSpaceOnly | Out-Null
+                            Write-Log "SUCCESS" "BitLocker enabled with recovery key protector"
+                            
+                            Get-VolumeObject
+                            # Ensure only one recovery key after enablement
+                            Invoke-RecoveryAction -v $blv -Action 'Ensure' -SuppressLog
+                            # Set state
+                            $usedSpaceOnlyValue = if ($UseUsedSpaceOnly) { 'Yes' } else { 'No' }
+                            if (-not (Test-Path $BitLockerStateStoragePath)) {
+                                New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
+                            }
+                            Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $MountPoint" -Value $usedSpaceOnlyValue -Type String -Force
+                            Write-Log "INFO" "Stored UsedSpaceOnly setting in registry: $usedSpaceOnlyValue"
+                        }
+                        catch {
+                            Write-Log "ERROR" "Failed to enable BitLocker: $_"
+                            continue
+                        }
+                        if ($UseTpmProtector) {
+                            Write-Log "INFO" "Adding TPM protector post-enablement"
+                            Ensure-TpmProtector -v $blv
+                            Get-VolumeObject
+                            # Ensure only one recovery key after adding TPM
+                            Invoke-RecoveryAction -v $blv -Action 'Ensure' -SuppressLog
+                        }
+                        $finalEnableState = "enabled"
+                        
+                        # Check for hardware test requirement
+                        if (Test-HardwareTestPending -MountPoint $MountPoint) {
+                            Write-Log "WARNING" "BitLocker setup requires a hardware test. Disabling to prevent lockout."
+                            try {
+                                Disable-BitLocker -MountPoint $MountPoint -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
+                                Remove-AllProtectors -v $blv
+                                Write-Log "INFO" "BitLocker disabled due to hardware test requirement."
+                            }
+                            catch {
+                                Write-Log "ERROR" "Failed to disable BitLocker: $_"
+                            }
+                            $finalEnableState = "disabled"
+                            continue
+                        }
                     }
                     else {
-                        Write-Log "INFO" "Enabling BitLocker without -UsedSpaceOnly (full disk encryption)"
-                    }
-                    try {
-                        Enable-BitLocker `
-                            -MountPoint $MountPoint `
-                            -EncryptionMethod $BitlockerEncryptionMethod `
-                            -RecoveryPasswordProtector `
-                            -SkipHardwareTest `
-                            -ErrorAction Stop `
-                            -WarningAction SilentlyContinue `
-                            -InformationAction SilentlyContinue `
-                            -UsedSpaceOnly:$UseUsedSpaceOnly | Out-Null
-                        Write-Log "SUCCESS" "BitLocker enabled with recovery key protector"
-                        Get-VolumeObject
-                        # Set state
-                        $usedSpaceOnlyValue = if ($UseUsedSpaceOnly) { 'Yes' } else { 'No' }
-                        if (-not (Test-Path $BitLockerStateStoragePath)) {
-                            New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
-                        }
-                        # Store custom registry key for each drive state. No other way to retrive after.
-                        Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $MountPoint" -Value $usedSpaceOnlyValue -Type String -Force
-                        Write-Log "INFO" "Stored UsedSpaceOnly setting in registry: $usedSpaceOnlyValue"
-                    }
-                    catch {
-                        Write-Log "ERROR" "Failed to enable BitLocker: $_"
+                        Write-Log "WARNING" "Volume is in an unexpected state: $($blv.VolumeStatus); skipping"
                         continue
                     }
-                    if ($UseTpmProtector) {
-                        Write-Log "INFO" "Adding TPM protector post-enablement"
-                        Ensure-TpmProtector -v $blv
-                        Get-VolumeObject
-                    }
-                    # Set state
-                    $finalEnableState = "enabled"
                 }
                 else {
                     Write-Log "INFO" "Protection already active; reconciling protectors"
@@ -1248,7 +1299,7 @@ process {
                         Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction -SuppressLog
                     }
                     else {
-                        Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction -SuppressLog
+                        Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction
                         if ($UseTpmProtector) { Ensure-TpmProtector -v $blv }
                     }
                     Get-VolumeObject
@@ -1298,7 +1349,7 @@ process {
                     try {
                         Suspend-BitLocker -MountPoint $MountPoint -RebootCount $SuspensionRebootCount -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
                         
-                       # Set state
+                        # Set state
                         $suspensionCountValue = $SuspensionRebootCount
                         if (-not (Test-Path $BitLockerStateStoragePath)) {
                             New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
@@ -1389,7 +1440,7 @@ process {
                         Write-Log "WARNING" "Cannot enable auto-unlock for $MountPoint because OS drive is not fully encrypted after $maxWaitSeconds seconds."
                     }
                 }
-                # Skip requirement 
+                # Skip requirement
                 else {
                     Write-Log "INFO" "Skipping auto-unlock for non-OS drive $MountPoint"
                     try {
@@ -1406,7 +1457,7 @@ process {
         
         # Apply recovery key action if not part of Enable process
         if ($BitLockerProtection -ne 'Enable') {
-            Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction
+            Invoke-RecoveryAction -v $blv -Action $RecoveryKeyAction -SuppressLog
             Get-VolumeObject
         }
         
@@ -1536,7 +1587,7 @@ end {
     foreach ($drive in $allFixedDrives) {
         $blv = Get-BitLockerVolume -MountPoint $drive -ErrorAction SilentlyContinue
         if ($blv) {
-            Store-RecoveryKey -v $blv
+            Collect-RecoveryKey -v $blv
         }
         # Backup to AD if set
         if ($BackupToAD) {
