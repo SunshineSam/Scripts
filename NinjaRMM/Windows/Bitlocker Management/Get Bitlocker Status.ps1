@@ -4,6 +4,7 @@
     Last Edit: 05-28-2025
     
     Note:
+    09-25-2025: Addressed a bug in the Get-SuspendedCount function, and furthermore the Cards Suspended Count logic to properly display the remaining suspend reboot count
     06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic
     05-29-2025: Bug fix with parsing reboot count
     05-28-2025: Bug fix for output regarding script scope variables
@@ -41,6 +42,9 @@
 .PARAMETER UpdateRecoveryKeys
     Optionally force update the stored keys securely.
     Defaults to true or env:updateRecoveryKeys
+
+.PARAMETER BackupToAD
+    Switch to backup recovery keys to AD/AAD (Intune).
 #>
 
 [CmdletBinding()]
@@ -74,7 +78,7 @@ begin {
         exit 1
     }
     Write-Host "`nRunning as Administrator"
-
+    
     # Initialize script scoped variables
     $script:LoggedRecoveryFound = @{}
     $script:SuppressRecoveryProtectorScanLog = $false
@@ -375,7 +379,7 @@ begin {
                     if ($suspendedCount -gt 0) {
                         # real suspend with N reboots left
                         Write-Log "INFO" "Drive $MountPoint Reboot Count: $suspendedCount"
-                        return $count
+                        return $suspendedCount
                     }
                     else {
                         # suspendedCount == 0 -> indefinitely suspended
