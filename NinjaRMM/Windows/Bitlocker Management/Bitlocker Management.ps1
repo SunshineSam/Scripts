@@ -1,9 +1,10 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 09-25-2025
+    Last Edit: 11-06-2025
     
     Note:
+    11-06-2025: @gmclelland in the NinjaOne discord mentioned this issue. During the logic clarity improvement process, one of the Param section brackets were removed by mistake. 
     09-25-2025: Addressed a bug in the Get-SuspendedCount function, and furthermore the Cards Suspended Count logic to properly display the remaining suspend reboot count. Also improved clarity and formatting across the board.
     07-03-2025: General cleanup. Non critical output and syntax
     06-28-2025: @seravous in the NinjaOne discord helped dtermine an unlikely outcome that was not accounted for. Also addresses the possibillity of more than one numerical password during a enablement/resume process in with a niche initial starting point.
@@ -444,7 +445,7 @@ begin {
     function Clear-Memory {
         [CmdletBinding()]
         param(
-            [Parameter(Mandatory)
+            [Parameter(Mandatory)]
             [string[]]$VariableNames
         )
         foreach ($name in $VariableNames) {
