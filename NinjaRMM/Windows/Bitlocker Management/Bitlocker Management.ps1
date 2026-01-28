@@ -4,18 +4,19 @@
     Last Edit: 11-06-2025
     
     Note:
-    11-06-2025: @gmclelland in the NinjaOne discord mentioned this issue. During the logic clarity improvement process, one of the Param section brackets were removed by mistake. 
+    12-23-2025: @Pegz in the NinjaOne discord mentioned this issue. Addressed multi-volume compatabillity for drives with multiple volumes, improved clarity.
+    11-06-2025: @gmclelland in the NinjaOne discord mentioned this issue. During the logic clarity impovement process, one of the Param section brackets were removed by mistake. This has now been addressed.
     09-25-2025: Addressed a bug in the Get-SuspendedCount function, and furthermore the Cards Suspended Count logic to properly display the remaining suspend reboot count. Also improved clarity and formatting across the board.
     07-03-2025: General cleanup. Non critical output and syntax
     06-28-2025: @seravous in the NinjaOne discord helped dtermine an unlikely outcome that was not accounted for. Also addresses the possibillity of more than one numerical password during a enablement/resume process in with a niche initial starting point.
-    06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic
-    06-02-2025: Addressed a sanitization issue that prevented non-os drives from being disabled individually without the OS Drive
+    06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic.
+    06-02-2025: Addressed a sanitization issue that prevented non-OS volumes from being disabled individually without the OS Volume.
     05-28-2025: Address suspend logic and validated
     05-27-2025: Status (Custom Field, Secure Field) update for all fixed drives, regardless of management as a safety precaution. Zero overriding of keys, etc.
-    05-23-2025: Cleanup, big fixes, and consistency, testing
-    05-22-2025: Rewrite for multi-volume handling, improved safety, and use case
-    05-19-2025: General cleanup improvements
-    04-25-2025: Creation and validation testing
+    05-23-2025: Cleanup, big fixes, and consistency, testing.
+    05-22-2025: Rewrite for multi-volume handling, improved safety, and use case.
+    05-19-2025: General cleanup improvements.
+    04-25-2025: Creation and validation testing.
 #>
 
 <#
@@ -77,18 +78,18 @@ param(
     [ValidateSet("Aes128", "Aes256", "XtsAes128", "XtsAes256")] [string]$BitlockerEncryptionMethod = $(if ($env:bitlockerEncryptionMethod)  { $env:bitlockerEncryptionMethod }  else { "XtsAes256" }), # Ninja Script Variable; Dropdown
     
     # Independent switches         Ninja Variable Resolution                                                                      Fallback
-    [switch]$UseTpmProtector       = $(if ($env:useBitlockerTpmProtector) { [Convert]::ToBoolean($env:useBitlockerTpmProtector) } else { $true }),  # Ninja Script Variable; Checkbox
-    [switch]$AutoUnlockNonOSDrives = $(if ($env:autoUnlockNonOsDrives) { [Convert]::ToBoolean($env:autoUnlockNonOsDrives) }       else { $true }),  # Static - Optional Ninja Script Variable; Checkbox
-    [switch]$ApplyToAllFixedDisk   = $(if ($env:applyToAllFixedDisk) { [Convert]::ToBoolean($env:applyToAllFixedDisk) }           else { $true }),  # Ninja Script Variable; Checkbox
-    [switch]$UseUsedSpaceOnly      = $(if ($env:encryptUsedspaceonly) { [Convert]::ToBoolean($env:encryptUsedspaceonly) }         else { $true }),  # Ninja Script Variable; Checkbox
-    [switch]$BackupToAD            = $(if ($env:bitlockerBackupToAd) { [Convert]::ToBoolean($env:bitlockerBackupToAd) }           else { $false }), # Ninja Script Variable; Checkbox
-    [switch]$SaveLogToDevice       = $(if ($env:saveLogToDevice) { [Convert]::ToBoolean($env:saveLogToDevice) }                   else { $false }), # Ninja Script Variable; Checkbox
-    [int]$SuspensionRebootCount    = $(if ($env:bitlockerSuspensionRebootCount) { [int]$env:bitlockerSuspensionRebootCount }      else { 1 }),      # Static - Optional Ninja Script Variable; Integer
+    [switch]$UseTpmProtector        = $(if ($env:useBitlockerTpmProtector) { [Convert]::ToBoolean($env:useBitlockerTpmProtector) } else { $true }),  # Ninja Script Variable; Checkbox
+    [switch]$AutoUnlockNonOSVolumes = $(if ($env:AutoUnlockNonOSVolumes) { [Convert]::ToBoolean($env:AutoUnlockNonOSVolumes) }     else { $true }),  # Static - Optional Ninja Script Variable; Checkbox
+    [switch]$ApplyToAllFixedDisk    = $(if ($env:applyToAllFixedDisk) { [Convert]::ToBoolean($env:applyToAllFixedDisk) }           else { $true }),  # Ninja Script Variable; Checkbox
+    [switch]$UseUsedSpaceOnly       = $(if ($env:encryptUsedspaceonly) { [Convert]::ToBoolean($env:encryptUsedspaceonly) }         else { $true }),  # Ninja Script Variable; Checkbox
+    [switch]$BackupToAD             = $(if ($env:bitlockerBackupToAd) { [Convert]::ToBoolean($env:bitlockerBackupToAd) }           else { $false }), # Ninja Script Variable; Checkbox
+    [switch]$SaveLogToDevice        = $(if ($env:saveLogToDevice) { [Convert]::ToBoolean($env:saveLogToDevice) }                   else { $false }), # Ninja Script Variable; Checkbox
+    [int]$SuspensionRebootCount     = $(if ($env:bitlockerSuspensionRebootCount) { [int]$env:bitlockerSuspensionRebootCount }      else { 1 }),      # Static - Optional Ninja Script Variable; Integer
     
     # Ninja custom field names          Ninja Variable Resolution                                                    Fallback
     [string]$BitLockerStatusFieldName   = $(if ($env:bitLockerStatusFieldName) { $env:bitLockerStatusFieldName }     else { "BitLockerStatusCard" }),  # Static - Optional Ninja Script Variable; String
     [string]$RecoveryKeySecureFieldName = $(if ($env:recoveryKeySecureFieldName) { $env:recoveryKeySecureFieldName } else { "BitLockerRecoveryKey" }), # Static - Optional Ninja Script Variable; String
-
+    
     # Registry Information                   Optional Ninja Variable Resolution                                             Fallback
     [string]$BitLockerStateStoragePath       = $(if ($env:bitLockerStateStoragePath) { $env:bitLockerStateStoragePath }     else { "HKLM:\SOFTWARE\BitLockerManagement" }), # Static - Optional Ninja Script Variable; String
     [string]$UsedSpaceOnlyStateValueName     = $(if ($env:usedSpaceOnlyStateValueName) { $env:usedSpaceOnlyStateValueName } else { "UsedSpaceOnly" }),                      # Static - Optional Ninja Script Variable; String
@@ -117,6 +118,13 @@ begin {
         exit 1
     }
     Write-Host "`nRunning as Administrator"
+    
+    ############
+    # OS Volume #
+    ############
+    # Define OS Volume
+    $script:OsVolume = (Get-CimInstance Win32_OperatingSystem).SystemDrive
+    $osVolume = $script:OsVolume
     
     ##############
     # Validation #
@@ -155,7 +163,7 @@ begin {
     # Handle ApplyToAllFixedDisk, otherwise parse MountPoint
     if ($ApplyToAllFixedDisk) {
         Write-Host "[INFO] ApplyToAllFixedDisk is set; retrieving all fixed disks"
-        # Ensure OS drive (e.g., C:) is first in the $drives array by assigning it a sort key of 0
+        # Ensure OS Volume (e.g., C:) is first in the $drives array by assigning it a sort key of 0
         $drives = Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } | 
             Sort-Object { if ($_.DriveLetter -eq (Get-CimInstance Win32_OperatingSystem).SystemDrive[0]) { 0 } else { 1 } } |
             Select-Object -ExpandProperty DriveLetter | ForEach-Object { $_ + ':' }
@@ -229,7 +237,7 @@ begin {
     Write-Host "  - Use TPM: $UseTpmProtector"
     Write-Host "  - Backup to AD: $BackupToAD"
     Write-Host "  - Prevent Key Prompt On Every Boot: $PreventKeyPromptOnEveryBoot"
-    Write-Host "  - Auto Unlock Non-OS Drives: $AutoUnlockNonOSDrives"
+    Write-Host "  - Auto Unlock non-OS volumes: $AutoUnlockNonOSVolumes"
     
     # Sanitization Section: Correct impossible or conflicting input combinations with detailed output
     Write-Host "`n=== Section: Sanitization ==="
@@ -260,13 +268,13 @@ begin {
             Write-Host "[INFO] Protection action 'Disable' selected; checking drive selection for safety"
             # Get all BitLocker-enabled volumes
             $bitLockerVolumes = Get-BitLockerVolume | Where-Object { $_.KeyProtector -and $_.VolumeStatus -ne 'FullyDecrypted' } | Select-Object -ExpandProperty MountPoint
-            if ($drives -contains $osDrive -and $bitLockerVolumes -contains $osDrive) {
-                # If OS drive is included and encrypted, ensure all encrypted drives are disabled for safety
+            if ($drives -contains $OsVolume -and $bitLockerVolumes -contains $OsVolume) {
+                # If OS Volume is included and encrypted, ensure all encrypted drives are disabled for safety
                 $drives = ($drives + $bitLockerVolumes) | Select-Object -Unique
-                Write-Host "[INFO] Including all BitLocker-enabled volumes for disabling due to OS drive selection and PreventKeyPromptOnEveryBoot being enabled."
+                Write-Host "[INFO] Including all BitLocker-enabled volumes for disabling due to OS Volume selection and PreventKeyPromptOnEveryBoot being enabled."
             }
             else {
-                # Allow disabling of explicitly specified drives, even if OS drive is encrypted but not selected
+                # Allow disabling of explicitly specified drives, even if OS Volume is encrypted but not selected
                 Write-Host "[INFO] Proceeding to disable BitLocker on explicitly selected drives ($($drives -join ', ')) as specified."
             }
         }
@@ -312,37 +320,34 @@ begin {
     
     Write-Host "[SUCCESS] Input sanitization completed successfully"
     
-    # Define the OS drive for use throughout the script
-    $osDrive = (Get-CimInstance Win32_OperatingSystem).SystemDrive
-    
-    # Check if OS drive is encrypted or included when enabling BitLocker on non-OS drives
+    # Check if OS Volume is encrypted or included when enabling BitLocker on non-OS volumes
     if ($BitLockerProtection -eq 'Enable') {
-        $nonOsDrives = $drives | Where-Object { $_ -ne $osDrive }
-        if ($nonOsDrives) {
+        $nonOsVolumes = $drives | Where-Object { $_ -ne $OsVolume }
+        if ($nonOsVolumes) {
             # Handle safely with PreventKeyPromptOnEveryBoot
             if ($PreventKeyPromptOnEveryBoot) {
-                if ($drives -notcontains $osDrive) {
+                if ($drives -notcontains $OsVolume) {
                     # Set the OS Volume
-                    $osVolume = Get-BitLockerVolume -MountPoint $osDrive -ErrorAction SilentlyContinue
-                    # Quit if there is no OS Drive
+                    $osVolume = Get-BitLockerVolume -MountPoint $OsVolume -ErrorAction SilentlyContinue
+                    # Quit if there is no OS Volume
                     if (-not $osVolume -or $osVolume.VolumeStatus -ne 'FullyEncrypted') {
-                        Write-Host "[ERROR] Cannot enable BitLocker on non-OS drives ($($nonOsDrives -join ', ')) without the OS drive ($osDrive) being encrypted or selected for encryption when PreventKeyPromptOnEveryBoot is enabled."
-                        Write-Host "[ERROR] OS drive ($osDrive) must be encrypted or included in the operation to enable BitLocker on non-OS drives when PreventKeyPromptOnEveryBoot is enabled."
+                        Write-Host "[ERROR] Cannot enable BitLocker on non-OS volumes ($($nonOsVolumes -join ', ')) without the OS Volume ($OsVolume) being encrypted or selected for encryption when PreventKeyPromptOnEveryBoot is enabled."
+                        Write-Host "[ERROR] OS Volume ($OsVolume) must be encrypted or included in the operation to enable BitLocker on non-OS volumes when PreventKeyPromptOnEveryBoot is enabled."
                         exit 1
                     }
                     else {
-                        Write-Host "[INFO] OS drive ($osDrive) is already fully encrypted; proceeding with non-OS drive enablement."
+                        Write-Host "[INFO] OS Volume ($OsVolume) is already fully encrypted; proceeding with non-OS volume enablement."
                     }
                 }
                 else {
-                    Write-Host "[INFO] OS drive ($osDrive) is included in the drives to be encrypted; proceeding."
+                    Write-Host "[INFO] OS Volume ($OsVolume) is included in the drives to be encrypted; proceeding."
                 }
             }
             # Skip system drive requirement. Will result in key prompting
             else {
-                $osVolume = Get-BitLockerVolume -MountPoint $osDrive -ErrorAction SilentlyContinue
+                $osVolume = Get-BitLockerVolume -MountPoint $OsVolume -ErrorAction SilentlyContinue
                 if (-not $osVolume -or $osVolume.VolumeStatus -ne 'FullyEncrypted') {
-                    Write-Host "[WARNING] Enabling BitLocker on non-OS drives ($($nonOsDrives -join ', ')) without the OS drive ($osDrive) being encrypted. This may affect auto-unlock functionality."
+                    Write-Host "[WARNING] Enabling BitLocker on non-OS volumes ($($nonOsVolumes -join ', ')) without the OS Volume ($OsVolume) being encrypted. This may affect auto-unlock functionality."
                 }
             }
         }
@@ -421,23 +426,36 @@ begin {
     
     # Helper function: Refresh drive state
     function Get-VolumeObject {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$TargetMountPoint,
+            
+            # Suppress the one-time "Volume state refreshed" log
+            [switch]$SuppressLog
+        )
+        
         try {
-            # Sublogic: Retrieve BitLocker volume object and suppress all non-error output
+            # Retrieve BitLocker volume object and suppress non-error output
             $global:blv = Get-BitLockerVolume `
-                -MountPoint $MountPoint `
+                -MountPoint $TargetMountPoint `
                 -ErrorAction Stop `
                 -WarningAction SilentlyContinue `
                 -InformationAction SilentlyContinue
+                
             # Only log volume state if not already logged for this mount point in this run
             if (-not $script:LastLogContext) { $script:LastLogContext = @{} }
-            if (-not $script:LastLogContext.ContainsKey("VolumeState-$MountPoint")) {
-                Write-Host "[SUCCESS] Volume state refreshed: ProtectionStatus=$($blv.ProtectionStatus), VolumeStatus=$($blv.VolumeStatus)"
-                $script:LastLogContext["VolumeState-$MountPoint"] = $true
+            
+            if (-not $SuppressLog -and -not $script:LastLogContext.ContainsKey("VolumeState-$TargetMountPoint")) {
+                Write-Host "[SUCCESS] Volume state refreshed: ProtectionStatus=$($global:blv.ProtectionStatus), VolumeStatus=$($global:blv.VolumeStatus)"
+                $script:LastLogContext["VolumeState-$TargetMountPoint"] = $true
             }
+            
+            return $global:blv
         }
         catch {
-            Write-Log "ERROR" "No BitLocker volume at $($MountPoint): $($_.Exception.Message)"
-            exit 1
+            Write-Log "ERROR" "No BitLocker volume at $($TargetMountPoint): $($_.Exception.Message)"
+            return $null
         }
     }
     
@@ -820,9 +838,9 @@ begin {
         param(
             [Parameter(Mandatory)]$volume
         )
-        # Check if the volume is the OS drive
-        if ($volume.MountPoint -ne $osDrive) {
-            Write-Log "WARNING" "TPM protectors can only be used on the OS drive. Skipping"
+        # Check if the volume is the OS Volume
+        if ($volume.MountPoint -ne $OsVolume) {
+            Write-Log "WARNING" "TPM protectors can only be used on the OS Volume. Skipping"
             return
         }
         Write-Log "INFO" "Ensuring TPM protector exists"
@@ -942,7 +960,11 @@ begin {
         
         # Retry loop to detect the new key
         do {
-            Get-VolumeObject  # Refresh volume object each attempt
+            # Refresh volume object each attempt
+            $refreshed = Get-VolumeObject -TargetMountPoint $volume.MountPoint -SuppressLog
+            if ($refreshed) {
+                $volume = $refreshed
+            }
             $protectors = Get-ValidRecoveryProtectors -volume $volume
             if ($protectors) {
                 $latestProtector = $protectors | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
@@ -1044,6 +1066,10 @@ begin {
         param (
             [Parameter(Mandatory)][string]$MountPoint
         )
+        # Lock to OS volume only by design
+        if ($MountPoint -ne $script:OsVolume) {
+            return $null
+        }
         try {
             $driveLetter = $MountPoint
             $volume = Get-CimInstance `
@@ -1121,16 +1147,24 @@ process {
     
     Write-Host "`n=== Drive Processing ==="
     # Process each drive
-    foreach ($MountPoint in $drives) {
-        Write-Log "INFO" "Processing drive $MountPoint"
+    foreach ($CurrentMountPoint in $drives) {
+
+        # IMPORTANT:
+        # Do NOT assign into $MountPoint here. $MountPoint is a [string[]] script parameter.
+        # Use a per-iteration variable that is always a scalar string.
+        $TargetMountPoint = [string]$CurrentMountPoint
+
+        Write-Log "INFO" "Processing drive $TargetMountPoint"
+
+        # Update the volume state
+        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+        if (-not $blv) { continue }
+
+        $script:initialProtectionStatus = $blv.ProtectionStatus
         
         # Reset per-drive state
         $script:PreviousRecoveryKey = $null
         $script:NumericProtectorCreated = $false
-        
-        # Update the volume state
-        Get-VolumeObject
-        $script:initialProtectionStatus = $blv.ProtectionStatus
         
         # Validate BitLocker and TPM state
         Validate-BitLockerState -volume $blv
@@ -1175,28 +1209,34 @@ process {
             $tpmAvailable = $false
         }
         if (-not $tpmAvailable -and $PreventKeyPromptOnEveryBoot) {
-            Write-Log "ERROR" "TPM is not available and PreventKeyPromptOnEveryBoot is true for $($MountPoint). Skipping."
+            Write-Log "ERROR" "TPM is not available and PreventKeyPromptOnEveryBoot is true for $($TargetMountPoint). Skipping."
             continue
         }
         elseif (-not $tpmAvailable) {
-            Write-Log "WARNING" "TPM is not available for $MountPoint, but PreventKeyPromptOnEveryBoot is false. Continuing without TPM."
+            Write-Log "WARNING" "TPM is not available for $TargetMountPoint, but PreventKeyPromptOnEveryBoot is false. Continuing without TPM."
         }
         
         # Manage BitLocker protection
         switch ($BitLockerProtection) {
             'Enable' {
-                Write-Log "INFO" "Requested: Enable/Resume protection for $MountPoint"
+                Write-Log "INFO" "Requested: Enable/Resume protection for $TargetMountPoint"
                 if ($blv.ProtectionStatus -eq 'Suspended') {
                     Write-Log "INFO" "BitLocker is suspended; resuming protection"
                     if ($PreventKeyPromptOnEveryBoot) {
                         Ensure-TpmProtector -volume $blv
                         Invoke-RecoveryAction -volume $blv -Action $RecoveryKeyAction
-                        Get-VolumeObject
+                        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                        if (-not $blv) {
+                            continue
+                        }
                     }
                     try {
-                        Resume-BitLocker -MountPoint $MountPoint -ErrorAction Stop | Out-Null
+                        Resume-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop | Out-Null
                         Write-Log "SUCCESS" "Protection resumed"
-                        Get-VolumeObject
+                        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                        if (-not $blv) {
+                            continue
+                        }
                         # Set state
                         $finalEnableState = "resumed"
                     }
@@ -1210,12 +1250,18 @@ process {
                     if ($PreventKeyPromptOnEveryBoot) {
                         Ensure-TpmProtector -volume $blv
                         try {
-                            Resume-BitLocker -MountPoint $MountPoint -ErrorAction Stop | Out-Null
+                            Resume-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop | Out-Null
                             Write-Log "SUCCESS" "Protection resumed before recovery action"
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                             $script:PreviousRecoveryKey = (Get-ValidRecoveryProtectors -volume $blv | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1)
                             Invoke-RecoveryAction -volume $blv -Action $RecoveryKeyAction -SuppressLog
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                             # Set state
                             $finalEnableState = "resumed"
                         }
@@ -1227,9 +1273,12 @@ process {
                     else {
                         if ($UseTpmProtector) { Ensure-TpmProtector -volume $blv }
                         try {
-                            Resume-BitLocker -MountPoint $MountPoint -ErrorAction Stop | Out-Null
+                            Resume-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop | Out-Null
                             Write-Log "SUCCESS" "Protection resumed"
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                             Invoke-RecoveryAction -volume $blv -Action 'Ensure'
                             # Set state
                             $finalEnableState = "resumed"
@@ -1256,7 +1305,10 @@ process {
                             Invoke-RecoveryAction -volume $blv -Action 'Ensure'
                             if ($UseTpmProtector) { Ensure-TpmProtector -volume $blv }
                         }
-                        Get-VolumeObject
+                        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                        if (-not $blv) {
+                            continue
+                        }
                         $finalEnableState = "reconciled"
                     }
                     elseif ($blv.VolumeStatus -eq 'FullyDecrypted') {
@@ -1270,7 +1322,7 @@ process {
                         }
                         try {
                             Enable-BitLocker `
-                                -MountPoint $MountPoint `
+                                -MountPoint $TargetMountPoint `
                                 -EncryptionMethod $BitlockerEncryptionMethod `
                                 -RecoveryPasswordProtector `
                                 -SkipHardwareTest `
@@ -1280,7 +1332,10 @@ process {
                                 -UsedSpaceOnly:$UseUsedSpaceOnly | Out-Null
                             Write-Log "SUCCESS" "BitLocker enabled with recovery key protector"
                             
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                             # Ensure only one recovery key after enablement
                             Invoke-RecoveryAction -volume $blv -Action 'Ensure' -SuppressLog
                             # Set state
@@ -1288,7 +1343,7 @@ process {
                             if (-not (Test-Path $BitLockerStateStoragePath)) {
                                 New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
                             }
-                            Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $MountPoint" -Value $usedSpaceOnlyValue -Type String -Force
+                            Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $TargetMountPoint" -Value $usedSpaceOnlyValue -Type String -Force
                             Write-Log "INFO" "Stored UsedSpaceOnly setting in registry: $usedSpaceOnlyValue"
                         }
                         catch {
@@ -1298,30 +1353,35 @@ process {
                         if ($UseTpmProtector) {
                             Write-Log "INFO" "Adding TPM protector post-enablement"
                             Ensure-TpmProtector -volume $blv
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                             # Ensure only one recovery key after adding TPM
                             Invoke-RecoveryAction -volume $blv -Action 'Ensure' -SuppressLog
                         }
                         $finalEnableState = "enabled"
                         
-                        # Check for hardware test requirement
-                        if (Test-HardwareTestPending -MountPoint $MountPoint) {
-                            Write-Log "WARNING" "BitLocker setup requires a hardware test. Disabling to prevent lockout."
-                            try {
-                                Disable-BitLocker -MountPoint $MountPoint -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
-                                Remove-AllProtectors -volume $blv
-                                Write-Log "INFO" "BitLocker disabled due to hardware test requirement."
+                        # Hardware test is an OS-volume concern in this script design
+                        if ($TargetMountPoint -eq $script:OsVolume) {
+                            if (Test-HardwareTestPending -MountPoint $TargetMountPoint) {
+                                Write-Log "WARNING" "BitLocker setup requires a hardware test. Disabling to prevent lockout."
+                                try {
+                                    Disable-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
+                                    $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint -SuppressLog
+                                    if ($blv) { Remove-AllProtectors -volume $blv }
+                                    Write-Log "INFO" "BitLocker disabled due to hardware test requirement."
+                                }
+                                catch {
+                                    Write-Log "ERROR" "Failed to disable BitLocker: $($_.Exception.Message)"
+                                }
+                                $finalEnableState = "disabled"
+                                continue
                             }
-                            catch {
-                                Write-Log "ERROR" "Failed to disable BitLocker: $($_.Exception.Message)"
-                            }
-                            $finalEnableState = "disabled"
-                            continue
                         }
-                    }
-                    else {
-                        Write-Log "WARNING" "Volume is in an unexpected state: $($blv.VolumeStatus); skipping"
-                        continue
+                        else {
+                            Write-Log "INFO" "Skipping hardware test check for data volume $TargetMountPoint (OS-volume only)."
+                        }
                     }
                 }
                 else {
@@ -1334,12 +1394,18 @@ process {
                         Invoke-RecoveryAction -volume $blv -Action $RecoveryKeyAction
                         if ($UseTpmProtector) { Ensure-TpmProtector -volume $blv }
                     }
-                    Get-VolumeObject
+                    $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                    if (-not $blv) {
+                        continue
+                    }
                     if ($blv.ProtectionStatus -eq 'Off' -and $blv.VolumeStatus -eq 'FullyEncrypted') {
                         try {
-                            Resume-BitLocker -MountPoint $MountPoint -ErrorAction Stop | Out-Null
+                            Resume-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop | Out-Null
                             Write-Log "SUCCESS" "Protection resumed"
-                            Get-VolumeObject
+                            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                            if (-not $blv) {
+                                continue
+                            }
                         }
                         catch {
                             Write-Log "ERROR" "Failed to resume protection: $($_.Exception.Message)"
@@ -1361,7 +1427,7 @@ process {
                 }
             }
             'Suspend' {
-                Write-Log "INFO" "Requested: Suspend protection for $MountPoint"
+                Write-Log "INFO" "Requested: Suspend protection for $TargetMountPoint"
                 if ($blv.VolumeStatus -eq 'EncryptionInProgress') {
                     Write-Log "WARNING" "Cannot suspend - BitLocker is currently encrypting the volume."
                 }
@@ -1377,9 +1443,12 @@ process {
                         if ($UseTpmProtector) { Ensure-TpmProtector -volume $blv }
                         Ensure-RecoveryKey -volume $blv
                     }
-                    Get-VolumeObject
+                    $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                    if (-not $blv) {
+                        continue
+                    }
                     try {
-                        Suspend-BitLocker -MountPoint $MountPoint -RebootCount $SuspensionRebootCount -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
+                        Suspend-BitLocker -MountPoint $TargetMountPoint -RebootCount $SuspensionRebootCount -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
                         
                         # Set state
                         $suspensionCountValue = $SuspensionRebootCount
@@ -1387,10 +1456,13 @@ process {
                             New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
                         }
                         # Store initial reboot count in registry key for each drive state
-                        Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$InitialSuspensionCountValueName $MountPoint" -Value $suspensionCountValue -Type String -Force
+                        Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$InitialSuspensionCountValueName $TargetMountPoint" -Value $suspensionCountValue -Type String -Force
                         # Write-Log "INFO" "Stored initial suspensionCountValue setting in registry: $suspensionCountValue"
                         
-                        Get-VolumeObject
+                        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                        if (-not $blv) {
+                            continue
+                        }
                     }
                     catch {
                         Write-Log "ERROR" "Failed to suspend protection: $($_.Exception.Message)"
@@ -1399,10 +1471,10 @@ process {
                 }
             }
             'Disable' {
-                Write-Log "INFO" "Requested: Disable protection for $MountPoint"
-                if ($MountPoint -eq $osDrive) {
+                Write-Log "INFO" "Requested: Disable protection for $TargetMountPoint"
+                if ($TargetMountPoint -eq $OsVolume) {
                     # Disable auto-unlock on all data drives with auto-unlock enabled
-                    $dataDrivesWithAutoUnlock = Get-BitLockerVolume | Where-Object { $_.MountPoint -ne $osDrive -and $_.AutoUnlockEnabled }
+                    $dataDrivesWithAutoUnlock = Get-BitLockerVolume | Where-Object { $_.MountPoint -ne $OsVolume -and $_.AutoUnlockEnabled }
                     foreach ($dataDrive in $dataDrivesWithAutoUnlock) {
                         Write-Log "INFO" "Disabling auto-unlock on $($dataDrive.MountPoint)"
                         try {
@@ -1419,9 +1491,12 @@ process {
                 }
                 else {
                     try {
-                        Disable-BitLocker -MountPoint $MountPoint -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
+                        Disable-BitLocker -MountPoint $TargetMountPoint -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
                         Write-Log "SUCCESS" "Decryption initiated"
-                        Get-VolumeObject
+                        $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+                        if (-not $blv) {
+                            continue
+                        }
                     }
                     catch {
                         Write-Log "ERROR" "Failed to disable protection: $($_.Exception.Message)"
@@ -1431,57 +1506,57 @@ process {
                 if (-not (Test-Path $BitLockerStateStoragePath)) {
                     New-Item -Path $BitLockerStateStoragePath -Force | Out-Null
                 }
-                Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $MountPoint" -Value "N/A" -Type String -Force
+                Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$UsedSpaceOnlyStateValueName $TargetMountPoint" -Value "N/A" -Type String -Force
                 Write-Log "INFO" "Set UsedSpaceOnly registry to 'N/A'"
-                Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$InitialSuspensionCountValueName $MountPoint" -Value "N/A" -Type String -Force
+                Set-ItemProperty -Path $BitLockerStateStoragePath -Name "$InitialSuspensionCountValueName $TargetMountPoint" -Value "N/A" -Type String -Force
                 Write-Log "INFO" "Set InitialSuspensionCount registry to 'N/A'"
             }
         }
         
-        # Manage auto-unlock for non-OS drives if applicable
+        # Manage auto-unlock for non-OS volumes if applicable
         if ($BitLockerProtection -eq 'Enable') {
-            if ($MountPoint -ne $osDrive) {
-                $osVolume = Get-BitLockerVolume -MountPoint $osDrive -ErrorAction SilentlyContinue
-                if ($AutoUnlockNonOSDrives) {
-                    # Periodically check OS drive encryption status
+            if ($TargetMountPoint -ne $OsVolume) {
+                $osVolume = Get-BitLockerVolume -MountPoint $OsVolume -ErrorAction SilentlyContinue
+                if ($AutoUnlockNonOSVolumes) {
+                    # Periodically check OS Volume encryption status
                     $maxWaitSeconds = 1800  # 30 minutes max wait
                     $waitIntervalSeconds = 30
                     $elapsedSeconds = 0
                     
-                    # Loop until system drive is fully encrypted to enable Auto-Unlock for non OS drives
+                    # Loop until system drive is fully encrypted to enable Auto-Unlock for non OS volumes
                     while ($osVolume -and $osVolume.VolumeStatus -ne 'FullyEncrypted' -and $elapsedSeconds -lt $maxWaitSeconds) {
                         Start-Sleep -Seconds $waitIntervalSeconds
                         $elapsedSeconds += $waitIntervalSeconds
-                        $osVolume = Get-BitLockerVolume -MountPoint $osDrive -ErrorAction SilentlyContinue
+                        $osVolume = Get-BitLockerVolume -MountPoint $OsVolume -ErrorAction SilentlyContinue
                     }
                     
-                    # When OS Drive is fully encrypted
+                    # When OS Volume is fully encrypted
                     if ($osVolume -and $osVolume.VolumeStatus -eq 'FullyEncrypted') {
-                        Write-Log "INFO" "OS Drive $osDrive is now fully encrypted... (Elapsed: $elapsedSeconds seconds)"
-                        Write-Log "INFO" "Enabling auto-unlock for non-OS drive $MountPoint"
+                        Write-Log "INFO" "OS Volume $OsVolume is now fully encrypted... (Elapsed: $elapsedSeconds seconds)"
+                        Write-Log "INFO" "Enabling auto-unlock for non-OS volume $TargetMountPoint"
                         try {
                             # Enable AutoUnlock
-                            Enable-BitLockerAutoUnlock -MountPoint $MountPoint -ErrorAction Stop | Out-Null
-                            Write-Log "SUCCESS" "Auto-unlock enabled for $MountPoint"
+                            Enable-BitLockerAutoUnlock -MountPoint $TargetMountPoint -ErrorAction Stop | Out-Null
+                            Write-Log "SUCCESS" "Auto-unlock enabled for $TargetMountPoint"
                         }
                         catch {
-                            Write-Log "ERROR" "Failed to enable auto-unlock for $($MountPoint): $($_.Exception.Message)"
+                            Write-Log "ERROR" "Failed to enable auto-unlock for $($TargetMountPoint): $($_.Exception.Message)"
                         }
                     }
                     else {
-                        Write-Log "WARNING" "Cannot enable auto-unlock for $MountPoint because OS drive is not fully encrypted after $maxWaitSeconds seconds."
+                        Write-Log "WARNING" "Cannot enable auto-unlock for $TargetMountPoint because OS Volume is not fully encrypted after $maxWaitSeconds seconds."
                     }
                 }
                 # Skip requirement
                 else {
-                    Write-Log "INFO" "Skipping auto-unlock for non-OS drive $MountPoint"
+                    Write-Log "INFO" "Skipping auto-unlock for non-OS volume $TargetMountPoint"
                     try {
-                        # Could be used to also disable autounlock like so by setting AutoUnlockNonOSDrives to false
+                        # Could be used to also disable autounlock like so by setting AutoUnlockNonOSVolumes to false
                         # Disable-BitLockerAutoUnlock -MountPoint $MountPoint -ErrorAction Stop | Out-Null
-                        Write-Log "INFO" "Auto-Unlock was not opted for. Ensure ($MountPoint) is configured properly."
+                        Write-Log "INFO" "Auto-Unlock was not opted for. Ensure ($TargetMountPoint) is configured properly."
                     }
                     catch {
-                        Write-Log "ERROR" "Failed to disable auto-unlock for $($MountPoint): $($_.Exception.Message)"
+                        Write-Log "ERROR" "Failed to disable auto-unlock for $($MountTargetMountPointPoint): $($_.Exception.Message)"
                     }
                 }
             }
@@ -1490,7 +1565,10 @@ process {
         # Apply recovery key action if not part of Enable process
         if ($BitLockerProtection -ne 'Enable') {
             Invoke-RecoveryAction -volume $blv -Action $RecoveryKeyAction -SuppressLog
-            Get-VolumeObject
+            $blv = Get-VolumeObject -TargetMountPoint $TargetMountPoint
+            if (-not $blv) {
+                continue
+            }
         }
         
         # Separate each volume in output
@@ -1546,18 +1624,17 @@ end {
                         'FullyDecrypted' { '<i class="fas fa-check-circle" style="color:#D9534F;"></i> Off' }
                         # If Off and volume status is FullyEncrypted, the volume is suspended
                         default {
+                            # OS-Volume only check for reboot count
                             $rebootCount = Get-RebootCount -MountPoint ([string]$MountPoint)
                             # Include reboot count if suspended and reboot count is greater than 0
                             if ($null -ne $rebootCount -and $rebootCount -gt 0) {
                                 '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     Reboot(s) Left: ' + $rebootCount
                             }
-                            # Indefinitely suspended
                             elseif ($null -ne $rebootCount -and $rebootCount -eq 0) {
                                 '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     Indefinitely'
                             }
-                            # Dont include reboot count if anything else
                             else {
-                                '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     [UNKNOWN]'
+                                '<i class="fas fa-check-circle" style="color:#F0AD4E;"></i> Suspended<br>     Reboot(s) Left: N/A'
                             }
                         }
                     }
@@ -1628,7 +1705,7 @@ end {
         }
     }
     
-    # Store all recovery keys in single-line format
+    # Store all recovery keys in a deterministic, multi-line format (stable ordering: OS first)
     Write-Log "INFO" "Storing recovery key(s) in secure field"
     try {
         if ($script:RecoveryKeys.Count -eq 0) {
@@ -1636,9 +1713,42 @@ end {
             Ninja-Property-Set $RecoveryKeySecureFieldName "N/A" | Out-Null
         }
         else {
-            $allKeys = ($script:RecoveryKeys.Values -join "; ")
-            Ninja-Property-Set $RecoveryKeySecureFieldName $allKeys | Out-Null
-            Write-Log "SUCCESS" "Stored recovery keys for drive(s) ($($script:RecoveryKeys.Keys -join ', ')) in '$RecoveryKeySecureFieldName'"
+            # Stable ordering: OS first, then alphabetical
+            $orderedMountPoints = @(
+                $allFixedDrives | Sort-Object `
+                    @{ Expression = { if ($_ -eq $script:OsVolume) { 0 } else { 1 } } }, `
+                    @{ Expression = { $_ } }
+            )
+            
+            [System.Collections.Generic.List[string]]$lines = @()
+            foreach ($mp in $orderedMountPoints) {
+                if ($script:RecoveryKeys.ContainsKey($mp)) {
+                    $lines.Add($script:RecoveryKeys[$mp])
+                }
+                else {
+                    # Safety: ensure every fixed drive has *some* representation
+                    $lines.Add("Drive: $mp - None")
+                }
+            }
+            # Seperator per key
+            $allKeys = ($lines -join " | ")
+            
+            # Use named params if available, otherwise positional (keeps compatibility across Ninja module variants)
+            $stored = $false
+            try {
+                Ninja-Property-Set -Name $RecoveryKeySecureFieldName -Value $allKeys | Out-Null
+                $stored = $true
+            }
+            catch {
+                # Swallow
+            }
+            
+            if (-not $stored) {
+                Ninja-Property-Set $RecoveryKeySecureFieldName $allKeys | Out-Null
+            }
+            
+            Write-Log "SUCCESS" "Stored recovery keys for drive(s) ($($orderedMountPoints -join ', ')) in '$RecoveryKeySecureFieldName'"
+            
             # Clear sensitive data
             Clear-Memory -VariableNames "allKeys"
         }
