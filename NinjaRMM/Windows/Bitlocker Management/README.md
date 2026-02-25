@@ -5,14 +5,14 @@
 This BitLocker suite **completely solves BitLocker management pain-points**, especially for mixed environments, or environments lacking AAD, Intune, or on-prem AD. It is:
 
 - ✅ **Agnostic** to AD and Azure/Intune
-- ✅ Operates seamlessly across hybrid, workgroup, or disconnected environments
-- ✅ Enforces consistent encryption and protection state across devices
-- ✅ Tracks all BitLocker details with custom field support
-- ✅ Automatically rotates and securely stores recovery keys
-- ✅ Outputs formatted WYSIWYG cards for visibility and executive reporting
-- ✅ Easily integrates into RMM workflows (e.g., NinjaRMM) with minimal setup
+- ✅ **Integrates seamlessly** with hybrid, workgroup, or disconnected environments
+- ✅ **Enforces consistency** with encryption and protection states across devices
+- ✅ **Tracks all BitLocker details** with custom field support
+- ✅ **Automatically** rotates and securely stores recovery keys
+- ✅ **Outputs formatted WYSIWYG cards** for visibility and executive reporting
+- ✅ **Easily implement** into RMM workflows (e.g., NinjaRMM) with minimal setup
 
-> ⚙️ This is a built from scratch solution to bridge real world gaps across IT environments, compliance needs, and automation.
+> ⚙️ This is a built from scratch solution to bridge real world gaps in IT environments, compliance needs, and automation.
 
 ---
 
@@ -149,4 +149,4 @@ _Read-only reporting for all fixed disks; collects recovery keys and renders a s
 - Eliminate reliance on AAD, Intune, or Group Policy for full BitLocker lifecycle management
 - Store critical encryption data securely within your RMM for **auditing or support**
 
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/Bitlocker%20Management/images/MultiVolumeExample.png" alt="BitLocker Multi-Volume View Example" width="580px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/Bitlocker%20Management/images/MultiVolumeExample.png" alt="BitLocker Multi-Volume View Example" width="660px" />
