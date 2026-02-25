@@ -1,9 +1,11 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 12-23-2025
+    Last Edit: 02-18-2026
     
     Note:
+    02-18-2026: All USB drives are now blacklisted. Recovery key collection now validates RecoveryPassword is non-empty. Modfified card order so OS Volume is always first. Squashed some bugs & edge case errors.
+    02-06-2026: @Leapo pointed out USB Storage handling issues & a few other bugs. Attempted to implement safe USB handling. Optionally validates the secure field data (Custom Field automation Read/Write access required for this).
     12-23-2025: @Pegz in the NinjaOne discord mentioned this issue. Addressed multi-volume compatabillity for drives with multiple volumes, improved clarity.
     09-25-2025: Addressed a bug in the Get-SuspendedCount/Get-RebootCount logic and improved suspended display behavior.
     06-18-2025: Modified AD/Intune Backup logic, improved Suspension insight, and Get-RebootCount logic.
@@ -58,14 +60,24 @@
 .PARAMETER InitialSuspensionCountValueName
     Registry value name prefix used to read initial suspend count per volume (kept for parity; not required for display).
     Defaults to "InitialSuspensionCount" (or env:suspensionCountValueName).
+
+.PARAMETER VerifyRecoveryKeyStorage
+    Switch. When enabled, runs a pre-flight check before drive processing,
+    writes a realistic-sized test payload to the secure field, reads it back
+    to confirm permissions and field capacity. Assumes full recovery key data
+    for every drive (security-case). If the pre-flight fails, recovery key
+    collection and storage are skipped entirely for this run.
+    REQUIRES: The secure custom field must have 'Read/Write' (Automation)
+    permissions enabled in NinjaRMM. Default: true.
 #>
 
 [CmdletBinding()]
 param(
     # Independent switches         Ninja Variable Resolution                                                                      Fallback
     [switch]$UpdateRecoveryKeys = $(if ($env:updateRecoveryKeys) { [Convert]::ToBoolean($env:updateRecoveryKeys) } else { $true }),   # Ninja Script Variable; Checkbox
-    [switch]$SaveLogToDevice    = $(if ($env:saveLogToDevice) { [Convert]::ToBoolean($env:saveLogToDevice) }         else { $false }), # Ninja Script Variable; Checkbox
-    [switch]$BackupToAD         = $(if ($env:bitlockerBackupToAd) { [Convert]::ToBoolean($env:bitlockerBackupToAd) } else { $false }), # Ninja Script Variable; Checkbox
+    [switch]$VerifyRecoveryKeyStorage  = $(if ($env:verifyRecoveryKeyStorage) { [Convert]::ToBoolean($env:verifyRecoveryKeyStorage) } else { $true }),  # Ninja Script Variable; Checkbox
+    [switch]$SaveLogToDevice           = $(if ($env:saveLogToDevice) { [Convert]::ToBoolean($env:saveLogToDevice) }                       else { $false }), # Ninja Script Variable; Checkbox
+    [switch]$BackupToAD                = $(if ($env:bitlockerBackupToAd) { [Convert]::ToBoolean($env:bitlockerBackupToAd) }               else { $false }), # Ninja Script Variable; Checkbox
     
     # Ninja custom field names          Ninja Variable Resolution                                                    Fallback
     [string]$BitLockerStatusFieldName   = $(if ($env:bitLockerStatusFieldName) { $env:bitLockerStatusFieldName }     else { "BitLockerStatusCard" }),  # Optional Ninja Script Variable; String
@@ -122,7 +134,7 @@ begin {
             }
             
             # Best-effort detection of spanned volumes
-            $spannedVolumes = Get-Volume | Where-Object { $_.FileSystemType -eq 'NTFS' -and $_.DriveType -eq 'Fixed' } |
+            $spannedVolumes = Get-Volume | Where-Object { $_.FileSystemType -eq 'NTFS' -and $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
                 Where-Object {
                     try {
                         (Get-Partition -Volume $_ -ErrorAction Stop).DiskNumber.Count -gt 1
@@ -142,11 +154,67 @@ begin {
     }
     Test-DriveDependencies
     
-    # Get all fixed drives for reporting (DriveLetter-based volumes only)
+    # Helper function: Detect drive letters connected via USB bus
+    # USB-connected drives (even if Windows reports them as 'Fixed') are always excluded from reporting.
+    function Get-USBDriveLetters {
+        $usbLetters = @()
+        # Primary method: Get-PhysicalDisk (available on Win10/Server2016+)
+        try {
+            $usbDisks = Get-PhysicalDisk | Where-Object { $_.BusType -eq 'USB' }
+            if ($usbDisks) {
+                foreach ($usbDisk in $usbDisks) {
+                    $disk = $usbDisk | Get-Disk -ErrorAction SilentlyContinue
+                    if ($null -ne $disk) {
+                        $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DriveLetter }
+                        foreach ($partition in $partitions) {
+                            $letter = "$($partition.DriveLetter):"
+                            $usbLetters += $letter
+                            Write-Host "[INFO] Detected USB drive: $letter (PhysicalDisk: $($usbDisk.FriendlyName), Disk #$($disk.Number))"
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Host "[WARNING] Get-PhysicalDisk USB detection failed: $($_.Exception.Message). Falling back to WMI."
+        }
+        # Fallback method: Win32_DiskDrive (broader compatibility)
+        if ($usbLetters.Count -eq 0) {
+            try {
+                $wmiUsbDisks = Get-CimInstance Win32_DiskDrive | Where-Object { $_.InterfaceType -eq 'USB' }
+                foreach ($wmiDisk in $wmiUsbDisks) {
+                    $partitions = Get-CimAssociatedInstance -InputObject $wmiDisk -ResultClassName Win32_DiskPartition
+                    foreach ($partition in $partitions) {
+                        $logicalDisks = Get-CimAssociatedInstance -InputObject $partition -ResultClassName Win32_LogicalDisk
+                        foreach ($logicalDisk in $logicalDisks) {
+                            if ($logicalDisk.DeviceID) {
+                                $usbLetters += $logicalDisk.DeviceID
+                                Write-Host "[INFO] Detected USB drive (WMI fallback): $($logicalDisk.DeviceID) (Model: $($wmiDisk.Model))"
+                            }
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-Host "[ERROR] WMI USB detection also failed: $($_.Exception.Message)"
+            }
+        }
+        return $usbLetters | Select-Object -Unique
+    }
+    
+    # Get all fixed drives for reporting (DriveLetter-based volumes only), excluding USB
+    # Sorted: OS volume first, then alphabetical, ensures cards and recovery keys use the same ordering
+    $script:USBDriveLetters = Get-USBDriveLetters
     $script:AllFixedDrives = Get-Volume |
         Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter } |
         Select-Object -ExpandProperty DriveLetter |
-        ForEach-Object { $_ + ':' }
+        ForEach-Object { $_ + ':' } |
+        Sort-Object @{ Expression = { if ($_ -eq $script:OsVolume) { 0 } else { 1 } } }, @{ Expression = { $_ } }
+    if ($script:USBDriveLetters) {
+        $script:AllFixedDrives = $script:AllFixedDrives | Where-Object { $_ -notin $script:USBDriveLetters }
+        Write-Host "[INFO] USB drives blacklisted from reporting: $($script:USBDriveLetters -join ', ')"
+    }
     
     if (-not $script:AllFixedDrives) {
         Write-Host "[ERROR] No fixed disks found on this system"
@@ -299,10 +367,28 @@ begin {
         $protectors = Get-ValidRecoveryProtectors -volume $volume -SuppressLog
         if ($protectors -and $protectors.Count -gt 0) {
             $latestProtector = $protectors | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
-            $keyInfo = "$($volume.MountPoint) - Protector ID: $($latestProtector.KeyProtectorId) | Recovery Key: $($latestProtector.RecoveryPassword)"
-            Write-Log "INFO" "Collected recovery key"
-            $script:RecoveryKeys[$volume.MountPoint] = $keyInfo
-            Clear-Memory -VariableNames "keyInfo"
+            # Validate that RecoveryPassword is actually populated (not just the protector ID)
+            if ([string]::IsNullOrWhiteSpace($latestProtector.RecoveryPassword)) {
+                Write-Log "WARNING" "Protector $($latestProtector.KeyProtectorId) found but RecoveryPassword is empty for $($volume.MountPoint); retrying volume refresh"
+                $rpRetry = 0
+                while ($rpRetry -lt 3 -and [string]::IsNullOrWhiteSpace($latestProtector.RecoveryPassword)) {
+                    Start-Sleep -Seconds 2
+                    $rpRetry++
+                    $refreshed = Get-BitLockerVolume -MountPoint $volume.MountPoint -ErrorAction SilentlyContinue
+                    if ($refreshed) { $volume = $refreshed }
+                    $latestProtector = Get-ValidRecoveryProtectors -volume $volume | Sort-Object { $_.KeyProtectorId } | Select-Object -Last 1
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($latestProtector.RecoveryPassword)) {
+                Write-Log "ERROR" "RecoveryPassword is empty for protector $($latestProtector.KeyProtectorId) on $($volume.MountPoint) after retries. Cannot store recovery key."
+                $script:RecoveryKeys[$volume.MountPoint] = "Drive: $($volume.MountPoint) - ERROR: Key not retrievable"
+            }
+            else {
+                $keyInfo = "$($volume.MountPoint) - Protector ID: $($latestProtector.KeyProtectorId) | Recovery Key: $($latestProtector.RecoveryPassword)"
+                Write-Log "INFO" "Collected recovery key"
+                $script:RecoveryKeys[$volume.MountPoint] = $keyInfo
+                Clear-Memory -VariableNames "keyInfo"
+            }
         }
         else {
             Write-Log "INFO" "No valid recovery key protectors found for $($volume.MountPoint); recording 'None'"
@@ -360,13 +446,71 @@ begin {
         }
     }
     
+    # Helper function: Verify recovery key was successfully written to the NinjaRMM agent cache.
+    #
+    # How NinjaRMM custom field caching works:
+    #   - Ninja-Property-Set writes to the LOCAL AGENT CACHE only.
+    #   - Ninja-Property-Get reads from the LOCAL AGENT CACHE (if a cached value exists).
+    #   - The agent checks in to the NinjaRMM console approximately every 60 seconds,
+    #     flushing any cached custom field changes to the server at that time.
+    #   - If the machine reboots/loses power before the next check-in, cached data is lost.
+    #
+    # What this verification DOES confirm:
+    #   - The field accepts writes (permissions are correct)
+    #   - The data was not truncated (field character limit is sufficient)
+    #   - The cached value matches what was written (no silent corruption)
+    #
+    # What this verification CANNOT confirm:
+    #   - That the data has been flushed to the NinjaRMM console (server-side persistence)
+    #   - There is no agent-side API to confirm a successful console sync
+    function Test-RecoveryKeyStorageVerification {
+        param(
+            [Parameter(Mandatory)][string]$FieldName,
+            [Parameter(Mandatory)][string]$ExpectedValue
+        )
+        try {
+            $readBack = Ninja-Property-Get $FieldName
+            if ($null -eq $readBack) {
+                Write-Log "ERROR" "Recovery key verification: Ninja-Property-Get returned null for '$FieldName'. Ensure the field has 'Script Read' (Automation Read) permission enabled."
+                return $false
+            }
+            if ($readBack.Trim() -ne $ExpectedValue.Trim()) {
+                Write-Log "ERROR" "Recovery key verification FAILED. Written length: $($ExpectedValue.Length), Read back length: $($readBack.Length). The field may have a character limit (default: 200) that truncated the data."
+                return $false
+            }
+            Write-Log "SUCCESS" "Recovery key cached to agent successfully (field: '$FieldName', $($ExpectedValue.Length) chars)"
+            return $true
+        }
+        catch {
+            Write-Log "ERROR" "Recovery key verification failed: Ninja-Property-Get unavailable or errored: $($_.Exception.Message). Ensure the secure field has 'Script Read' (Automation Read) permission enabled."
+            return $false
+        }
+    }
+    
+    # Helper function: Check if auto-unlock is configured (will survive reboot)
+    # For internal (fixed) drives, use Get-BitLockerVolume to check the AutoUnlockEnabled property
+    # This directly queries the BitLocker status for the volume
+    function Test-AutoUnlockStatus {
+        param(
+            [Parameter(Mandatory)]$TargetMountPoint
+        )
+        try {
+            $TargetMountPoint = [string]$TargetMountPoint
+            $volume = Get-BitLockerVolume -MountPoint $TargetMountPoint -ErrorAction Stop
+            return $volume.AutoUnlockEnabled
+        }
+        catch {
+            return $false
+        }
+    }
+    
     # Helper function: Retrieve the remaining reboot count for a suspended BitLocker volume
     function Get-RebootCount {
         param (
             [Parameter(Mandatory)][string]$MountPoint
         )
         
-        # Lock to OS volume only by design (matches management script behavior)
+        # Lock to OS volume only by design
         if ($MountPoint -ne $script:OsVolume) {
             return $null
         }
@@ -428,9 +572,68 @@ begin {
 # END Block: Generate Card & Finalization
 # =========================================
 end {
+    # ==============================
+    # Pre-flight: Recovery Key Field
+    # ==============================
+    # Before collecting or storing recovery keys, verify the NinjaRMM secure field is writable,
+    # readable, and has sufficient capacity. Uses a realistic-sized test payload matching the
+    # expected format for all fixed drives.
+    #
+    # A single drive entry is ~120 characters:
+    #   "C: - Protector ID: {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} | Recovery Key: XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX-XXXXXX"
+    # Multiple drives are joined with " | ", so 2 drives ~= 245 chars, 3 drives ~= 370 chars.
+    # The default NinjaRMM secure field size is 200 characters, which overflows on 2+ drives.
+    # This pre-flight generates a test payload matching the expected real size to catch truncation early.
+    $script:PreflightPassed = $false
+    if ($VerifyRecoveryKeyStorage -and $UpdateRecoveryKeys) {
+        Write-Log "INFO" "Pre-flight: Testing NinjaRMM secure field accessibility and capacity for '$RecoveryKeySecureFieldName'"
+        $preflightDriveCount = @($script:AllFixedDrives).Count
+        if ($preflightDriveCount -eq 0) { $preflightDriveCount = 1 }
+        [System.Collections.Generic.List[string]]$preflightEntries = @()
+        foreach ($pfDrive in $script:AllFixedDrives) {
+            # Simulate: "C: - Protector ID: {GUID} | Recovery Key: 000000-000000-000000-000000-000000-000000-000000-000000"
+            $preflightEntries.Add("$pfDrive - Protector ID: {00000000-0000-0000-0000-000000000000} | Recovery Key: 000000-000000-000000-000000-000000-000000-000000-000000")
+        }
+        $preflightTestValue = ($preflightEntries -join " | ")
+        Write-Log "INFO" "Pre-flight: Test payload is $($preflightTestValue.Length) characters for $preflightDriveCount drive(s)"
+
+        $preflightWriteSuccess = $false
+        try {
+            try {
+                Ninja-Property-Set -Name $RecoveryKeySecureFieldName -Value $preflightTestValue | Out-Null
+                $preflightWriteSuccess = $true
+            }
+            catch {
+                Ninja-Property-Set $RecoveryKeySecureFieldName $preflightTestValue | Out-Null
+                $preflightWriteSuccess = $true
+            }
+        }
+        catch {
+            Write-Log "ERROR" "Pre-flight FAILED: Cannot write to NinjaRMM secure field '$RecoveryKeySecureFieldName': $($_.Exception.Message)"
+        }
+        if ($preflightWriteSuccess) {
+            $preflightVerified = Test-RecoveryKeyStorageVerification -FieldName $RecoveryKeySecureFieldName -ExpectedValue $preflightTestValue
+            if (-not $preflightVerified) {
+                Write-Log "ERROR" "Pre-flight FAILED: Secure field cannot hold recovery keys for $preflightDriveCount drive(s) ($($preflightTestValue.Length) characters). The field likely has a character limit (default: 200) that is too small."
+                Write-Log "ERROR" "Increase the secure field character limit in NinjaRMM and ensure 'Read/Write' (Automation) is enabled. Recovery keys will NOT be stored this run."
+            }
+            else {
+                Write-Log "SUCCESS" "Pre-flight: Agent cache verified - field is writable, readable, and has sufficient capacity ($($preflightTestValue.Length) chars for $preflightDriveCount drive(s))"
+                $script:PreflightPassed = $true
+            }
+        }
+    }
+    elseif (-not $VerifyRecoveryKeyStorage -and $UpdateRecoveryKeys) {
+        Write-Log "WARNING" "Recovery key storage verification is DISABLED. Keys will be written but NOT verified. Enable VerifyRecoveryKeyStorage for safety."
+        $script:PreflightPassed = $true
+    }
+
+    # ==============================
+    # Card Generation
+    # ==============================
     Write-Host "=== BitLocker Card Generation ==="
     Write-Log "INFO" "Generating status card for all fixed drives"
-    
+
     # Initialize combined HTML for all cards
     $allCardsHtml = ""
     
@@ -468,7 +671,7 @@ end {
                     'DecryptionInProgress' { '<i class="fas fa-check-circle" style="color:#D9534F;"></i> Pending Off' }
                     'FullyDecrypted'       { '<i class="fas fa-check-circle" style="color:#D9534F;"></i> Off' }
                     default {
-                        # If Off and volume status is FullyEncrypted, interpret as suspended (matches management script display)
+                        # If Off and volume status is FullyEncrypted, interpret as suspended
                         $rebootCount = Get-RebootCount -MountPoint ([string]$MountPoint)
                         
                         if ($null -ne $rebootCount -and $rebootCount -gt 0) {
@@ -511,15 +714,39 @@ end {
             }
         }
         
-        # Combine Card Panel Information
-        $bitlockerInfo = [PSCustomObject]@{
-            'Protection Status'       = $protectionStatusHtml
-            'Volume Status'           = $volumeStatusHtml
-            'Volume'                  = $MountPoint
-            'Encryption Method'       = $encryptionMethod
-            'Protectors'              = $protectors
-            'Encrypt Used Space Only' = $usedSpaceOnlyDisplay
+        # Auto-unlock status (non-OS volumes only, only relevant when encrypted)
+        $autoUnlockDisplay = $null
+        if ($MountPoint -ne $script:OsVolume) {
+            if ($blv.VolumeStatus -eq 'FullyDecrypted' -and $blv.ProtectionStatus -eq 'Off') {
+                $autoUnlockDisplay = "N/A"
+            }
+            else {
+                $autoUnlockConfirmed = Test-AutoUnlockStatus -TargetMountPoint $MountPoint
+                if ($autoUnlockConfirmed) {
+                    $autoUnlockDisplay = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Enabled'
+                }
+                else {
+                    $autoUnlockDisplay = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Not Enabled'
+                    Write-Log "WARNING" "Auto-unlock is not enabled for $MountPoint."
+                }
+            }
         }
+        
+        # Combine Card Panel Information
+        $cardProperties = [ordered]@{
+            'Protection Status' = $protectionStatusHtml
+            'Volume Status'     = $volumeStatusHtml
+        }
+        # Only add auto-unlock row for non-OS volumes
+        if ($null -ne $autoUnlockDisplay) {
+            $cardProperties['AutoUnlock'] = $autoUnlockDisplay
+        }
+        $cardProperties['Volume']                  = $MountPoint
+        $cardProperties['Encryption Method']       = $encryptionMethod
+        $cardProperties['Encrypt Used Space Only'] = $usedSpaceOnlyDisplay
+        $cardProperties['Protectors']              = $protectors
+        
+        $bitlockerInfo = [PSCustomObject]$cardProperties
         
         # Generate card for this drive
         $cardHtml = Get-NinjaOneInfoCard `
@@ -543,23 +770,23 @@ end {
         Write-Log "ERROR" "Failed to store status cards: $($_.Exception.Message)"
     }
     
-    # Recovery key workflow (optional)
+    # Recovery key workflow (optional, gated by pre-flight when verification is enabled)
     Write-Host "`n=== Recovery Key Backup ==="
-    if ($UpdateRecoveryKeys) {
-      
+    if ($UpdateRecoveryKeys -and ($script:PreflightPassed -or -not $VerifyRecoveryKeyStorage)) {
+
         foreach ($drive in $script:AllFixedDrives) {
             $blv = Get-BitLockerVolume -MountPoint $drive -ErrorAction SilentlyContinue
             if (-not $blv) { continue }
-            
+
             Collect-RecoveryKey -volume $blv
-            
+
             if ($BackupToAD) {
                 Write-Log "INFO" "Backing up $drive recovery key to Intune/AD"
                 Backup-KeyToAD -volume $blv
             }
         }
-        
-        # Store all recovery keys in a deterministic, multi-line format (stable ordering: OS first)
+
+        # Store all recovery keys in a deterministic format (stable ordering: OS first, then alphabetical)
         Write-Log "INFO" "Storing recovery key(s) in secure field"
         try {
             if ($script:RecoveryKeys.Count -eq 0) {
@@ -573,7 +800,7 @@ end {
                         @{ Expression = { if ($_ -eq $script:OsVolume) { 0 } else { 1 } } }, `
                         @{ Expression = { $_ } }
                 )
-                
+
                 [System.Collections.Generic.List[string]]$lines = @()
                 foreach ($mp in $orderedMountPoints) {
                     if ($script:RecoveryKeys.ContainsKey($mp)) {
@@ -583,10 +810,10 @@ end {
                         $lines.Add("Drive: $mp - None")
                     }
                 }
-                
-                # Separator per key (matches management script behavior)
+
+                # Separator per key
                 $allKeys = ($lines -join " | ")
-                
+
                 # Use named params if available, otherwise positional (keeps compatibility across Ninja module variants)
                 $stored = $false
                 try {
@@ -596,19 +823,21 @@ end {
                 catch {
                     # Swallow
                 }
-                
+
                 if (-not $stored) {
                     Ninja-Property-Set $RecoveryKeySecureFieldName $allKeys | Out-Null
                 }
-                
+
                 Write-Log "SUCCESS" "Stored recovery keys for drive(s) ($($orderedMountPoints -join ', ')) in '$RecoveryKeySecureFieldName'"
-                
                 Clear-Memory -VariableNames "allKeys"
             }
         }
         catch {
             Write-Log "ERROR" "Failed to store recovery keys: $($_.Exception.Message)"
         }
+    }
+    elseif ($UpdateRecoveryKeys -and -not $script:PreflightPassed) {
+        Write-Log "ERROR" "Recovery key storage skipped - pre-flight verification failed. Keys were NOT collected or stored."
     }
     else {
         Write-Log "INFO" "UpdateRecoveryKeys is false; skipping storage of recovery keys"
