@@ -149,4 +149,4 @@ _Read-only reporting for all fixed disks; collects recovery keys and renders a s
 - Eliminate reliance on AAD, Intune, or Group Policy for full BitLocker lifecycle management
 - Store critical encryption data securely within your RMM for **auditing or support**
 
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/Bitlocker%20Management/images/MultiDriveExample.png" alt="BitLocker Multi-Drive View Example" width="360px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/Bitlocker%20Management/images/MultiVolumeExample.png" alt="BitLocker Multi-Volume View Example" width="360px" />
