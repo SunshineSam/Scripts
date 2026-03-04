@@ -823,7 +823,7 @@ end {
             
             if ($oemKeyGuide) {
                 $guideHtml = '<br /><a href="' + $oemKeyGuide + '" target="_blank">OEM Key Reset Guide</a>'
-                $guidePlain = "`nSee BIOS Secure Boot key guide:`n    " + $oemKeyGuide
+                $guidePlain = "`nSee BIOS Secure Boot key guide in Status Card" 
             }
             else {
                 $guideHtml = ''
@@ -832,11 +832,11 @@ end {
             
             if ($has2023InDb) {
                 $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the OS-side validation is stuck on 1801.<br />2023 certs in db; OS update triggered via reg key<br />to resolve before June 2026 deadline.'
-                $plainText     = '❌ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801; triggered reg update. Action Required.'
+                $plainText     = '❌ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801; triggered reg update. Pending Windows Update rotation'
             }
             elseif ($has2023InDbDefault) {
                 $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the BIOS active database has NOT been updated.<br />BIOS supports via default db; reset Secure Boot keys<br />in BIOS to apply before the June 2026 deadline.<br /> Re-Run script after secure boot keys are cleared!' + $bitlockerNote + $guideHtml
-                $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801). Action Required.' + $guidePlain
+                $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + 'BIOS Key Reset Required.'
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -846,14 +846,14 @@ end {
                 $oemBiosGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosGuide) {
                     $biosGuideHtml = '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
-                    $biosGuidePlain = "`nSee BIOS update guide:`n    " + $oemBiosGuide
+                    $biosGuidePlain = "`nSee BIOS update guide in Status Card."
                 }
                 else {
                     $biosGuideHtml = ''
                     $biosGuidePlain = ''
                 }
                 $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $biosGuideHtml
-                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault; OEM BIOS/firmware update required. Action Required.' + $biosGuidePlain
+                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault.' + $biosGuidePlain + ' OEM BIOS/firmware update required.'
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -882,7 +882,7 @@ end {
                 $bitlockerNotePlain = " Suspend BitLocker or have recovery keys for each enabled volume before resetting keys."
                 if ($oemKeyGuide) {
                     $guideHtml = '<br /><a href="' + $oemKeyGuide + '" target="_blank">OEM Key Reset Guide</a>'
-                    $guidePlain = "`nSee BIOS Secure Boot key guide:`n    " + $oemKeyGuide
+                    $guidePlain = "`nSee BIOS Secure Boot key guide in Status Card"
                 }
                 else {
                     $guideHtml = ''
@@ -891,31 +891,32 @@ end {
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
-                $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br />Awaiting Windows Update to deploy, or reset Secure Boot<br />keys in BIOS to apply from defaults.' + $bitlockerNote + $guideHtml
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; awaiting Windows Update or reset keys in BIOS. Pending.' + $guidePlain
+                $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br /> Reset Secure Boot keys in BIOS to apply from defaults.<br /> Re-Run after for an updated status.' + $bitlockerNote + $guideHtml
+                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS before Windows can complete the rotate. Pending BIOS key reset.' + $guidePlain
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
-            } else {
-                # 2023 cert not in db OR dbDefault — firmware update likely required before Windows Update can help
+            }
+            else {
+                # 2023 cert not in db OR dbDefault — firmware update required before Windows Update can help
                 $oemBiosUpdateGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosUpdateGuide) {
                     $guideHtml = '<br /><a href="' + $oemBiosUpdateGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
-                    $guidePlain = "`nSee BIOS update guide:`n    " + $oemBiosUpdateGuide
+                    $guidePlain = "`nSee BIOS update guide in Status Card."
                 }
                 else {
                     $guideHtml = ''
-                    $guidePlain = ''
+                    $guidePlain = "See BIOS update guide in Status Card."
                 }
                 $statusKey     = 'ActionRequired'
                 $cardIconColor = '#D9534F'
                 $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                 $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $guideHtml
-                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault; OEM BIOS/firmware update required. Action Required.' + $guidePlain
+                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault; OEM BIOS/firmware update required.' + $guidePlain + ' BIOS update Required.'
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
-                $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events — firmware lacks 2023 certificate support'
+                $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events — BIOS lacks 2023 certificate support'
             }
             $statusEmoji = '⚠️'
             break
