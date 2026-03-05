@@ -4,7 +4,7 @@
     Last Edit: 02-27-2026
     
     Note:
-    03-02-2026: Added the abillity to optional store the status outputs under local storage.
+    03-02-2026: Added the abillity to optionally store the status outputs under local storage.
                 This outputs 2 files and bypasses the Ninja custom field storage logic.
     02-26-2026: Implemented additional checks for reliable Secure Boot detection.
                 Fixed handling of UEFI variable Bytes as array; added parsing of
@@ -823,7 +823,7 @@ end {
             
             if ($oemKeyGuide) {
                 $guideHtml = '<br /><a href="' + $oemKeyGuide + '" target="_blank">OEM Key Reset Guide</a>'
-                $guidePlain = "`nSee BIOS Secure Boot key guide in Status Card" 
+                $guidePlain = "`nSee BIOS Secure Boot key guide in Status Card." 
             }
             else {
                 $guideHtml = ''
@@ -836,7 +836,7 @@ end {
             }
             elseif ($has2023InDbDefault) {
                 $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the BIOS active database has NOT been updated.<br />BIOS supports via default db; reset Secure Boot keys<br />in BIOS to apply before the June 2026 deadline.<br /> Re-Run script after secure boot keys are cleared!' + $bitlockerNote + $guideHtml
-                $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + 'BIOS Key Reset Required.'
+                $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + ' BIOS Key Reset Required.'
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -873,7 +873,7 @@ end {
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = '2023 Secure Boot certificate is present in the active db<br />but no completion events (1808/1801) were logged.<br />Cert may have been pre-installed by firmware.<br />Awaiting Windows Update to finalize validation.'
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged; awaiting Windows Update to finalize. Pending.'
+                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize. Pending probable reboot.'
             }
             elseif ($has2023InDbDefault) {
                 # 2023 cert in firmware defaults but not deployed — Windows Update or key reset can resolve
@@ -892,7 +892,7 @@ end {
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br /> Reset Secure Boot keys in BIOS to apply from defaults.<br /> Re-Run after for an updated status.' + $bitlockerNote + $guideHtml
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS before Windows can complete the rotate. Pending BIOS key reset.' + $guidePlain
+                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS before Windows can complete the rotation. Pending BIOS key reset.' + $guidePlain
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -952,7 +952,7 @@ end {
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = 'Event 1799 detected (boot manager installed).<br />Pending UEFI final validation (1808) ~15 min.'
-                $plainText     = '⚠️ Secure Boot Enabled. 1799 detected, awaiting 1808 (~15 min). Pending.'
+                $plainText     = '⚠️ Secure Boot Enabled. 1799 detected, awaiting 1808 (~15 min). Pending final event confirmation.'
                 $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> 1799 detected; awaiting 1808 (~15 min)'
                 $statusEmoji = '⚠️'
             }
@@ -962,7 +962,7 @@ end {
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = 'Event 1799 detected (boot manager installed).<br />But over 20 minutes ago without 1808.<br />Likely pending a system restart to complete.'
-                $plainText     = '⚠️ Secure Boot Enabled. 1799 old (>20 min), no 1808; likely pending restart. Pending.'
+                $plainText     = '⚠️ Secure Boot Enabled. 1799 old (>20 min), no 1808. Likely pending restart.'
                 $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> 1799 old; likely pending restart'
                 $statusEmoji = '⚠️'
                 $rebootStatus = Get-PendingRebootStatus
@@ -986,16 +986,16 @@ end {
                     $sourceList = $rebootStatus.Sources -join ', '
                     Write-Log "INFO" "Reboot pending from: $sourceList"
                     $detailRowHtml = 'Triggered OS-side update.<br />No 1799 yet (boot manager install).<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; no 1799 yet. Reboot pending (' + $sourceList + '). Pending.'
+                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; no 1799 yet. Reboot pending (' + $sourceList + ').'
                     if ($plainText.Length -gt 200) {
                         $plainText = $plainText.Substring(0, 197) + '...'
                     }
-                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Awaiting 1799 — reboot pending (' + $sourceList + ')'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Awaiting 1799 - reboot pending (' + $sourceList + ')'
                 }
                 else {
                     Write-Log "INFO" "No pending reboot detected"
                     $detailRowHtml = 'Triggered OS-side update.<br />No 1799 yet (boot manager install).<br />Pending signed boot manager confirmation (1799) ~5 min.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; awaiting 1799 (~5 min). Pending.'
+                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; awaiting 1799 (~5 min). Pending event validation.'
                     $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> Awaiting 1799 (~5 min)'
                 }
                 $statusEmoji = '⚠️'
