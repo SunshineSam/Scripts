@@ -1,9 +1,13 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 02-27-2026
+    Last Edit: 03-05-2026
     
     Note:
+    03-05-2026: Added passive UEFI variable attributes check for 'db'. This indicates the OS is Allowed to
+                write directly to the UEFI cert db, which windows should then eventually update on its own, without
+                a need to update the BIOS/Firmware individually (insightful for systems with no BIOS update).
+                Integrated into core logic: Passive check always runs if Secure Boot Enabled.
     03-02-2026: Added the abillity to optionally store the status outputs under local storage.
                 This outputs 2 files and bypasses the Ninja custom field storage logic.
     02-26-2026: Implemented additional checks for reliable Secure Boot detection.
@@ -55,6 +59,10 @@
 .PARAMETER SaveStatusLocal
     If specified, saves the plain-text status to a local text file and the HTML card to a local HTML file,
     in addition to any NinjaRMM field updates. Useful for non-NinjaRMM environments.
+
+.PARAMETER TestUEFIEnvironmentVariableAccess
+    If specified, performs an active test of UEFI variable writability using a custom test variable.
+    This is optional and only runs if Secure Boot is Enabled.
 #>
 
 [CmdletBinding()]
@@ -340,6 +348,173 @@ begin {
         }
     }
     
+    ###########
+    # Sources #
+    ###########
+    # https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-secure-boot-key-creation-and-management-guidance?view=windows-11#appendix-b--secure-boot-apis
+    # https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/modify-firmware-environment-values
+    # https://superuser.com/questions/1045279/use-bcdedit-to-configure-pxe-boot-as-default-boot-option
+    # https://www.powershellgallery.com/packages/Set-Privilege/1.0.1/Content/Set-Privilege.ps1
+    # https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfirmwareenvironmentvariablea
+    # https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfirmwareenvironmentvariableexa
+    # https://github.com/perturbed-platypus/UEFIReadCPP/blob/master/uefiCPP/uefiCPP.cpp
+    # https://tools.thehacker.recipes/mimikatz/modules/privilege/sysenv
+    # https://www.powershellgallery.com/packages/HP.ClientManagement/1.7.2/Content/HP.UEFI.psm1
+    # https://wikileaks.org/ciav7p1/cms/page_26968084.html
+    # https://docs.system-transparency.org/st-1.3.0/docs/reference/efi-variables/
+    
+    # New Helper function: Get UEFI variable attributes (passive check)
+    # P/Invoke setup for GetFirmwareEnvironmentVariableExA and token privilege management
+    Add-Type -MemberDefinition @"
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+        public static extern uint GetFirmwareEnvironmentVariableExA(
+            string lpName,
+            string lpGuid,
+            byte[] pBuffer,
+            uint nSize,
+            ref uint pdwAttributes
+        );
+        
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+        
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+        
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool OpenProcessToken(
+            IntPtr ProcessHandle,
+            uint DesiredAccess,
+            out IntPtr TokenHandle
+        );
+        
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool LookupPrivilegeValue(
+            string lpSystemName,
+            string lpName,
+            out long lpLuid
+        );
+        
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AdjustTokenPrivileges(
+            IntPtr TokenHandle,
+            [MarshalAs(UnmanagedType.Bool)] bool DisableAllPrivileges,
+            ref TOKEN_PRIVILEGES NewState,
+            uint BufferLength,
+            IntPtr PreviousState,
+            IntPtr ReturnLength
+        );
+        
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct TOKEN_PRIVILEGES {
+            public uint PrivilegeCount;
+            public long Luid;
+            public uint Attributes;
+        }
+"@ -Namespace Win32 -Name NativeMethods
+    
+    # Helper function: Enable SeSystemEnvironmentPrivilege for the current process token
+    # Required before calling GetFirmwareEnvironmentVariableExA (Error 1314 without it)
+    function Enable-SeSystemEnvironmentPrivilege {
+        $tokenHandle = [IntPtr]::Zero
+        try {
+            $processHandle = [Win32.NativeMethods]::GetCurrentProcess()
+            # TOKEN_ADJUST_PRIVILEGES (0x20) | TOKEN_QUERY (0x08)
+            if (-not [Win32.NativeMethods]::OpenProcessToken($processHandle, 0x0028, [ref]$tokenHandle)) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Log "WARNING" "OpenProcessToken failed: Win32 error $err"
+                return $false
+            }
+            
+            $luid = [long]0
+            if (-not [Win32.NativeMethods]::LookupPrivilegeValue($null, "SeSystemEnvironmentPrivilege", [ref]$luid)) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Log "WARNING" "LookupPrivilegeValue failed: Win32 error $err"
+                return $false
+            }
+            
+            $tp = New-Object Win32.NativeMethods+TOKEN_PRIVILEGES
+            $tp.PrivilegeCount = 1
+            $tp.Luid = $luid
+            $tp.Attributes = 2  # SE_PRIVILEGE_ENABLED
+            
+            if (-not [Win32.NativeMethods]::AdjustTokenPrivileges($tokenHandle, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero)) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Log "WARNING" "AdjustTokenPrivileges failed: Win32 error $err"
+                return $false
+            }
+            
+            # AdjustTokenPrivileges returns true even if not all privileges assigned (error 1300)
+            $lastErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($lastErr -eq 1300) {
+                Write-Log "WARNING" "SeSystemEnvironmentPrivilege not held by this process token"
+                return $false
+            }
+            
+            Write-Log "INFO" "SeSystemEnvironmentPrivilege enabled successfully"
+            return $true
+        }
+        finally {
+            if ($tokenHandle -ne [IntPtr]::Zero) {
+                [Win32.NativeMethods]::CloseHandle($tokenHandle) | Out-Null
+            }
+        }
+    }
+
+    # Utilize the invoke import
+    function Get-UefiVariableAttributes {
+        param (
+            [string]$VarName = "db",
+            [string]$Guid = "{d719b2cb-3d3a-4596-a3bc-dad00e67656f}"  # EFI_IMAGE_SECURITY_DATABASE_GUID (for db/dbx)
+        )
+        
+        # Enable SeSystemEnvironmentPrivilege (required for UEFI variable access)
+        $privEnabled = Enable-SeSystemEnvironmentPrivilege
+        if (-not $privEnabled) {
+            Write-Log "WARNING" "Could not enable SeSystemEnvironmentPrivilege; UEFI attributes check may fail"
+        }
+        
+        $buffer = New-Object byte[] 65536  # 64 KB — Dell/OEM db can exceed 4 KB
+        $attributes = [uint32]0
+        $result = [Win32.NativeMethods]::GetFirmwareEnvironmentVariableExA(
+            $VarName,
+            $Guid,
+            $buffer,
+            $buffer.Length,
+            [ref]$attributes
+        )
+        
+        if ($result -eq 0) {
+            $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log "ERROR" "Failed to get $VarName attributes. Error: $errorCode (1=Invalid Function/legacy BIOS; 5=Access Denied; 122=Buffer too small; 1314=Privilege not held)"
+            return $null
+        }
+        
+        Write-Log "INFO" ("{0} attributes: 0x{1:X8}" -f $VarName, $attributes)
+        
+        # Interpret attributes
+        $hasRuntimeAccess = ($attributes -band 0x00000004) -ne 0  # OS can access at runtime
+        $hasTimeBasedAuth = ($attributes -band 0x00000020) -ne 0  # Authenticated writes supported (Windows handles signing)
+        $hasAppendWrite   = ($attributes -band 0x00000040) -ne 0  # Append write mode (not always reported in stored attributes)
+        
+        Write-Log "INFO" "Runtime Access: $hasRuntimeAccess (OS can access UEFI var at runtime)"
+        Write-Log "INFO" "Time-Based Authenticated Write: $hasTimeBasedAuth (Windows can sign and push updates)"
+        if ($hasAppendWrite) { Write-Log "INFO" "Append Write: True (firmware reports append mode)" }
+        
+        if ($hasRuntimeAccess -and $hasTimeBasedAuth) {
+            Write-Log "SUCCESS" "$VarName is runtime-writable via authenticated updates`n    Windows is CAPABLE of (and eventually will) update the cert without a manual BIOS upgrade"
+        }
+        else {
+            Write-Log "WARNING" "$VarName may not be writable from Windows (missing Runtime Access or Authenticated Write)"
+        }
+        
+        return $attributes
+    }
+    
     # Helper function: Query the System event log for Secure Boot certificate update events
     # Event 1808 = Certificates updated successfully in BIOS (compliant)
     # Event 1801 = Certificates updated in Windows but NOT yet in BIOS (action required)
@@ -520,7 +695,8 @@ begin {
                 Write-Log "ERROR" "Failed to apply WinCS key: $($_.Exception.Message)"
                 return $false
             }
-        } else {
+        }
+        else {
             Write-Log "INFO" "WinCsFlags.exe not found; reg key should push this through still"
             return $false
         }
@@ -705,6 +881,14 @@ end {
                 Write-Log "WARNING" "Failed to check 2023 cert in dbDefault: $($_.Exception.Message)"
             }
         }
+        
+        # Always perform passive attributes check for 'db'
+        Write-Host "`n === Windows UEFI DB Access Check ==="
+        Write-Log "INFO" "Performing passive UEFI variable attributes check for 'db'"
+        $dbAttributes = Get-UefiVariableAttributes -VarName "db"
+        $dbIsOsWritable = $null -ne $dbAttributes -and (($dbAttributes -band 0x00000004) -ne 0) -and (($dbAttributes -band 0x00000020) -ne 0)
+        Write-Log "INFO" "OS capable of writing to UEFI db: $dbIsOsWritable"
+        Write-Host ""
     }
     
     # -----------------------------------------------
@@ -842,23 +1026,28 @@ end {
                 }
             }
             else {
-                # 2023 cert not in db OR dbDefault — firmware update required
+                # 2023 cert not in db OR dbDefault — firmware update or OS-driven update needed
                 $oemBiosGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosGuide) {
                     $biosGuideHtml = '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
-                    $biosGuidePlain = "`nSee BIOS update guide in Status Card."
                 }
                 else {
                     $biosGuideHtml = ''
-                    $biosGuidePlain = ''
                 }
-                $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $biosGuideHtml
-                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault.' + $biosGuidePlain + ' OEM BIOS/firmware update required.'
+                if ($dbIsOsWritable) {
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update will eventually push the cert automatically,<br />or a manual BIOS update can be applied.' + $biosGuideHtml
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if availiable.'
+                    $statusEmoji = '⚠️'
+                }
+                else {
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $biosGuideHtml
+                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required.'
+                    $statusEmoji = '❌'
+                }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
             }
-            $statusEmoji = '❌'
             break
         }
         
@@ -898,27 +1087,36 @@ end {
                 }
             }
             else {
-                # 2023 cert not in db OR dbDefault — firmware update required before Windows Update can help
+                # 2023 cert not in db OR dbDefault — firmware update or OS-driven update needed
                 $oemBiosUpdateGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosUpdateGuide) {
                     $guideHtml = '<br /><a href="' + $oemBiosUpdateGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
-                    $guidePlain = "`nSee BIOS update guide in Status Card."
                 }
                 else {
                     $guideHtml = ''
-                    $guidePlain = "See BIOS update guide in Status Card."
                 }
-                $statusKey     = 'ActionRequired'
-                $cardIconColor = '#D9534F'
-                $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
-                $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $guideHtml
-                $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault; OEM BIOS/firmware update required.' + $guidePlain + ' BIOS update Required.'
+                if ($dbIsOsWritable) {
+                    $statusKey     = 'Pending'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update may push the cert automatically,<br />or a manual BIOS update can be applied.' + $guideHtml
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows can update BIOS db directly, or push BIOS update.'
+                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events — Windows capable of updating BIOS db'
+                    $statusEmoji = '⚠️'
+                }
+                else {
+                    $statusKey     = 'ActionRequired'
+                    $cardIconColor = '#D9534F'
+                    $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $guideHtml
+                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required.'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events — BIOS lacks 2023 certificate support'
+                    $statusEmoji = '❌'
+                }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
-                $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events — BIOS lacks 2023 certificate support'
             }
-            $statusEmoji = '⚠️'
             break
         }
         
