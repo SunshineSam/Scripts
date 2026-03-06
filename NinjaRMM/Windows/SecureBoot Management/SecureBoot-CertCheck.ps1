@@ -1035,8 +1035,12 @@ end {
                     $biosGuideHtml = ''
                 }
                 if ($dbIsOsWritable) {
+                    $statusKey     = 'ActionOptional'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update will eventually push the cert automatically,<br />or a manual BIOS update can be applied.' + $biosGuideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if availiable.'
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if available.'
                     $statusEmoji = '⚠️'
                 }
                 else {
