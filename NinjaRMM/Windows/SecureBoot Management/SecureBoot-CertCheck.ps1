@@ -1019,8 +1019,19 @@ end {
                 $plainText     = '❌ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801; triggered reg update. Pending Windows Update rotation'
             }
             elseif ($has2023InDbDefault) {
-                $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the BIOS active database has NOT been updated.<br />BIOS supports via default db; reset Secure Boot keys<br />in BIOS to apply before the June 2026 deadline.<br /> Re-Run script after secure boot keys are cleared!' + $bitlockerNote + $guideHtml
-                $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + ' BIOS Key Reset Required.'
+                if ($dbIsOsWritable) {
+                    $statusKey     = 'ActionOptional'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
+                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately.' + $bitlockerNote + $guideHtml
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault; Windows will push to db directly, or reset keys to apply now.'
+                    $statusEmoji = '⚠️'
+                }
+                else {
+                    $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the BIOS active database has NOT been updated.<br />BIOS supports via default db; reset Secure Boot keys<br />in BIOS to apply before the June 2026 deadline.<br /> Re-Run script after secure boot keys are cleared!' + $bitlockerNote + $guideHtml
+                    $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + ' BIOS Key Reset Required.'
+                }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -1083,9 +1094,16 @@ end {
                 }
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
-                $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br /> Reset Secure Boot keys in BIOS to apply from defaults.<br /> Re-Run after for an updated status.' + $bitlockerNote + $guideHtml
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS before Windows can complete the rotation. Pending BIOS key reset.' + $guidePlain
+                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Action Optional'
+                if ($dbIsOsWritable) {
+                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately.' + $bitlockerNote + $guideHtml
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault; Windows will push to db directly, or reset keys to apply now.'
+                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events — Windows capable of updating BIOS db'
+                }
+                else {
+                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br /> Reset Secure Boot keys in BIOS to apply from defaults.<br /> Re-Run after for an updated status.' + $bitlockerNote + $guideHtml
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS (see card details) before Windows can complete the rotation. Pending BIOS key reset.'
+                }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
@@ -1102,7 +1120,7 @@ end {
                 if ($dbIsOsWritable) {
                     $statusKey     = 'Pending'
                     $cardIconColor = '#F0AD4E'
-                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Action Optional'
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update may push the cert automatically,<br />or a manual BIOS update can be applied.' + $guideHtml
                     $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows can update BIOS db directly, or push BIOS update.'
                     $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events — Windows capable of updating BIOS db'
@@ -1183,7 +1201,7 @@ end {
                 $rebootStatus = Get-PendingRebootStatus
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Restart'
                 if ($rebootStatus.Pending) {
                     $sourceList = $rebootStatus.Sources -join ', '
                     Write-Log "INFO" "Reboot pending from: $sourceList"
