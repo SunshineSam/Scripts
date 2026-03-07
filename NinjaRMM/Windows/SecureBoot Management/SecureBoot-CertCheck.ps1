@@ -31,22 +31,33 @@
 
 <#
 .SYNOPSIS
-    Reports Secure Boot status and 2023 certificate update state for NinjaRMM.
+    Audits Secure Boot certificate rotation (Windows UEFI CA 2023) and reports
+    actionable status via NinjaRMM custom fields.
 
 .DESCRIPTION
     Checks whether the machine supports UEFI Secure Boot, whether it is enabled,
-    and (if enabled) queries the System event log for Microsoft-Windows-TPM-WMI
-    events 1808 (BIOS updated - compliant) and 1801 (Windows updated but BIOS
-    not yet updated - action required). Outputs an HTML status card and a
-    searchable plain-text summary to NinjaRMM custom fields.
-    
-    The five possible output states are:
-      1. Not Applicable  - Non-UEFI or unsupported hardware (Confirm-SecureBootUEFI throws)
-      2. Disabled        - UEFI capable but Secure Boot is off
-      3. Compliant       - Secure Boot on, Event 1808 found (BIOS certs updated)
-      4. Action Required - Secure Boot on, Event 1801 found (BIOS firmware update needed)
-                         - OR Secure Boot on, no events, and 2023 cert missing from both db and dbDefault
-      5. Pending         - Secure Boot on, no events, 2023 cert in db or dbDefault (awaiting update)
+    and (if enabled) audits the actual UEFI signature database (db/dbDefault/dbx)
+    for the 2023 certificate, queries the System event log for TPM-WMI events
+    (1808/1801/1799), and performs a passive UEFI variable attributes check via
+    GetFirmwareEnvironmentVariableExA to determine if Windows can write directly
+    to the BIOS cert db. Where possible, automatically triggers the OS-side
+    update (registry key + WinCsFlags + scheduled task) and reports the result.
+    Outputs an HTML status card and a searchable plain-text summary to NinjaRMM
+    custom fields.
+
+    The seven possible output states are:
+      1. Not Applicable       - Non-UEFI or unsupported hardware
+      2. Disabled             - UEFI capable but Secure Boot is off
+      3. Compliant            - Secure Boot on, Event 1808 found (BIOS certs updated)
+      4. Action Required      - 2023 cert missing and Windows cannot write to the BIOS db;
+                                OEM firmware update or manual key reset required
+      5. Action Optional      - 2023 cert missing (or in dbDefault only), but the UEFI db is
+                                OS-writable; Windows Update will push the cert automatically,
+                                or a manual BIOS update / key reset can expedite
+      6. Pending              - 2023 cert in db or dbDefault but rotation not yet complete;
+                                OS update triggered where applicable
+      7. Pending (Trigger)    - OS-side update triggered; monitoring for Event 1799 -> 1808
+                                progression, with reboot detection if stalled
 
 .PARAMETER StatusCardFieldName
     NinjaRMM WYSIWYG custom field name for the HTML status card.
@@ -59,10 +70,6 @@
 .PARAMETER SaveStatusLocal
     If specified, saves the plain-text status to a local text file and the HTML card to a local HTML file,
     in addition to any NinjaRMM field updates. Useful for non-NinjaRMM environments.
-
-.PARAMETER TestUEFIEnvironmentVariableAccess
-    If specified, performs an active test of UEFI variable writability using a custom test variable.
-    This is optional and only runs if Secure Boot is Enabled.
 #>
 
 [CmdletBinding()]
