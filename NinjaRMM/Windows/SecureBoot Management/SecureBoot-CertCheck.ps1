@@ -1,9 +1,16 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 03-05-2026
-    
+    Last Edit: 03-18-2026
+
     Note:
+    03-18-2026: Added "Action Optional" state when UEFI db is OS-writable, downgrades
+                Action Required to Action Optional (Windows will push cert automatically).
+                Applied to both State 4 (Event 1801) and State 5 (Pending/no events) when
+                cert is missing from db or only in dbDefault.
+                Added "Audit Secure Boot management status" action, read-only check of
+                telemetry keys (AllowTelemetry, MaxTelemetryAllowed), and opt-in keys
+                (MicrosoftUpdateManagedOptIn, AvailableUpdates) without making changes..
     03-05-2026: Added passive UEFI variable attributes check for 'db'. This indicates the OS is Allowed to
                 write directly to the UEFI cert db, which windows should then eventually update on its own, without
                 a need to update the BIOS/Firmware individually (insightful for systems with no BIOS update).
@@ -31,33 +38,64 @@
 
 <#
 .SYNOPSIS
-    Audits Secure Boot certificate rotation (Windows UEFI CA 2023) and reports
-    actionable status via NinjaRMM custom fields.
+    Audits Secure Boot certificate rotation (Microsoft 2023 certs) across db,
+    KEK, and dbDefault, and reports actionable status via NinjaRMM custom fields.
+    Optionally enables or removes the Windows Update opt-in for Secure Boot management.
 
 .DESCRIPTION
     Checks whether the machine supports UEFI Secure Boot, whether it is enabled,
-    and (if enabled) audits the actual UEFI signature database (db/dbDefault/dbx)
-    for the 2023 certificate, queries the System event log for TPM-WMI events
-    (1808/1801/1799), and performs a passive UEFI variable attributes check via
-    GetFirmwareEnvironmentVariableExA to determine if Windows can write directly
-    to the BIOS cert db. Where possible, automatically triggers the OS-side
-    update (registry key + WinCsFlags + scheduled task) and reports the result.
+    and (if enabled) performs a comprehensive audit:
+      
+      Certificate databases:
+        - Parses db (allowed signatures), KEK (key exchange keys), dbx (revocations),
+          and dbDefault (firmware defaults) for X509 certificates.
+        - Checks for all four 2023 certificates Microsoft is rotating to:
+            db:  Windows UEFI CA 2023, Microsoft Corporation UEFI CA 2023,
+                 Microsoft Option ROM UEFI CA 2023
+            KEK: Microsoft Corporation KEK 2K CA 2023
+        - KEK is the trust authority that authorizes writes to db. If the 2023 KEK
+          authority cert is missing, Windows Update cannot sign the payload needed
+          to push new certs into db — even if UEFI attributes allow runtime writes.
+      
+      UEFI variable attributes (passive, read-only):
+        - Uses GetFirmwareEnvironmentVariableExA (P/Invoke) with
+          SeSystemEnvironmentPrivilege to read the db variable attributes under the
+          EFI Image Security Database GUID.
+        - Checks for RUNTIME_ACCESS (0x04) and TIME_BASED_AUTHENTICATED_WRITE_ACCESS (0x20).
+        - Combined with the KEK 2023 check, determines whether Windows Update can
+          effectively write to the BIOS cert db from the OS.
+      
+      Event log (TPM-WMI):
+        - Queries for Events 1808 (compliant), 1801 (action required), and 1799
+          (boot manager installed — intermediate progress).
+      
+      Scheduled task:
+        - Checks whether \Microsoft\Windows\PI\Secure-Boot-Update exists.
+      
+      Automation (when 2023 cert is in db but OS hasn't acknowledged via 1808):
+        - Sets AvailableUpdates + MicrosoftUpdateManagedOptIn (0x5944)
+        - Runs WinCsFlags.exe /apply if available
+        - Triggers the Secure-Boot-Update scheduled task
+        - Waits and checks for post-trigger event progression (1799 -> 1808)
+    
     Outputs an HTML status card and a searchable plain-text summary to NinjaRMM
-    custom fields.
-
+    custom fields (or local files via -SaveStatusLocal).
+    
     The seven possible output states are:
-      1. Not Applicable       - Non-UEFI or unsupported hardware
-      2. Disabled             - UEFI capable but Secure Boot is off
-      3. Compliant            - Secure Boot on, Event 1808 found (BIOS certs updated)
-      4. Action Required      - 2023 cert missing and Windows cannot write to the BIOS db;
-                                OEM firmware update or manual key reset required
-      5. Action Optional      - 2023 cert missing (or in dbDefault only), but the UEFI db is
-                                OS-writable; Windows Update will push the cert automatically,
-                                or a manual BIOS update / key reset can expedite
-      6. Pending              - 2023 cert in db or dbDefault but rotation not yet complete;
-                                OS update triggered where applicable
-      7. Pending (Trigger)    - OS-side update triggered; monitoring for Event 1799 -> 1808
-                                progression, with reboot detection if stalled
+      1. Not Applicable    - Non-UEFI or unsupported hardware
+      2. Disabled          - UEFI capable but Secure Boot is off
+      3. Compliant         - Secure Boot on, Event 1808 found (BIOS certs updated)
+      4. Action Required   - 2023 certs missing and Windows cannot write to the BIOS db
+                             (UEFI attributes or KEK authority missing); OEM firmware
+                             update or manual key reset required
+      5. Action Optional   - 2023 certs missing (or in dbDefault only), but the UEFI db
+                             is OS-writable (attributes + KEK both present); Windows
+                             Update will push the cert automatically, or a manual BIOS
+                             update / key reset can expedite
+      6. Pending           - 2023 cert in db or dbDefault but rotation not yet complete;
+                             OS update triggered where applicable
+      7. Pending (Trigger) - OS-side update triggered; monitoring for Event 1799 -> 1808
+                             progression, with reboot detection if stalled
 
 .PARAMETER StatusCardFieldName
     NinjaRMM WYSIWYG custom field name for the HTML status card.
@@ -68,8 +106,41 @@
     Defaults to "SecureBootCertStatus" or env:secureBootPlainTextField.
 
 .PARAMETER SaveStatusLocal
-    If specified, saves the plain-text status to a local text file and the HTML card to a local HTML file,
-    in addition to any NinjaRMM field updates. Useful for non-NinjaRMM environments.
+    If specified, saves the plain-text status to a local text file and the HTML card
+    to a local HTML file, in addition to any NinjaRMM field updates. Useful for
+    non-NinjaRMM environments.
+
+.PARAMETER SecureBootAction
+    Optional action to take in addition to the certificate audit (which always runs).
+    ValidateSet: "Enable opt-in for SecureBoot management",
+                 "Remove opt-in for SecureBoot management",
+                 "Audit SecureBoot management status"
+      
+      - Enable opt-in for SecureBoot management
+            Sets required telemetry to minimum (AllowTelemetry=1,
+            MaxTelemetryAllowed=1, per-user ShowedToastAtLevel=1), then sets
+            MicrosoftUpdateManagedOptIn=0x5944 and AvailableUpdates=0x5944 to
+            opt-in and trigger Secure Boot cert updates via Windows Update.
+            If 1808 is already present (compliant), the script still follows
+            through but notes that enablement was not strictly necessary.
+      
+      - Remove opt-in for SecureBoot management
+            Removes telemetry enforcement keys (AllowTelemetry,
+            MaxTelemetryAllowed) and removes MicrosoftUpdateManagedOptIn to
+            opt out of Secure Boot management via Windows Update. Does NOT
+            remove AvailableUpdates (already-triggered updates should complete).
+      
+      - Audit SecureBoot management status
+            Read-only check of the current opt-in and telemetry configuration.
+            Reports the state of AllowTelemetry, MaxTelemetryAllowed,
+            MicrosoftUpdateManagedOptIn, and AvailableUpdates registry keys
+            without making any changes. Useful for verifying whether a device
+            is properly configured for Windows Update to manage Secure Boot
+            certificates.
+
+.PARAMETER IncludeDefaultHive
+    Switch: Include the Default user profile template (C:\Users\Default) when applying
+    per-user telemetry keys. Only effective when running as SYSTEM. Default: $false.
 #>
 
 [CmdletBinding()]
@@ -81,6 +152,11 @@ param(
     # Other options                 Ninja Variable Resolution                                             Fallback
     [switch]$SaveLogToDevice = $(if ($env:saveLogToDevice) { [Convert]::ToBoolean($env:saveLogToDevice) } else { $true }), # Ninja Script Variable; Checkbox
     [switch]$SaveStatusLocal = $(if ($env:saveStatusLocal) { [Convert]::ToBoolean($env:saveStatusLocal) } else { $false }), # Ninja Script Variable; Checkbox
+    
+    # Secure Boot opt-in action     Ninja Variable Resolution                                             Fallback
+    [ValidateSet('Enable opt-in for SecureBoot management','Remove opt-in for SecureBoot management','Audit SecureBoot management status')]
+    [string]$SecureBootAction = $(if ($env:securebootAction) { $env:securebootAction } else { 'Audit SecureBoot management status' }), # Optional Ninja Script Variable; Drop-down
+    [switch]$IncludeDefaultHive = $(if ($env:includeDefaultHive) { [Convert]::ToBoolean($env:includeDefaultHive) } else { $true }),    # Ninja Script Variable; Checkbox
     
     # Card customization options
     [string]$CardTitle              = "Secure Boot",        # Default title
@@ -471,7 +547,7 @@ begin {
             }
         }
     }
-
+    
     # Utilize the invoke import
     function Get-UefiVariableAttributes {
         param (
@@ -669,18 +745,15 @@ begin {
         return 'Pending1799'
     }
     
-    # Helper function: Set the AvailableUpdates registry key to trigger OS-side update
+    # Helper function: Set the AvailableUpdates + MicrosoftUpdateManagedOptIn registry keys to trigger OS-side update
     function Set-SecureBootUpdateRegKey {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
-        $regName = "AvailableUpdates"
-        $regValue = 0x5944  # Bitmask to trigger all updates
+        $regValue = 0x5944  # Bitmask to trigger all updates / opt-in magic value
         
         try {
-            if (-not (Test-Path $regPath)) {
-                New-Item -Path $regPath -Force | Out-Null
-            }
-            Set-ItemProperty -Path $regPath -Name $regName -Value $regValue -Type DWord -Force
-            Write-Log "SUCCESS" "Set $regPath\$regName to 0x5944 to trigger Secure Boot updates"
+            RegistryShouldBe -KeyPath $regPath -Name "MicrosoftUpdateManagedOptIn" -Value $regValue
+            RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $regValue
+            Write-Log "SUCCESS" "Set $regPath opt-in + trigger keys to 0x5944"
             return $true
         }
         catch {
@@ -739,7 +812,375 @@ begin {
             Sources = $sources
         }
     }
-
+    
+    # Helper function: Check if running as SYSTEM
+    function Test-IsSystem {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        return $id.Name -like "NT AUTHORITY\*" -or $id.IsSystem
+    }
+    
+    # Helper function: Set or create a registry value, retrying until correct
+    function RegistryShouldBe {
+        param(
+            [Parameter(Mandatory)][string]$KeyPath,
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)]$Value,
+            [ValidateSet('DWord','String','ExpandString','MultiString','Binary','QWord')]
+            [string]$Type = 'DWord'
+        )
+        
+        if (-not (Test-Path $KeyPath)) {
+            try {
+                New-Item -Path $KeyPath -Force | Out-Null
+            }
+            catch {
+                Write-Log "ERROR" "Failed to create registry key for '$Name' at '$KeyPath': $_"
+                return
+            }
+        }
+        
+        # --- Special-case Binary values to avoid noisy / unreliable array comparison ---
+        if ($Type -eq 'Binary') {
+            $current = (Get-ItemProperty -Path $KeyPath -Name $Name -ErrorAction SilentlyContinue |
+                        Select-Object -ExpandProperty $Name -ErrorAction SilentlyContinue)
+                        
+            if ($null -eq $current) {
+                Write-Log "VERBOSE" "Creating $Name (Binary)"
+                New-ItemProperty -Path $KeyPath -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+            }
+            else {
+                Write-Log "VERBOSE" "Updating $Name (Binary)"
+                Set-ItemProperty -Path $KeyPath -Name $Name -Value $Value -Force
+            }
+            
+            # Don’t fight PowerShell’s Binary comparison semantics here – treat as success
+            Write-Log "VERBOSE" "$Name confirmed Binary value (length: $($Value.Length))"
+            return
+        }
+        
+        # --- Standard retry logic for non-Binary types ---
+        function Test-RegistryValueEqual {
+            param(
+                $Current,
+                $Desired
+            )
+            # For non-binary types, simple scalar comparison is fine
+            return ($Current -ceq $Desired)
+        }
+        
+        $attempt = 0
+        do {
+            $attempt++
+            $current = (Get-ItemProperty -Path $KeyPath -Name $Name -ErrorAction SilentlyContinue |
+                        Select-Object -ExpandProperty $Name -ErrorAction SilentlyContinue)
+            
+            $valuesMatch = Test-RegistryValueEqual -Current $current -Desired $Value
+            
+            if (-not $valuesMatch) {
+                if ($null -eq $current) {
+                    Write-Log "VERBOSE" "Creating $Name = $Value"
+                    New-ItemProperty -Path $KeyPath -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+                }
+                else {
+                    Write-Log "VERBOSE" "Updating $Name from $current to $Value"
+                    Set-ItemProperty -Path $KeyPath -Name $Name -Value $Value -Force
+                }
+            }
+            
+            Start-Sleep -Milliseconds 800
+            
+            $current = (Get-ItemProperty -Path $KeyPath -Name $Name -ErrorAction SilentlyContinue |
+                        Select-Object -ExpandProperty $Name -ErrorAction SilentlyContinue)
+            $valuesMatch = Test-RegistryValueEqual -Current $current -Desired $Value
+            
+        }
+        while (-not $valuesMatch -and $attempt -lt 5)
+        
+        $final = (Get-ItemProperty -Path $KeyPath -Name $Name -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty $Name -ErrorAction SilentlyContinue)
+                
+        if (Test-RegistryValueEqual -Current $final -Desired $Value) {
+            Write-Log "VERBOSE" "$Name confirmed $Value"
+        }
+        else {
+            Write-Log "WARNING" "$Name failed to set to $Value"
+        }
+    }
+    
+    # Helper function: Retrieve user profiles and their NTUSER hive paths
+    function Get-UserHive {
+        [CmdletBinding()]
+        param (
+            [Parameter()]
+            [ValidateSet('AzureAD', 'DomainAndLocal', 'All')]
+            [String]$Type = "All",
+            [Parameter()]
+            [String[]]$ExcludedUsers,
+            [Parameter()]
+            [switch]$IncludeDefault
+        )
+        
+        $Patterns = switch ($Type) {
+            "AzureAD"        { "S-1-12-1-(\d+-?){4}$" }
+            "DomainAndLocal" { "S-1-5-21-(\d+-?){4}$" }
+            "All"            { "S-1-12-1-(\d+-?){4}$" ; "S-1-5-21-(\d+-?){4}$" }
+        }
+        
+        $UserProfiles = foreach ($Pattern in $Patterns) {
+            Get-ItemProperty "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" |
+                Where-Object { $_.PSChildName -match $Pattern } |
+                Select-Object @{
+                    Name       = "SID"
+                    Expression = { $_.PSChildName }
+                }, @{
+                    Name       = "Username"
+                    Expression = { "$($_.ProfileImagePath | Split-Path -Leaf)" }
+                }, @{
+                    Name       = "Domain"
+                    Expression = {
+                        if ($_.PSChildName -match "S-1-12-1-(\d+-?){4}$") { "AzureAD" } else { $null }
+                    }
+                }, @{
+                    Name       = "UserHive"
+                    Expression = { "$($_.ProfileImagePath)\NTUSER.DAT" }
+                }, @{
+                    Name       = "Path"
+                    Expression = { $_.ProfileImagePath }
+                }
+        }
+        
+        if ($IncludeDefault) {
+            $DefaultProfile = "" | Select-Object Username, SID, UserHive, Path, Domain
+            $DefaultProfile.Username = "Default"
+            $DefaultProfile.Domain   = $env:COMPUTERNAME
+            $DefaultProfile.SID      = "DefaultProfile"
+            $DefaultProfile.UserHive = "$env:SystemDrive\Users\Default\NTUSER.DAT"
+            $DefaultProfile.Path     = "$env:SystemDrive\Users\Default"
+            
+            $UserProfiles = @($UserProfiles) + @(
+                $DefaultProfile | Where-Object { $ExcludedUsers -notcontains $_.Username }
+            )
+        }
+        
+        if ($PSVersionTable.PSVersion.Major -lt 3) {
+            $AllAccounts = Get-WmiObject -Class "win32_UserAccount"
+        }
+        else {
+            $AllAccounts = Get-CimInstance -ClassName "win32_UserAccount"
+        }
+        
+        $CompleteUserProfiles = $UserProfiles | ForEach-Object {
+            $SID         = $_.SID
+            $Win32Object = $AllAccounts | Where-Object { $_.SID -like $SID }
+            
+            if ($Win32Object) {
+                $Win32Object | Add-Member -NotePropertyName UserHive -NotePropertyValue $_.UserHive -Force
+                $Win32Object | Add-Member -NotePropertyName Path     -NotePropertyValue $_.Path     -Force
+                $Win32Object
+            }
+            else {
+                [PSCustomObject]@{
+                    Name     = $_.Username
+                    Domain   = $_.Domain
+                    SID      = $_.SID
+                    UserHive = $_.UserHive
+                    Path     = $_.Path
+                }
+            }
+        }
+        
+        $CompleteUserProfiles | Where-Object { $ExcludedUsers -notcontains $_.Name }
+    }
+    
+    # Helper function: Enable required telemetry for Windows Update Secure Boot management
+    # Sets machine-level AllowTelemetry + MaxTelemetryAllowed, and per-user ShowedToastAtLevel
+    function Enable-RequiredTelemetry {
+        Write-Log "INFO" "Setting telemetry to minimum 'Required' level for Secure Boot management"
+        
+        $dataCollectionPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
+        
+        # Machine-level: AllowTelemetry = 1 (Required), unless already >= 3 (Full)
+        $currentAllow = (Get-ItemProperty -Path $dataCollectionPath -Name "AllowTelemetry" -ErrorAction SilentlyContinue |
+                         Select-Object -ExpandProperty "AllowTelemetry" -ErrorAction SilentlyContinue)
+        if ($currentAllow -ge 3) {
+            Write-Log "INFO" "AllowTelemetry already set to $currentAllow (optional+required); skipping"
+        }
+        else {
+            RegistryShouldBe -KeyPath $dataCollectionPath -Name "AllowTelemetry" -Value 1
+        }
+        
+        # Machine-level: MaxTelemetryAllowed = 1 (Required), unless already >= 3
+        $currentMax = (Get-ItemProperty -Path $dataCollectionPath -Name "MaxTelemetryAllowed" -ErrorAction SilentlyContinue |
+                       Select-Object -ExpandProperty "MaxTelemetryAllowed" -ErrorAction SilentlyContinue)
+        if ($currentMax -ge 3) {
+            Write-Log "INFO" "MaxTelemetryAllowed already set to $currentMax (optional+required); skipping"
+        }
+        else {
+            RegistryShouldBe -KeyPath $dataCollectionPath -Name "MaxTelemetryAllowed" -Value 1
+        }
+        
+        # Per-user: ShowedToastAtLevel = 1 across all user hives
+        Write-Log "INFO" "Retrieving user profiles for per-user telemetry keys"
+        $isSystem = Test-IsSystem
+        
+        if ($isSystem) {
+            $hives = Get-UserHive -Type 'All' -IncludeDefault:([bool]$IncludeDefaultHive)
+        }
+        else {
+            Write-Log "INFO" "Not running as SYSTEM; applying per-user key for current user only"
+            $hives = @(
+                [PSCustomObject]@{
+                    Name     = $env:USERNAME
+                    Domain   = $env:USERDOMAIN
+                    SID      = 'CurrentUser'
+                    UserHive = $null
+                    Path     = $env:USERPROFILE
+                }
+            )
+        }
+        
+        $loaded = @()
+        
+        foreach ($hive in $hives) {
+            $sid      = $hive.SID
+            $userHive = $hive.UserHive
+            $label    = if ($hive.Name) { $hive.Name } else { $sid }
+            
+            if ($isSystem -and $sid -ne 'CurrentUser') {
+                $regRoot = "HKEY_USERS\$sid"
+                
+                # Load hive if not mounted
+                if (-not (Test-Path "Registry::$regRoot")) {
+                    if ($userHive -and (Test-Path $userHive)) {
+                        try {
+                            Write-Log "VERBOSE" "Loading hive for $label"
+                            reg.exe LOAD "HKEY_USERS\$sid" "$userHive" 2>&1 | Out-Null
+                            $loaded += $sid
+                        }
+                        catch {
+                            Write-Log "WARNING" "Failed to load hive for $label. Skipping."
+                            continue
+                        }
+                    }
+                    else {
+                        Write-Log "WARNING" "Hive file not found for $label. Skipping."
+                        continue
+                    }
+                }
+                
+                $diagPath = "Registry::$regRoot\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack"
+            }
+            else {
+                $diagPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack"
+            }
+            
+            # ShowedToastAtLevel: skip if already >= 3
+            $currentToast = (Get-ItemProperty -Path $diagPath -Name "ShowedToastAtLevel" -ErrorAction SilentlyContinue |
+                             Select-Object -ExpandProperty "ShowedToastAtLevel" -ErrorAction SilentlyContinue)
+            if ($currentToast -ge 3) {
+                Write-Log "INFO" "ShowedToastAtLevel for $label already $currentToast; skipping"
+            }
+            else {
+                Write-Log "INFO" "Setting ShowedToastAtLevel for $label"
+                RegistryShouldBe -KeyPath $diagPath -Name "ShowedToastAtLevel" -Value 1
+            }
+        }
+        
+        # Unload any hives we loaded
+        if ($loaded.Count -gt 0) {
+            foreach ($sid in $loaded) {
+                [gc]::Collect()
+                Start-Sleep -Seconds 1
+                try {
+                    Start-Process -FilePath "cmd.exe" `
+                                -ArgumentList "/C reg.exe UNLOAD HKU\$sid" `
+                                -Wait -WindowStyle Hidden -ErrorAction Stop | Out-Null
+                    Write-Log "VERBOSE" "Unloaded hive for $sid"
+                }
+                catch {
+                    Write-Log "WARNING" "Failed to unload hive for $sid. $_"
+                }
+            }
+        }
+        
+        Write-Log "SUCCESS" "Required telemetry configuration complete"
+    }
+    
+    # Helper function: Remove telemetry enforcement keys (restore to OS defaults)
+    function Remove-TelemetryEnforcement {
+        Write-Log "INFO" "Removing telemetry enforcement keys (restoring to OS defaults)"
+        
+        $dataCollectionPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
+        
+        if (Test-Path $dataCollectionPath) {
+            $collectionKey = Get-ItemProperty -Path $dataCollectionPath -ErrorAction SilentlyContinue
+            
+            if ($collectionKey.AllowTelemetry) {
+                try {
+                    Remove-ItemProperty -Path $dataCollectionPath -Name "AllowTelemetry" -ErrorAction Stop
+                    Write-Log "SUCCESS" "Removed AllowTelemetry enforcement"
+                }
+                catch {
+                    Write-Log "ERROR" "Failed to remove AllowTelemetry: $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Log "INFO" "AllowTelemetry not present; nothing to remove"
+            }
+            
+            if ($collectionKey.MaxTelemetryAllowed) {
+                try {
+                    Remove-ItemProperty -Path $dataCollectionPath -Name "MaxTelemetryAllowed" -ErrorAction Stop
+                    Write-Log "SUCCESS" "Removed MaxTelemetryAllowed enforcement"
+                }
+                catch {
+                    Write-Log "ERROR" "Failed to remove MaxTelemetryAllowed: $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Log "INFO" "MaxTelemetryAllowed not present; nothing to remove"
+            }
+        }
+        
+        Write-Log "INFO" "Per-user ShowedToastAtLevel keys left as-is (default value is 1; no enforcement to remove)"
+    }
+    
+    # Helper function: Set the Secure Boot opt-in gate AND trigger keys
+    # Sets both MicrosoftUpdateManagedOptIn (opt-in gate) and AvailableUpdates (trigger bitmask)
+    function Set-SecureBootOptInKeys {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+        $optInValue = 0x5944  # Microsoft Update managed opt-in magic value
+        
+        Write-Log "INFO" "Setting Secure Boot opt-in and trigger keys"
+        RegistryShouldBe -KeyPath $regPath -Name "MicrosoftUpdateManagedOptIn" -Value $optInValue
+        RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $optInValue
+        Write-Log "SUCCESS" "Secure Boot opt-in keys set (MicrosoftUpdateManagedOptIn + AvailableUpdates = 0x5944)"
+    }
+    
+    # Helper function: Remove the Secure Boot opt-in gate (opt out of WU management)
+    # Does NOT remove AvailableUpdates — already-triggered updates should complete
+    function Remove-SecureBootOptInKeys {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+        
+        $currentOptIn = (Get-ItemProperty -Path $regPath -Name "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue |
+                         Select-Object -ExpandProperty "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue)
+        
+        if ($currentOptIn) {
+            try {
+                Remove-ItemProperty -Path $regPath -Name "MicrosoftUpdateManagedOptIn" -ErrorAction Stop
+                Write-Log "SUCCESS" "Removed MicrosoftUpdateManagedOptIn (opted out of WU Secure Boot management)"
+            }
+            catch {
+                Write-Log "ERROR" "Failed to remove MicrosoftUpdateManagedOptIn: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Log "INFO" "MicrosoftUpdateManagedOptIn not present; already opted out"
+        }
+        
+        Write-Log "INFO" "AvailableUpdates left as-is (already-triggered updates should complete)"
+    }
+    
     # Helper function: Get OEM manufacturer and matching key reset guide URL
     function Get-OemKeyResetGuide {
         try {
@@ -828,11 +1269,32 @@ end {
     Write-Log "INFO" "Secure Boot status: $secureBoot"
     
     # -----------------------------------------------
-    # Step 1.5: If Enabled, parse db and dbx certificates
+    # Step 1.5: If Enabled, parse db, KEK, and dbx certificates
     # -----------------------------------------------
-    $has2023InDb = $false
+    # The full set of 2023 certificates Microsoft is rotating to:
+    #   db certs:  Windows UEFI CA 2023, Microsoft Corporation UEFI CA 2023, Microsoft Option ROM UEFI CA 2023
+    #   KEK cert:  Microsoft Corporation KEK 2K CA 2023
+    # KEK (Key Exchange Key) is the trust authority that authorizes writes to db.
+    # When Windows Update pushes a signed update payload to write new certs into db,
+    # the firmware verifies the payload signature against the KEK database.
+    # If the 2023 KEK authority cert is missing, the firmware will reject the write
+    # even if the UEFI attributes indicate db is runtime-writable.
+    $updatedDbCertNames  = @(
+        'Windows UEFI CA 2023',
+        'Microsoft Corporation UEFI CA 2023',
+        'Microsoft Option ROM UEFI CA 2023'
+    )
+    $updatedKekCertName  = 'Microsoft Corporation KEK 2K CA 2023'
+    
+    $has2023InDb        = $false
     $has2023InDbDefault = $false
+    $has2023InKek       = $false
+    $dbCertsFound       = @()   # Which 2023 db certs are present
+    $scheduledTaskPresent = $false
+    $dbIsOsWritable     = $false
+    
     if ($secureBoot -eq 'Enabled') {
+        # --- Parse db (allowed signatures) ---
         try {
             Write-Log "INFO" "Parsing db certificates"
             $dbBytes = (Get-SecureBootUEFI -Name db -ErrorAction Stop).Bytes
@@ -848,7 +1310,34 @@ end {
                     Write-Log "INFO" "db Cert: $shortSubject, ValidFrom=$validFrom, ValidTo=$validTo"
                 }
             }
-            
+        }
+        catch {
+            Write-Log "WARNING" "Failed to parse db: $($_.Exception.Message)"
+        }
+        
+        # --- Parse KEK (key exchange keys — authorizes writes to db) ---
+        try {
+            Write-Log "INFO" "Parsing KEK certificates"
+            $kekBytes = (Get-SecureBootUEFI -Name KEK -ErrorAction Stop).Bytes
+            $kekCerts = Parse-UefiSignatureDatabase -Bytes $kekBytes
+            if ($kekCerts.Count -eq 0) {
+                Write-Log "INFO" "No X509 certificates found in KEK"
+            }
+            else {
+                foreach ($cert in $kekCerts) {
+                    $shortSubject = (($cert.Subject -split ',') | Select-Object -First 2 | ForEach-Object { $_.Trim() }) -join ', '
+                    $validFrom = $cert.NotBefore.ToString('MM/dd/yyyy')
+                    $validTo = $cert.NotAfter.ToString('MM/dd/yyyy')
+                    Write-Log "INFO" "KEK Cert: $shortSubject, ValidFrom=$validFrom, ValidTo=$validTo"
+                }
+            }
+        }
+        catch {
+            Write-Log "WARNING" "Failed to parse KEK: $($_.Exception.Message)"
+        }
+        
+        # --- Parse dbx (revocation list) ---
+        try {
             Write-Log "INFO" "Parsing dbx certificates"
             $dbxBytes = (Get-SecureBootUEFI -Name dbx -ErrorAction Stop).Bytes
             $dbxCerts = Parse-UefiSignatureDatabase -Bytes $dbxBytes
@@ -865,23 +1354,50 @@ end {
             }
         }
         catch {
-            Write-Log "WARNING" "Failed to parse db/dbx: $($_.Exception.Message)"
+            Write-Log "WARNING" "Failed to parse dbx: $($_.Exception.Message)"
         }
         
-        # Check for 2023 cert in db
+        # --- Check for 2023 certs in db (check all 3 db-level certs) ---
         try {
-            $has2023InDb = [System.Text.Encoding]::ASCII.GetString($dbBytes) -match 'Windows UEFI CA 2023'
-            Write-Log "INFO" "2023 Cert in db: $has2023InDb"
+            $dbRawText = [System.Text.Encoding]::ASCII.GetString($dbBytes)
+            foreach ($certName in $updatedDbCertNames) {
+                if ($dbRawText -match [regex]::Escape($certName)) {
+                    $dbCertsFound += $certName
+                }
+            }
+            $has2023InDb = $dbCertsFound.Count -gt 0
+            if ($has2023InDb) {
+                Write-Log "INFO" "2023 certs found in db: $($dbCertsFound -join ', ')"
+            }
+            else {
+                Write-Log "INFO" "No 2023 certs found in db"
+            }
         }
         catch {
-            Write-Log "WARNING" "Failed to check 2023 cert in db: $($_.Exception.Message)"
+            Write-Log "WARNING" "Failed to check 2023 certs in db: $($_.Exception.Message)"
         }
         
-        # If not in db, check dbDefault
+        # --- Check for 2023 KEK authority cert ---
+        try {
+            $kekRawText = [System.Text.Encoding]::ASCII.GetString($kekBytes)
+            $has2023InKek = $kekRawText -match [regex]::Escape($updatedKekCertName)
+            Write-Log "INFO" "2023 KEK authority cert ($updatedKekCertName): $(if ($has2023InKek) { 'Present' } else { 'Missing' })"
+        }
+        catch {
+            Write-Log "WARNING" "Failed to check 2023 cert in KEK: $($_.Exception.Message)"
+        }
+        
+        # --- If not in db, check dbDefault ---
         if (-not $has2023InDb) {
             try {
                 $dbDefaultBytes = (Get-SecureBootUEFI -Name dbDefault -ErrorAction Stop).Bytes
-                $has2023InDbDefault = [System.Text.Encoding]::ASCII.GetString($dbDefaultBytes) -match 'Windows UEFI CA 2023'
+                $dbDefaultRawText = [System.Text.Encoding]::ASCII.GetString($dbDefaultBytes)
+                foreach ($certName in $updatedDbCertNames) {
+                    if ($dbDefaultRawText -match [regex]::Escape($certName)) {
+                        $has2023InDbDefault = $true
+                        break
+                    }
+                }
                 Write-Log "INFO" "2023 Cert in dbDefault: $has2023InDbDefault"
             }
             catch {
@@ -889,12 +1405,36 @@ end {
             }
         }
         
-        # Always perform passive attributes check for 'db'
+        # --- Check Secure-Boot-Update scheduled task existence ---
+        Write-Host "`n === Secure Boot Update Task Check ==="
+        if (Get-ScheduledTask -TaskPath "\Microsoft\Windows\PI\*" -TaskName "Secure-Boot-Update" -ErrorAction SilentlyContinue) {
+            $scheduledTaskPresent = $true
+            Write-Log "INFO" "Scheduled task '\Microsoft\Windows\PI\Secure-Boot-Update' is present"
+        }
+        else {
+            Write-Log "WARNING" "Scheduled task '\Microsoft\Windows\PI\Secure-Boot-Update' is MISSING. Windows Update may not be able to apply Secure Boot certificate updates."
+        }
+        
+        # --- Passive UEFI variable attributes check for 'db' ---
         Write-Host "`n === Windows UEFI DB Access Check ==="
         Write-Log "INFO" "Performing passive UEFI variable attributes check for 'db'"
         $dbAttributes = Get-UefiVariableAttributes -VarName "db"
-        $dbIsOsWritable = $null -ne $dbAttributes -and (($dbAttributes -band 0x00000004) -ne 0) -and (($dbAttributes -band 0x00000020) -ne 0)
-        Write-Log "INFO" "OS capable of writing to UEFI db: $dbIsOsWritable"
+        $uefiAllowsWrite = $null -ne $dbAttributes -and (($dbAttributes -band 0x00000004) -ne 0) -and (($dbAttributes -band 0x00000020) -ne 0)
+        
+        # db is truly OS-writable only if UEFI attributes allow it AND the 2023 KEK authority is present
+        # (KEK authorizes the signed payload Windows Update uses to write to db)
+        if ($uefiAllowsWrite -and $has2023InKek) {
+            $dbIsOsWritable = $true
+            Write-Log "INFO" "OS capable of writing to UEFI db: True (UEFI attributes + KEK authority both present)"
+        }
+        elseif ($uefiAllowsWrite -and -not $has2023InKek) {
+            $dbIsOsWritable = $false
+            Write-Log "WARNING" "UEFI attributes allow runtime writes, but 2023 KEK authority cert is missing. Windows Update cannot sign the payload — db is NOT effectively OS-writable."
+        }
+        else {
+            $dbIsOsWritable = $false
+            Write-Log "INFO" "OS capable of writing to UEFI db: False"
+        }
         Write-Host ""
     }
     
@@ -918,6 +1458,121 @@ end {
         Write-Log "INFO" "Skipping event log check (Secure Boot is $secureBoot)"
     }
     
+    # -----------------------------------------------
+    # Step 2.25: Execute SecureBootAction if specified
+    # -----------------------------------------------
+    if ($SecureBootAction) {
+        Write-Host "`n === Secure Boot Action: $SecureBootAction ==="
+        
+        if ($secureBoot -ne 'Enabled') {
+            Write-Log "WARNING" "Secure Boot is '$secureBoot'; action '$SecureBootAction' requires Secure Boot to be enabled. Skipping action."
+        }
+        else {
+            switch ($SecureBootAction) {
+                'Enable opt-in for SecureBoot management' {
+                    # Note if already compliant
+                    if ($certStatus -and $certStatus.EventId -eq 1808) {
+                        Write-Log "INFO" "Event 1808 already present (compliant). Enablement is not strictly necessary, but proceeding to ensure keys are set."
+                    }
+                    
+                    # 1. Set required telemetry (machine + per-user)
+                    Enable-RequiredTelemetry
+                    
+                    # 2. Set opt-in gate + trigger keys
+                    Set-SecureBootOptInKeys
+                    
+                    # 3. Trigger Secure-Boot-Update scheduled task to kick off the update
+                    Trigger-SecureBootTask
+                    
+                    Write-Log "SUCCESS" "Secure Boot opt-in and telemetry enablement complete"
+                }
+                'Remove opt-in for SecureBoot management' {
+                    if ($certStatus -and $certStatus.EventId -eq 1808) {
+                        Write-Log "INFO" "Event 1808 present (compliant). Removal will opt out of future WU-managed updates, but the current cert rotation is already complete."
+                    }
+                    
+                    # 1. Remove telemetry enforcement
+                    Remove-TelemetryEnforcement
+                    
+                    # 2. Remove opt-in gate (leave AvailableUpdates alone)
+                    Remove-SecureBootOptInKeys
+                    
+                    Write-Log "SUCCESS" "Secure Boot opt-out and telemetry enforcement removal complete"
+                }
+                'Audit SecureBoot management status' {
+                    Write-Log "INFO" "Auditing Secure Boot management configuration (read-only)"
+                    
+                    # --- Machine-level telemetry ---
+                    $dataCollectionPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
+                    $allowTelemetry = (Get-ItemProperty -Path $dataCollectionPath -Name "AllowTelemetry" -ErrorAction SilentlyContinue |
+                                       Select-Object -ExpandProperty "AllowTelemetry" -ErrorAction SilentlyContinue)
+                    $maxTelemetry   = (Get-ItemProperty -Path $dataCollectionPath -Name "MaxTelemetryAllowed" -ErrorAction SilentlyContinue |
+                                       Select-Object -ExpandProperty "MaxTelemetryAllowed" -ErrorAction SilentlyContinue)
+                    
+                    if ($null -eq $allowTelemetry) {
+                        Write-Log "INFO" "AllowTelemetry: Not set (OS default)"
+                    } else {
+                        $telemetryLabel = switch ($allowTelemetry) { 0 { 'Off' } 1 { 'Required' } 2 { 'Enhanced' } 3 { 'Full' } default { $allowTelemetry } }
+                        Write-Log "INFO" "AllowTelemetry: $allowTelemetry ($telemetryLabel)"
+                    }
+                    
+                    if ($null -eq $maxTelemetry) {
+                        Write-Log "INFO" "MaxTelemetryAllowed: Not set (OS default)"
+                    }
+                    else {
+                        $maxLabel = switch ($maxTelemetry) { 0 { 'Off' } 1 { 'Required' } 2 { 'Enhanced' } 3 { 'Full' } default { $maxTelemetry } }
+                        Write-Log "INFO" "MaxTelemetryAllowed: $maxTelemetry ($maxLabel)"
+                    }
+                    
+                    $telemetryMeetsMin = ($null -ne $allowTelemetry -and $allowTelemetry -ge 1) -or ($null -eq $allowTelemetry)
+                    if (-not $telemetryMeetsMin) {
+                        Write-Log "WARNING" "AllowTelemetry is 0 (Off) — Windows Update cannot manage Secure Boot certs"
+                    }
+                    
+                    # --- Secure Boot opt-in keys ---
+                    $secureBootPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+                    $optIn = (Get-ItemProperty -Path $secureBootPath -Name "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue |
+                              Select-Object -ExpandProperty "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue)
+                    $available = (Get-ItemProperty -Path $secureBootPath -Name "AvailableUpdates" -ErrorAction SilentlyContinue |
+                                  Select-Object -ExpandProperty "AvailableUpdates" -ErrorAction SilentlyContinue)
+                    
+                    if ($optIn -eq 0x5944) {
+                        Write-Log "INFO" "MicrosoftUpdateManagedOptIn: 0x5944 (Opted in to WU Secure Boot management)"
+                    }
+                    elseif ($null -eq $optIn) {
+                        Write-Log "INFO" "MicrosoftUpdateManagedOptIn: Not set (not opted in)"
+                    }
+                    else {
+                        Write-Log "INFO" "MicrosoftUpdateManagedOptIn: $optIn (unexpected value)"
+                    }
+                    
+                    if ($available -eq 0x5944) {
+                        Write-Log "INFO" "AvailableUpdates: 0x5944 (update trigger set)"
+                    }
+                    elseif ($null -eq $available) {
+                        Write-Log "INFO" "AvailableUpdates: Not set (no trigger)"
+                    }
+                    else {
+                        Write-Log "INFO" "AvailableUpdates: $available"
+                    }
+                    
+                    # --- Summary ---
+                    $isOptedIn = $optIn -eq 0x5944
+                    if ($isOptedIn -and $telemetryMeetsMin) {
+                        Write-Log "SUCCESS" "Secure Boot management via Windows Update: ENABLED (opted in + telemetry meets minimum)"
+                    }
+                    elseif ($isOptedIn -and -not $telemetryMeetsMin) {
+                        Write-Log "WARNING" "Secure Boot management via Windows Update: OPT-IN SET but telemetry is too low (AllowTelemetry=0)"
+                    }
+                    else {
+                        Write-Log "INFO" "Secure Boot management via Windows Update: NOT ENABLED (opt-in key not set)"
+                    }
+                }
+            }
+        }
+        Write-Host ""
+    }
+
     # -----------------------------------------------
     # Step 2.5: Automate registry trigger if needed
     # -----------------------------------------------
@@ -958,7 +1613,7 @@ end {
     }
     
     # -----------------------------------------------
-    # Step 3: Map to one of the 5 final states
+    # Step 3: Map to one of the 7 final states
     # -----------------------------------------------
     $cardIcon        = "fas fa-shield-alt"  # Same icon for all states; color differentiates them
     $eventRowHtml    = $null                # Omitted unless Secure Boot is Enabled
@@ -1242,6 +1897,24 @@ end {
     if ($null -ne $eventRowHtml) {
         $cardProperties['Last Event'] = $eventRowHtml
     }
+    # KEK authority status (only when Secure Boot is Enabled)
+    if ($secureBoot -eq 'Enabled') {
+        if ($has2023InKek) {
+            $cardProperties['KEK Authority'] = '<i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 KEK authority cert present'
+        }
+        else {
+            $cardProperties['KEK Authority'] = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> 2023 KEK authority cert missing. <br />Windows Update cannot authorize db writes'
+        }
+    }
+    # Scheduled task status (only when Secure Boot is Enabled)
+    if ($secureBoot -eq 'Enabled') {
+        if ($scheduledTaskPresent) {
+            $cardProperties['Update Task'] = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Secure-Boot-Update task present'
+        }
+        else {
+            $cardProperties['Update Task'] = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Secure-Boot-Update task missing'
+        }
+    }
     
     $cardInfo = [PSCustomObject]$cardProperties
     
@@ -1268,6 +1941,18 @@ end {
         }
         if ($null -ne $eventRowHtml) {
             $localCardProperties['Last Event'] = ($eventRowHtml -replace $faPattern, '').Trim()
+        }
+        if ($secureBoot -eq 'Enabled') {
+            if ($has2023InKek) {
+                $localCardProperties['KEK Authority'] = '✅ 2023 KEK authority cert present'
+            } else {
+                $localCardProperties['KEK Authority'] = '❌ 2023 KEK authority cert missing — Windows Update cannot authorize db writes'
+            }
+            if ($scheduledTaskPresent) {
+                $localCardProperties['Update Task'] = '✅ Secure-Boot-Update task present'
+            } else {
+                $localCardProperties['Update Task'] = '⚠️ Secure-Boot-Update task missing'
+            }
         }
         
         $localCardInfo = [PSCustomObject]$localCardProperties
@@ -1340,6 +2025,12 @@ end {
     Write-Host "Plain Text  : $plainText"
     if ($certStatus -and -not $triggeredOsUpdate) {
         Write-Host "Event Detail: $($certStatus.EventMessage)"
+    }
+    if ($secureBoot -eq 'Enabled') {
+        Write-Host "KEK 2023    : $(if ($has2023InKek) { 'Present' } else { 'Missing' })"
+        Write-Host "DB 2023     : $(if ($has2023InDb) { $dbCertsFound -join ', ' } else { 'None found' })"
+        Write-Host "Update Task : $(if ($scheduledTaskPresent) { 'Present' } else { 'Missing' })"
+        Write-Host "OS Writable : $dbIsOsWritable"
     }
     Write-Host "--------------------------------------`n"
     
