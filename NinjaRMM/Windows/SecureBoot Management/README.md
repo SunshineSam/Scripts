@@ -5,7 +5,7 @@
 This script tells you the other half, and what actions are required.
 ---
 **What it does:**
-Rather than just reporting Secure Boot state, it audits the actual certificate database (`db`/`dbDefault`), checks the TPM-WMI event log for rotation progress, performs a **passive UEFI variable attributes check** to determine if Windows can write to the BIOS cert db directly, and where possible, **automatically triggers the OS-side update** (registry key + WinCsFlags + scheduled task) and reports the result.
+Rather than just reporting Secure Boot state, it audits the actual certificate database (`db`/`dbDefault`/`KEK`), checks the TPM-WMI event log for rotation progress, performs a **passive UEFI variable attributes check** to determine if Windows can write to the BIOS cert db directly, and where possible, **automatically triggers the OS-side update** (registry key + WinCsFlags + scheduled task) and reports the result.
 
 **Seven distinct states, all handled:**
 
@@ -17,34 +17,76 @@ Rather than just reporting Secure Boot state, it audits the actual certificate d
 - :black_circle: **Disabled** - Secure Boot off; cert check not applicable
 - :black_circle: **Not Applicable** - Legacy BIOS / non-UEFI
 
-**Passive UEFI variable attributes check**
+---
+
+## Certificate Audit
+
+The script checks for all four 2023 certificates Microsoft is rotating to:
+
+| Variable | Certificate | Purpose |
+|----------|-------------|---------|
+| `db` | Windows UEFI CA 2023 | Signs Windows boot binaries |
+| `db` | Microsoft Corporation UEFI CA 2023 | Signs third-party UEFI drivers/apps |
+| `db` | Microsoft Option ROM UEFI CA 2023 | Signs option ROMs (add-in cards) |
+| `KEK` | Microsoft Corporation KEK 2K CA 2023 | **Authority** that signs updates to db/dbx |
+
+### Why the KEK matters
+
+The **Key Exchange Key (KEK)** is the authority certificate that signs any updates to the `db` and `dbx` variables. Even if the UEFI `db` attributes allow runtime writes (`RUNTIME_ACCESS` + `TIME_BASED_AUTHENTICATED_WRITE_ACCESS`), the firmware will **reject** the write if the payload isn't signed by a trusted KEK. Without `Microsoft Corporation KEK 2K CA 2023` in the KEK database, Windows Update cannot authorize pushing the new db certificates — meaning the machine is **not effectively OS-writable** regardless of what the UEFI attributes report.
+
+The script checks for the 2023 KEK and overrides `$dbIsOsWritable` to `$false` if it's missing, ensuring the status card correctly shows "Action Required" instead of "Action Optional."
+
+---
+
+## Passive UEFI Variable Attributes Check
 
 The script uses `GetFirmwareEnvironmentVariableExA` (P/Invoke) to read the UEFI `db` variable attributes at runtime. This determines whether the firmware allows authenticated writes from the OS, the mechanism Windows Update uses to push certificates directly into the BIOS signature database without a firmware update.
 
 - Enables `SeSystemEnvironmentPrivilege` via token adjustment (required for UEFI variable access)
 - Reads the `db` variable under the EFI Image Security Database GUID (`{d719b2cb-3d3a-4596-a3bc-dad00e67656f}`)
 - Checks for `RUNTIME_ACCESS` (0x04) and `TIME_BASED_AUTHENTICATED_WRITE_ACCESS` (0x20)
-- If both are present, the machine is marked as OS-writable, downgrading "Action Required" to "Action Optional"
+- Validates the 2023 KEK authority cert is present (required to sign the payload)
+- If all conditions are met, the machine is marked as OS-writable, downgrading "Action Required" to "Action Optional"
 
 This check is entirely passive and read-only; it does not modify any UEFI variables.
 
-**Smart handling**
+---
+
+## SecureBootAction (Optional)
+
+The certificate audit always runs regardless of which action is selected. These actions manage the **opt-in configuration** that allows Windows Update to handle the cert rotation.
+
+| Action | Description |
+|--------|-------------|
+| **Enable opt-in for Secure Boot management** | Sets telemetry to minimum required level (`AllowTelemetry=1`, `MaxTelemetryAllowed=1`, per-user `ShowedToastAtLevel=1`), sets `MicrosoftUpdateManagedOptIn=0x5944` and `AvailableUpdates=0x5944`, then triggers the `Secure-Boot-Update` scheduled task. If already compliant (1808 present), proceeds anyway but notes it wasn't strictly necessary. |
+| **Remove opt-in for Secure Boot management** | Removes telemetry enforcement keys and `MicrosoftUpdateManagedOptIn`. Does **not** remove `AvailableUpdates` (already-triggered updates should complete). |
+| **Audit Secure Boot management status** | Read-only check of `AllowTelemetry`, `MaxTelemetryAllowed`, `MicrosoftUpdateManagedOptIn`, and `AvailableUpdates`. Reports whether the device is properly configured for Windows Update to manage Secure Boot certificates, without making any changes. |
+
+---
+
+## Smart Handling
 - Stale 1801 events (cert already in `db`) are flagged as such (no false alarms)
 - OS-writable firmware correctly differentiates "wait for Windows Update" from "manual action needed"
+- KEK presence validated before declaring db as OS-writable
 - OEM-specific BIOS update and key reset guide links included per manufacturer (Dell, HP, Lenovo, ASUS, Microsoft)
-- Bitlocker warnings surfaced before any key reset guidance
+- Scheduled task `\Microsoft\Windows\PI\Secure-Boot-Update` existence check with reporting
+- BitLocker warnings surfaced before any key reset guidance
 - Reboot-pending detection with source (Windows Update / Component Servicing) when the trigger stalls
 
-**Output:** Writes a WYSIWYG status card + plain-text field (you may add to device table) to NinjaRMM custom fields.
 ---
+
+## Output
+
+Writes a WYSIWYG status card + plain-text field (you may add to device table) to NinjaRMM custom fields.
+
 **Fields Required**
-| Field Name                   | Type        | Description                                                                 |
-|-------------------------------|------------|-----------------------------------------------------------------------------|
+| Field Name                   | Type       | Description                                                                |
+|------------------------------|------------|----------------------------------------------------------------------------|
 | `SecureBootCertStatusCard`   | WYSIWYG    | Color-coded, detailed HTML status card                                     |
 | `SecureBootCertStatus`       | Text       | Plain-text summary; add to the device table for quick viewing              |
-| **OR**                       |            |                                                                             |
+| **OR**                       |            |                                                                            |
 | `saveStatusLocal`            | CheckBox   | Optional parameter input that saves the status card and status text to two local files at `C:\Windows\Logs\SecureBoot` |
 
 > :gear: Both fallback values can be overridden manually or via Script Variables (`secureBootStatusCardField`, `secureBootPlainTextField`).
-> 
+>
 [Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-CertCheck.ps1)
