@@ -52,15 +52,36 @@ This check is entirely passive and read-only; it does not modify any UEFI variab
 
 ---
 
-## SecureBootAction (Optional)
+## `secureBootAction` — NinjaRMM Script Variable (Drop-down)
 
-The certificate audit always runs regardless of which action is selected. These actions manage the **opt-in configuration** that allows Windows Update to handle the cert rotation.
+The certificate audit **always runs** regardless of the selected action. The `secureBootAction` script variable controls whether the script also takes action on the Windows Update opt-in configuration for Secure Boot certificate management.
 
-| Action | Description |
-|--------|-------------|
-| **Enable opt-in for Secure Boot management** | Sets telemetry to minimum required level (`AllowTelemetry=1`, `MaxTelemetryAllowed=1`, per-user `ShowedToastAtLevel=1`), sets `MicrosoftUpdateManagedOptIn=0x5944` and `AvailableUpdates=0x5944`, then triggers the `Secure-Boot-Update` scheduled task. If already compliant (1808 present), proceeds anyway but notes it wasn't strictly necessary. |
-| **Remove opt-in for Secure Boot management** | Removes telemetry enforcement keys and `MicrosoftUpdateManagedOptIn`. Does **not** remove `AvailableUpdates` (already-triggered updates should complete). |
-| **Audit Secure Boot management status** | Read-only check of `AllowTelemetry`, `MaxTelemetryAllowed`, `MicrosoftUpdateManagedOptIn`, and `AvailableUpdates`. Reports whether the device is properly configured for Windows Update to manage Secure Boot certificates, without making any changes. |
+> Configure as a **Drop-down** script variable in NinjaRMM with the values below, or pass directly via `-SecureBootAction`.
+
+| Drop-down Value | What It Does |
+|-----------------|--------------|
+| `Enable opt-in for Secure Boot management` | Sets telemetry to minimum required level (`AllowTelemetry=1`, `MaxTelemetryAllowed=1`, per-user `ShowedToastAtLevel=1`), sets `MicrosoftUpdateManagedOptIn=0x5944` and `AvailableUpdates=0x5944`, then triggers the `\Microsoft\Windows\PI\Secure-Boot-Update` scheduled task. If already compliant (1808 present), proceeds anyway but notes it wasn't strictly necessary. |
+| `Remove opt-in for Secure Boot management` | Removes telemetry enforcement keys (`AllowTelemetry`, `MaxTelemetryAllowed`) and `MicrosoftUpdateManagedOptIn`. Does **not** remove `AvailableUpdates` (already-triggered updates should complete). |
+| `Audit Secure Boot management status` | Read-only check of all opt-in and telemetry keys. Reports current state without making any changes. |
+| *(empty / not set)* | No action taken — audit only. |
+
+---
+
+## Opt-In Status Check
+
+Regardless of the selected action, the script always checks the current opt-in configuration and reports it in the status card under **Opt-In Status**. This uses the `Check-OptInStatus` function which reads:
+
+| Registry Key | Path | Expected Value |
+|---|---|---|
+| `AllowTelemetry` | `HKLM:\...\Policies\DataCollection` | ≥ 1 (Required) |
+| `MaxTelemetryAllowed` | `HKLM:\...\Policies\DataCollection` | ≥ 1 |
+| `MicrosoftUpdateManagedOptIn` | `HKLM:\...\Control\SecureBoot` | `0x5944` |
+| `AvailableUpdates` | `HKLM:\...\Control\SecureBoot` | `0x5944` |
+
+The card displays one of three states:
+- :green_circle: **Enabled** — opted in + telemetry meets minimum
+- :yellow_circle: **Blocked** — opted in but `AllowTelemetry=0` prevents WU from managing certs
+- :black_circle: **Not enabled** — opt-in key not set
 
 ---
 
@@ -68,6 +89,7 @@ The certificate audit always runs regardless of which action is selected. These 
 - Stale 1801 events (cert already in `db`) are flagged as such (no false alarms)
 - OS-writable firmware correctly differentiates "wait for Windows Update" from "manual action needed"
 - KEK presence validated before declaring db as OS-writable
+- Opt-in status always checked and surfaced in the status card
 - OEM-specific BIOS update and key reset guide links included per manufacturer (Dell, HP, Lenovo, ASUS, Microsoft)
 - Scheduled task `\Microsoft\Windows\PI\Secure-Boot-Update` existence check with reporting
 - BitLocker warnings surfaced before any key reset guidance
@@ -80,13 +102,15 @@ The certificate audit always runs regardless of which action is selected. These 
 Writes a WYSIWYG status card + plain-text field (you may add to device table) to NinjaRMM custom fields.
 
 **Fields Required**
-| Field Name                   | Type       | Description                                                                |
-|------------------------------|------------|----------------------------------------------------------------------------|
+| Field Name                   | Type        | Description                                                                 |
+|-------------------------------|------------|-----------------------------------------------------------------------------|
 | `SecureBootCertStatusCard`   | WYSIWYG    | Color-coded, detailed HTML status card                                     |
 | `SecureBootCertStatus`       | Text       | Plain-text summary; add to the device table for quick viewing              |
-| **OR**                       |            |                                                                            |
+| **OR**                       |            |                                                                             |
 | `saveStatusLocal`            | CheckBox   | Optional parameter input that saves the status card and status text to two local files at `C:\Windows\Logs\SecureBoot` |
 
 > :gear: Both fallback values can be overridden manually or via Script Variables (`secureBootStatusCardField`, `secureBootPlainTextField`).
 >
 [Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-CertCheck.ps1)
+
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-CardExample.png" alt="SecureBoot Card Example" width="660px" />
