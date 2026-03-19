@@ -16,10 +16,10 @@
 
 1. **"Script Variable" Name**
    - In the NinjaRMM automation script creation, you add a "Script Variable" and select the type, then give it a display name (e.g., `My Fancy Option`).
-   - NinjaRMM automatically converts that display name into a temporary environment variable by removing spaces (and preserving case).
+   - NinjaRMM automatically converts that display name into a temporary environment variable using **Camel Case** (removing spaces and lowercasing the first letter while capitalizing the first letter of each subsequent word).
    - Example:
-     - Script Variable Menu name: `Save Log To Device`
-     - Resulting environment variable: `env:saveLogToDevice`
+     - Ninja Script Variable menu name: `Save Log To Device`
+     - Resulting environment variable: `$env:saveLogToDevice`
 
 2. **PowerShell Access**  
    - Inside the PowerShell script, it should be referenced as `"$env:variableNameNoSpaces"`.  
@@ -37,7 +37,7 @@
 
 Imagine you want a two-option dropdown called **`Example Dropdown`** (with options: `Allow`, `Deny`). In the Script Variable menu, you would label it "Example Dropdown," but the internal name (shown under the hood) is `exampleDropdown`, shown in the top right corner of the script variable menu. NinjaRMM creates an environment variable `env:exampleDropdown`.
 
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Script%20Variable%20Resolution%20Documentation/images/NinjaScriptVariableResolution.png" alt="Ninja Variable Resolution Preview" width="320px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Script%20Variable%20Resolution%20Documentation/images/NinjaScriptVariableResolutionNew.png" alt="Ninja 12.0+ Variable Resolution Preview" width="320px" />
 
 
 ```powershell
@@ -47,12 +47,13 @@ Imagine you want a two-option dropdown called **`Example Dropdown`** (with optio
 #>
 
 param (
-    # Dropdown Option                                      Ninja Variable Resolution                              Fallback
+    # Dropdown Option                                        Ninja Variable Resolution                            Fallback
     [ValidateSet("Allow", "Deny")][string]$ExampleDropdown = $(if ($env:exampleDropdown) { $env:exampleDropdown } else { "Ensure" })
 
-    # Checkbox Option        Ninja Variable Resolution               Converting Ninja Checkbox Binary to bool               Fallback
-    [switch]$ExampleCheckbox = $(if ($env:useBitlockerTpmProtector) { [Convert]::ToBoolean($env:useBitlockerTpmProtector) } else { $true }),  # Ninja Script Variable; Checkbox
+    # Checkbox Option        Ninja Variable Resolution     Converting Ninja Checkbox Binary to bool       Fallback
+    [switch]$ExampleCheckbox = $(if ($env:exampleCheckbox) { [Convert]::ToBoolean($env:exampleCheckbox) } else { $true }),  # Ninja Script Variable; Checkbox
 
-    # Custom field name       Ninja Variable Resolution                                            Fallback
+    # Custom field name         Ninja Variable Resolution                                          Fallback
     [String]$ExampleFieldName = $(if ($env:exampleSecureFieldName) { $env:exampleSecureFieldName } else { "ExampleSecureField" }) # Could be Static - Optional Ninja Script Variable; String
 )
+```
