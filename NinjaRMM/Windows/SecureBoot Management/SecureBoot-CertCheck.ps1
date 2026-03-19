@@ -1,9 +1,18 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 03-18-2026
+    Last Edit: 03-19-2026
 
     Note:
+    03-19-2026: Added Check-OptInStatus function — always checks telemetry and opt-in
+                registry keys (AllowTelemetry, MaxTelemetryAllowed,
+                MicrosoftUpdateManagedOptIn, AvailableUpdates) and surfaces result
+                in the status card as "Opt-In Status" line.
+                Added Trigger-SecureBootTask call after Enable opt-in sets registry keys.
+                Increased UEFI variable buffer from 4 KB to 64 KB for large OEM db vars.
+                Updated error hint text to include common Win32 error codes (122, 1314).
+                Fixed README: secureBootAction section now references Ninja script variable
+                properly and documents as Drop-down, not "optional."
     03-18-2026: Added "Action Optional" state when UEFI db is OS-writable, downgrades
                 Action Required to Action Optional (Windows will push cert automatically).
                 Applied to both State 4 (Event 1801) and State 5 (Pending/no events) when
@@ -795,6 +804,49 @@ begin {
         }
     }
     
+    # Helper function: Check Secure Boot opt-in and telemetry configuration status (read-only)
+    # Returns: hashtable with IsOptedIn, TelemetryMeetsMin, AvailableUpdatesSet, Summary, and raw values
+    function Check-OptInStatus {
+        $dataCollectionPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
+        $secureBootPath     = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+
+        $allowTelemetry = (Get-ItemProperty -Path $dataCollectionPath -Name "AllowTelemetry" -ErrorAction SilentlyContinue |
+                           Select-Object -ExpandProperty "AllowTelemetry" -ErrorAction SilentlyContinue)
+        $maxTelemetry   = (Get-ItemProperty -Path $dataCollectionPath -Name "MaxTelemetryAllowed" -ErrorAction SilentlyContinue |
+                           Select-Object -ExpandProperty "MaxTelemetryAllowed" -ErrorAction SilentlyContinue)
+        $optIn          = (Get-ItemProperty -Path $secureBootPath -Name "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue |
+                           Select-Object -ExpandProperty "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue)
+        $available      = (Get-ItemProperty -Path $secureBootPath -Name "AvailableUpdates" -ErrorAction SilentlyContinue |
+                           Select-Object -ExpandProperty "AvailableUpdates" -ErrorAction SilentlyContinue)
+
+        # Telemetry meets minimum if AllowTelemetry >= 1 or is not set (OS default allows it)
+        $telemetryMeetsMin = ($null -eq $allowTelemetry) -or ($allowTelemetry -ge 1)
+        $isOptedIn         = $optIn -eq 0x5944
+        $availableSet      = $available -eq 0x5944
+
+        # Determine summary
+        if ($isOptedIn -and $telemetryMeetsMin) {
+            $summary = 'Enabled'
+        }
+        elseif ($isOptedIn -and -not $telemetryMeetsMin) {
+            $summary = 'Blocked'  # Opted in but telemetry too low
+        }
+        else {
+            $summary = 'Not enabled'
+        }
+
+        return @{
+            IsOptedIn         = $isOptedIn
+            TelemetryMeetsMin = $telemetryMeetsMin
+            AvailableUpdatesSet = $availableSet
+            AllowTelemetry    = $allowTelemetry
+            MaxTelemetry      = $maxTelemetry
+            OptInValue        = $optIn
+            AvailableUpdates  = $available
+            Summary           = $summary
+        }
+    }
+
     # Helper function: Check if a system reboot is pending and return the source(s)
     # Returns: hashtable @{ Pending = $true/$false; Sources = @('Windows Update', 'Component Servicing') }
     function Get-PendingRebootStatus {
@@ -1157,7 +1209,7 @@ begin {
         Write-Log "SUCCESS" "Secure Boot opt-in keys set (MicrosoftUpdateManagedOptIn + AvailableUpdates = 0x5944)"
     }
     
-    # Helper function: Remove the Secure Boot opt-in gate (opt out of WU management)
+    # Helper function: Remove the Secure Boot opt-in gate (opt out of Windows Update management)
     # Does NOT remove AvailableUpdates — already-triggered updates should complete
     function Remove-SecureBootOptInKeys {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
@@ -1168,7 +1220,7 @@ begin {
         if ($currentOptIn) {
             try {
                 Remove-ItemProperty -Path $regPath -Name "MicrosoftUpdateManagedOptIn" -ErrorAction Stop
-                Write-Log "SUCCESS" "Removed MicrosoftUpdateManagedOptIn (opted out of WU Secure Boot management)"
+                Write-Log "SUCCESS" "Removed MicrosoftUpdateManagedOptIn (opted out of Windows Update Secure Boot management)"
             }
             catch {
                 Write-Log "ERROR" "Failed to remove MicrosoftUpdateManagedOptIn: $($_.Exception.Message)"
@@ -1537,7 +1589,7 @@ end {
                                   Select-Object -ExpandProperty "AvailableUpdates" -ErrorAction SilentlyContinue)
                     
                     if ($optIn -eq 0x5944) {
-                        Write-Log "INFO" "MicrosoftUpdateManagedOptIn: 0x5944 (Opted in to WU Secure Boot management)"
+                        Write-Log "INFO" "MicrosoftUpdateManagedOptIn: 0x5944 (Opted in to Windows Update Secure Boot management)"
                     }
                     elseif ($null -eq $optIn) {
                         Write-Log "INFO" "MicrosoftUpdateManagedOptIn: Not set (not opted in)"
@@ -1569,6 +1621,38 @@ end {
                     }
                 }
             }
+        }
+        Write-Host ""
+    }
+
+    # -----------------------------------------------
+    # Step 2.3: Check opt-in status (always, after any action has run)
+    # -----------------------------------------------
+    $optInStatus = $null
+    if ($secureBoot -eq 'Enabled') {
+        Write-Host "`n === Opt-In Status Check ==="
+        $optInStatus = Check-OptInStatus
+
+        $telemetryLabel = if ($null -eq $optInStatus.AllowTelemetry) { 'Not set (OS default)' }
+                          else { switch ($optInStatus.AllowTelemetry) { 0 { '0 (Off)' } 1 { '1 (Required)' } 2 { '2 (Enhanced)' } 3 { '3 (Full)' } default { $optInStatus.AllowTelemetry } } }
+        Write-Log "INFO" "AllowTelemetry: $telemetryLabel"
+
+        if ($optInStatus.IsOptedIn) {
+            Write-Log "INFO" "MicrosoftUpdateManagedOptIn: 0x5944 (opted in)"
+        } else {
+            Write-Log "INFO" "MicrosoftUpdateManagedOptIn: $(if ($null -eq $optInStatus.OptInValue) { 'Not set' } else { $optInStatus.OptInValue }) (not opted in)"
+        }
+
+        if ($optInStatus.AvailableUpdatesSet) {
+            Write-Log "INFO" "AvailableUpdates: 0x5944 (trigger set)"
+        } else {
+            Write-Log "INFO" "AvailableUpdates: $(if ($null -eq $optInStatus.AvailableUpdates) { 'Not set' } else { $optInStatus.AvailableUpdates })"
+        }
+
+        switch ($optInStatus.Summary) {
+            'Enabled'     { Write-Log "SUCCESS" "Windows Update Secure Boot management: Enabled" }
+            'Blocked'     { Write-Log "WARNING" "Windows Update Secure Boot management: Opted in but telemetry too low (AllowTelemetry=0)" }
+            'Not enabled' { Write-Log "INFO" "Windows Update Secure Boot management: Not enabled (opt-in key not set)" }
         }
         Write-Host ""
     }
@@ -1915,7 +1999,21 @@ end {
             $cardProperties['Update Task'] = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Secure-Boot-Update task missing'
         }
     }
-    
+    # Opt-in status (only when Secure Boot is Enabled and check ran)
+    if ($secureBoot -eq 'Enabled' -and $null -ne $optInStatus) {
+        switch ($optInStatus.Summary) {
+            'Enabled' {
+                $cardProperties['Opt-In Status'] = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Window Update Secure Boot management enabled'
+            }
+            'Blocked' {
+                $cardProperties['Opt-In Status'] = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Opted in but telemetry too low (AllowTelemetry=0)'
+            }
+            'Not enabled' {
+                $cardProperties['Opt-In Status'] = '<i class="fas fa-info-circle" style="color:#6C757D;"></i> Windows Update Secure Boot management not enabled'
+            }
+        }
+    }
+
     $cardInfo = [PSCustomObject]$cardProperties
     
     $cardHtml = Get-NinjaOneInfoCard `
@@ -1953,8 +2051,15 @@ end {
             } else {
                 $localCardProperties['Update Task'] = '⚠️ Secure-Boot-Update task missing'
             }
+            if ($null -ne $optInStatus) {
+                switch ($optInStatus.Summary) {
+                    'Enabled'     { $localCardProperties['Opt-In Status'] = '✅ Windows Update Secure Boot management enabled' }
+                    'Blocked'     { $localCardProperties['Opt-In Status'] = '⚠️ Opted in but telemetry too low (AllowTelemetry=0)' }
+                    'Not enabled' { $localCardProperties['Opt-In Status'] = 'ℹ️ Windows Update Secure Boot management not enabled' }
+                }
+            }
         }
-        
+
         $localCardInfo = [PSCustomObject]$localCardProperties
         
         $localCardTitle = "🛡️ Secure Boot Status Card"
@@ -2031,6 +2136,7 @@ end {
         Write-Host "DB 2023     : $(if ($has2023InDb) { $dbCertsFound -join ', ' } else { 'None found' })"
         Write-Host "Update Task : $(if ($scheduledTaskPresent) { 'Present' } else { 'Missing' })"
         Write-Host "OS Writable : $dbIsOsWritable"
+        Write-Host "Opt-In      : $(if ($null -ne $optInStatus) { $optInStatus.Summary } else { 'N/A' })"
     }
     Write-Host "--------------------------------------`n"
     
