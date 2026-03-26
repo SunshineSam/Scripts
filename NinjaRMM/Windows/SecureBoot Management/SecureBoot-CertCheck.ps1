@@ -1,18 +1,75 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 03-19-2026
+    Last Edit: 03-24-2026
 
     Note:
-    03-19-2026: Added Check-OptInStatus function — always checks telemetry and opt-in
+    03-24-2026: Manifest cross-referencing has been added, now checks each manifest bit
+                against actual cert presence:
+                  0x0040 → checks if Windows UEFI CA 2023 is in $dbCertsFound
+                  0x0800 → checks if Microsoft Option ROM UEFI CA 2023 is in $dbCertsFound
+                  0x1000 → checks if Microsoft UEFI CA 2023 is in $dbCertsFound
+                  0x0004/0x4004 → checks $has2023InKek
+                  0x0100 → checks if Event 1799 has occurred
+                Addresses incorerct assumptions about Update Completion/Manifest.
+                dbDefault now tracks which certs are found.
+                Three-way logic for missing KEK (both State 4 with 1801 and State 5b without events):
+                  dbIsOsWritable → Action Optional (KEK present, WU will handle it)
+                  has1803 → Action Required (OEM blocker, key reset or firmware update genuinely needed)
+                  No 1803 → Pending, opt-in can push KEK; tells you if opted in or not
+                Added WindowsUEFICA2023Capable check and 2011 CA Revocation Cross-Check;
+                  Source: https://github.com/cjee21/Check-UEFISecureBootVariables
+    03-24-2026: Removed "Pending (1799)" as a distinct state - Event 1799 now falls
+                through to the general Pending state. UEFICA2023Status='Updated' is
+                the ground truth; age-based 1799 guessing was unnecessary.
+                Added 1799→1808 informational note: when 1799 is latest and servicing
+                confirms Updated but 1808 is absent from the log, annotates card/console
+                that 1808 is expected on the next scheduled task cycle (runs at startup
+                + every 12h). No nudge or wait — just an informational annotation.
+                Fixed reboot correlation to show latest reboot (closest to 1799).
+                Fixed cert name: 'Microsoft Corporation UEFI CA 2023' -> 'Microsoft
+                UEFI CA 2023' (matching actual certificate CN).
+                Fixed BucketConfidenceLevel extraction: restricted to Event 1801/1808
+                only (1800 messages contain garbage metadata), added UpdateType: prefix
+                cleanup, null out empty confidence values.
+                Added Secure Boot servicing registry reads (UEFICA2023Status, Error,
+                ErrorEvent, CanAttemptUpdateAfter from Servicing + DeviceAttributes).
+                UEFICA2023Status='Updated' now serves as supplemental compliance signal
+                alongside Event 1808. Added Get-Win32ErrorMessage for error code decoding.
+                Added Get-AvailableUpdatesMeaning bitmask decoder (0x0004 KEK, 0x0040
+                Windows UEFI CA, 0x0100 boot manager, 0x0800 Option ROM CA, 0x1000
+                Microsoft UEFI CA, 0x4000 conditional on 2011 trust). Detects unknown bits.
+                Enhanced Check-OptInStatus to also read AvailableUpdatesPolicy (GPO/MDM
+                persistent trigger) and HighConfidenceOptOut (auto-deployment opt-out).
+                Enhanced Get-CertUpdateEventStatus to extract BucketId,
+                BucketConfidenceLevel, and SkipReason (KI_<number>) from event messages.
+                Card now shows: Certificate Inventory (all 4 certs), Servicing status
+                with error details, decoded AvailableUpdates bitmask, Rollout Tier
+                (confidence level + skip reason), and enhanced Opt-In with policy/opt-out.
+                Sources: MS KB5084567, Get-SecureBootCertInfo.ps1 (HorizonSecured),
+                Detect-SecureBootCertUpdateStatus.ps1 (Microsoft Official).
+    03-23-2026: Major event log expansion, now queries all 19 Secure Boot TPM-WMI event
+                IDs per MS KB5016061, including firmware/error events (1795 firmware
+                rejected write, 1796 unexpected error, 1797 prerequisite failure,
+                1798 boot mgr not signed, 1802 blocked by known limitation, 1803
+                PK-signed KEK not found). Color-coded event log summary in the status
+                card with aggregated occurrence counts and timestamps.
+                Fixed State 5 bug: "Action Optional" was shown for all has2023InDbDefault
+                cases regardless of $dbIsOsWritable, now correctly gates on the flag.
+                Fixed inconsistent $statusKey ('Pending' vs card showing 'Action Optional').
+                Fixed trigger logic: Step 2.5 no longer re-triggers when Event 1800
+                (reboot required) or 1799 (boot manager installed) is the latest state.
+                These are in-progress states that need a reboot, not another push.
+                Added distinct state handling for Event 1800 ("Pending Reboot") and
+                Event 1799 ("Pending" with age-based reboot detection) in the state
+                switch, replacing the generic "Pending" catch-all for these events.
+    03-19-2026: Added Check-OptInStatus function, always checks telemetry and opt-in
                 registry keys (AllowTelemetry, MaxTelemetryAllowed,
                 MicrosoftUpdateManagedOptIn, AvailableUpdates) and surfaces result
                 in the status card as "Opt-In Status" line.
                 Added Trigger-SecureBootTask call after Enable opt-in sets registry keys.
                 Increased UEFI variable buffer from 4 KB to 64 KB for large OEM db vars.
                 Updated error hint text to include common Win32 error codes (122, 1314).
-                Fixed README: secureBootAction section now references Ninja script variable
-                properly and documents as Drop-down, not "optional."
     03-18-2026: Added "Action Optional" state when UEFI db is OS-writable, downgrades
                 Action Required to Action Optional (Windows will push cert automatically).
                 Applied to both State 4 (Event 1801) and State 5 (Pending/no events) when
@@ -59,12 +116,12 @@
         - Parses db (allowed signatures), KEK (key exchange keys), dbx (revocations),
           and dbDefault (firmware defaults) for X509 certificates.
         - Checks for all four 2023 certificates Microsoft is rotating to:
-            db:  Windows UEFI CA 2023, Microsoft Corporation UEFI CA 2023,
+            db:  Windows UEFI CA 2023, Microsoft UEFI CA 2023,
                  Microsoft Option ROM UEFI CA 2023
             KEK: Microsoft Corporation KEK 2K CA 2023
         - KEK is the trust authority that authorizes writes to db. If the 2023 KEK
           authority cert is missing, Windows Update cannot sign the payload needed
-          to push new certs into db — even if UEFI attributes allow runtime writes.
+          to push new certs into db - even if UEFI attributes allow runtime writes.
       
       UEFI variable attributes (passive, read-only):
         - Uses GetFirmwareEnvironmentVariableExA (P/Invoke) with
@@ -74,9 +131,33 @@
         - Combined with the KEK 2023 check, determines whether Windows Update can
           effectively write to the BIOS cert db from the OS.
       
-      Event log (TPM-WMI):
-        - Queries for Events 1808 (compliant), 1801 (action required), and 1799
-          (boot manager installed — intermediate progress).
+      Event log (TPM-WMI - 19 event IDs per MS KB5016061):
+        - State events: 1808 (compliant), 1801 (action required), 1800 (reboot
+          required), 1799 (boot manager installed)
+        - Deployment events: 1043 (KEK updated), 1044 (Option ROM CA added),
+          1045 (UEFI CA added), 1036 (DB applied), 1034 (DBX applied),
+          1037 (2011 CA revoked), 1042 (Boot Manager SVN applied)
+        - Blocker events: 1032 (BitLocker conflict), 1033 (vulnerable bootloader)
+        - Firmware/error events: 1795 (firmware rejected write), 1796 (unexpected
+          error), 1797 (2023 cert not in DB), 1798 (boot mgr not signed),
+          1802 (blocked by known limitation), 1803 (PK-signed KEK not found)
+        - Aggregated summary with occurrence counts displayed in the status card.
+      
+      Servicing registry (HKLM:\...\SecureBoot\Servicing):
+        - UEFICA2023Status: definitive compliance state ("Updated" = done)
+        - UEFICA2023Error / UEFICA2023ErrorEvent: last error code + event ID
+        - CanAttemptUpdateAfter (DeviceAttributes): next allowed attempt time
+        - OEM manufacturer, model, firmware version/date
+      
+      AvailableUpdates bitmask decoding:
+        - Decodes each bit into human-readable pending update descriptions
+        - Reads both AvailableUpdates (volatile) and AvailableUpdatesPolicy (GPO/MDM persistent)
+        - Detects HighConfidenceOptOut (auto-deployment opt-out flag)
+      
+      Rollout metadata (from event messages):
+        - BucketId: Microsoft's device grouping hash
+        - BucketConfidenceLevel: "High Confidence" (auto-eligible) vs "Action Required" (manual)
+        - SkipReason: KI_<number> known firmware issue IDs
       
       Scheduled task:
         - Checks whether \Microsoft\Windows\PI\Secure-Boot-Update exists.
@@ -90,10 +171,11 @@
     Outputs an HTML status card and a searchable plain-text summary to NinjaRMM
     custom fields (or local files via -SaveStatusLocal).
     
-    The seven possible output states are:
+    The eight possible output states are:
       1. Not Applicable    - Non-UEFI or unsupported hardware
       2. Disabled          - UEFI capable but Secure Boot is off
-      3. Compliant         - Secure Boot on, Event 1808 found (BIOS certs updated)
+      3. Compliant         - Secure Boot on, Event 1808 or UEFICA2023Status='Updated'
+                             confirmed (BIOS certs updated)
       4. Action Required   - 2023 certs missing and Windows cannot write to the BIOS db
                              (UEFI attributes or KEK authority missing); OEM firmware
                              update or manual key reset required
@@ -101,10 +183,11 @@
                              is OS-writable (attributes + KEK both present); Windows
                              Update will push the cert automatically, or a manual BIOS
                              update / key reset can expedite
-      6. Pending           - 2023 cert in db or dbDefault but rotation not yet complete;
+      6. Pending Reboot    - Event 1800 detected; reboot required to continue the update
+      7. Pending           - 2023 cert in db or dbDefault but rotation not yet complete;
                              OS update triggered where applicable
-      7. Pending (Trigger) - OS-side update triggered; monitoring for Event 1799 -> 1808
-                             progression, with reboot detection if stalled
+      8. Pending (Trigger) - OS-side update triggered; monitoring for event progression,
+                             with reboot detection if stalled
 
 .PARAMETER StatusCardFieldName
     NinjaRMM WYSIWYG custom field name for the HTML status card.
@@ -570,7 +653,7 @@ begin {
             Write-Log "WARNING" "Could not enable SeSystemEnvironmentPrivilege; UEFI attributes check may fail"
         }
         
-        $buffer = New-Object byte[] 65536  # 64 KB — Dell/OEM db can exceed 4 KB
+        $buffer = New-Object byte[] 65536  # 64 KB - Dell/OEM db can exceed 4 KB
         $attributes = [uint32]0
         $result = [Win32.NativeMethods]::GetFirmwareEnvironmentVariableExA(
             $VarName,
@@ -607,119 +690,302 @@ begin {
         return $attributes
     }
     
-    # Helper function: Query the System event log for Secure Boot certificate update events
-    # Event 1808 = Certificates updated successfully in BIOS (compliant)
-    # Event 1801 = Certificates updated in Windows but NOT yet in BIOS (action required)
-    # Event 1799 = Boot manager installed, awaiting BIOS update confirmation
-    # Neither    = Machine has not received the certificate update via Windows Update yet
+    # -----------------------------------------------
+    # Secure Boot Event ID Reference (Microsoft-Windows-TPM-WMI)
+    # Source: https://support.microsoft.com/en-us/topic/secure-boot-db-and-dbx-variable-update-events-37e47cf8-608b-4a87-8175-bdead630eb69
+    # -----------------------------------------------
+    # State / progress events:
+    #   1801 = Certs available but not applied (action required)
+    #   1800 = Reboot required to continue
+    #   1799 = Boot manager (signed with 2023 cert) installed
+    #   1808 = Fully updated - all certs + boot manager applied (compliant)
     #
-    # Returns a hashtable: @{ Status; EventId; EventTime; EventMessage }
+    # Certificate deployment events (success):
+    #   1043 = KEK updated with KEK CA 2023
+    #   1044 = Option ROM CA 2023 added to DB
+    #   1045 = UEFI CA 2023 added to DB
+    #   1036 = DB variable applied
+    #   1034 = DBX variable applied
+    #   1037 = 2011 CA revoked from DBX (Mitigation 3)
+    #   1042 = Boot Manager SVN applied to DBX (Mitigation 4)
+    #
+    # Blocker / warning events:
+    #   1032 = BitLocker conflict (would enter recovery)
+    #   1033 = Vulnerable bootloader in EFI partition
+    #
+    # Firmware / prerequisite error events:
+    #   1795 = Firmware returned an error (rejected the write)
+    #   1796 = Unexpected error during variable update (Windows retries on reboot)
+    #   1797 = Windows UEFI CA 2023 not in DB (prerequisite failure)
+    #   1798 = Boot manager not signed with 2023 cert (DBX update blocked)
+    #   1802 = Update blocked - known firmware/hardware limitation
+    #   1803 = PK-signed KEK not found for this device (OEM hasn't provided signed KEK)
+    # -----------------------------------------------
+    
+    # Human-readable descriptions for each event ID
+    $script:SecureBootEventDescriptions = @{
+        # State events
+        1801 = 'Certs available but not applied'
+        1800 = 'Reboot required to continue'
+        1799 = 'Boot manager installed'
+        1808 = 'Fully updated (all certs + boot manager)'
+        # Deployment success events
+        1043 = 'KEK updated with KEK CA 2023'
+        1044 = 'Option ROM CA 2023 added to DB'
+        1045 = 'UEFI CA 2023 added to DB'
+        1036 = 'DB variable applied'
+        1034 = 'DBX variable applied'
+        1037 = '2011 CA revoked from DBX (Mitigation 3)'
+        1042 = 'Boot Manager SVN applied to DBX (Mitigation 4)'
+        # Blocker events
+        1032 = 'BitLocker conflict'
+        1033 = 'Vulnerable bootloader in EFI partition'
+        # Firmware / prerequisite errors
+        1795 = 'Firmware returned an error'
+        1796 = 'Unexpected update error (will retry on reboot)'
+        1797 = 'UEFI CA 2023 not in DB (prerequisite failure)'
+        1798 = 'Boot manager not signed with 2023 cert'
+        1802 = 'Update blocked (known firmware limitation)'
+        1803 = 'PK-signed KEK not found (OEM issue)'
+    }
+    
+    # All event IDs we query for (18 total per MS KB5016061)
+    $script:SecureBootEventIds = @(
+        1032, 1033, 1034, 1036, 1037, 1042, 1043, 1044, 1045,
+        1795, 1796, 1797, 1798, 1799, 1800, 1801, 1802, 1803, 1808
+    )
+    
+    # Helper function: Query ALL Secure Boot events from the System event log
+    # Returns a hashtable with:
+    #   Status       - Compliant / ActionRequired / Pending (based on most recent state event)
+    #   EventId      - Most recent state event ID
+    #   EventTime    - Timestamp of most recent state event
+    #   EventMessage - Human-readable description
+    #   AllEvents    - Full list of parsed events (for summary)
+    #   EventSummary - Aggregated list: @{ Id; Description; Count; FirstSeen; LastSeen }
     function Get-CertUpdateEventStatus {
-        $events = $null
+        $rawEvents = $null
         
-        # Primary method: Get-WinEvent (modern, preferred for Windows 10+)
+        # Primary method: Get-WinEvent
         try {
-            $events = Get-WinEvent -FilterHashtable @{
+            $rawEvents = Get-WinEvent -FilterHashtable @{
                 LogName      = 'System'
                 ProviderName = 'Microsoft-Windows-TPM-WMI'
-                Id           = 1799, 1801, 1808
-            } -MaxEvents 5 -ErrorAction Stop
-            Write-Log "INFO" "Get-WinEvent succeeded: $(@($events).Count) event(s) found"
+                Id           = $script:SecureBootEventIds
+            } -ErrorAction Stop
+            Write-Log "INFO" "Get-WinEvent succeeded: $(@($rawEvents).Count) event(s) found"
         }
         catch {
-            # Get-WinEvent throws (rather than returning empty) when no events match or provider is missing.
-            # Distinguish "no results" from a real error to decide whether to fall back.
             if ($_.Exception.Message -match 'No events were found') {
-                Write-Log "INFO" "Get-WinEvent: No matching events found in System log"
-                $events = @()
+                Write-Log "INFO" "Get-WinEvent: No matching Secure Boot events found"
+                $rawEvents = @()
             }
             else {
                 Write-Log "WARNING" "Get-WinEvent failed: $($_.Exception.Message). Attempting Get-EventLog fallback."
-                # Legacy fallback: Get-EventLog (deprecated in PS7 but available on PS5.1)
                 try {
-                    $events = Get-EventLog `
-                        -LogName System `
-                        -Source 'Microsoft-Windows-TPM-WMI' `
-                        -Newest 5 `
-                        -InstanceId 1799, 1801, 1808 `
-                        -ErrorAction Stop
-                    Write-Log "INFO" "Get-EventLog fallback succeeded: $(@($events).Count) event(s) found"
+                    $rawEvents = Get-EventLog -LogName System -Source 'Microsoft-Windows-TPM-WMI' `
+                        -InstanceId $script:SecureBootEventIds -ErrorAction Stop
+                    Write-Log "INFO" "Get-EventLog fallback succeeded: $(@($rawEvents).Count) event(s) found"
                 }
                 catch {
-                    Write-Log "WARNING" "Get-EventLog fallback also failed: $($_.Exception.Message). Treating as no events found."
-                    $events = @()
+                    Write-Log "WARNING" "Get-EventLog fallback also failed: $($_.Exception.Message)"
+                    $rawEvents = @()
                 }
             }
         }
         
-        $events = @($events)
+        $rawEvents = @($rawEvents)
         
-        if ($events.Count -eq 0) {
+        # Normalize events to a common format, extracting BucketId/Confidence/SkipReason from message text
+        $parsedEvents = foreach ($ev in $rawEvents) {
+            $id   = if ($null -ne $ev.Id) { $ev.Id } else { $ev.InstanceId }
+            $time = if ($null -ne $ev.TimeCreated) { $ev.TimeCreated } else { $ev.TimeGenerated }
+            $msg  = if ($null -ne $ev.Message) { $ev.Message } else { '' }
+            
+            # Extract BucketId, BucketConfidenceLevel, SkipReason from event message (1801/1808 carry these)
+            $bucketId    = $null
+            $confidence  = $null
+            $skipReason  = $null
+            if ($msg -match 'BucketId:\s*(.+?)(\r|\n|$)')             { $bucketId   = $matches[1].Trim() }
+            if ($msg -match 'BucketConfidenceLevel:\s*(.+?)(\r|\n|$)') { $confidence = $matches[1].Trim() }
+            if ($msg -match 'SkipReason:\s*(KI_\d+)')                 { $skipReason = $matches[1] }
+            
+            [PSCustomObject]@{
+                Id          = [int]$id
+                Time        = [datetime]$time
+                Description = if ($script:SecureBootEventDescriptions.ContainsKey([int]$id)) { $script:SecureBootEventDescriptions[[int]$id] } else { "Unknown event $id" }
+                BucketId    = $bucketId
+                Confidence  = $confidence
+                SkipReason  = $skipReason
+            }
+        }
+        
+        # Sort chronologically (oldest first for display, newest first for state)
+        $parsedEvents = @($parsedEvents | Sort-Object -Property Time)
+        
+        # Build aggregated summary: group by ID, count occurrences, track first/last seen
+        $eventSummary = @()
+        if ($parsedEvents.Count -gt 0) {
+            $grouped = $parsedEvents | Group-Object -Property Id
+            foreach ($group in ($grouped | Sort-Object { ($_.Group | Select-Object -First 1).Time })) {
+                $sorted = $group.Group | Sort-Object Time
+                $eventSummary += [PSCustomObject]@{
+                    Id          = [int]$group.Name
+                    Description = $sorted[0].Description
+                    Count       = $group.Count
+                    FirstSeen   = $sorted[0].Time
+                    LastSeen    = $sorted[-1].Time
+                }
+            }
+        }
+        
+        # Log the summary
+        if ($eventSummary.Count -gt 0) {
+            Write-Log "INFO" "Event log summary:"
+            foreach ($entry in ($eventSummary | Sort-Object FirstSeen)) {
+                $timeStr = $entry.LastSeen.ToString('yyyy-MM-dd HH:mm')
+                Write-Log "INFO" ("  {0}  [{1}] {2} ({3}x)" -f $timeStr, $entry.Id, $entry.Description, $entry.Count)
+            }
+        }
+        
+        # Determine state from the most recent STATE event (1808 > 1800 > 1801 > 1799)
+        # These are the events that indicate overall deployment status
+        $stateEventIds = @(1799, 1800, 1801, 1808)
+        $stateEvents = @($parsedEvents | Where-Object { $stateEventIds -contains $_.Id } | Sort-Object Time -Descending)
+        
+        if ($stateEvents.Count -eq 0 -and $parsedEvents.Count -eq 0) {
             return @{
                 Status       = 'Pending'
                 EventId      = $null
                 EventTime    = $null
-                EventMessage = 'No TPM-WMI certificate update events (1799/1801/1808) found in System log'
+                EventMessage      = 'No Secure Boot certificate events found in System log'
+                AllEvents         = @()
+                EventSummary      = @()
+                BucketId          = $null
+                Confidence        = $null
+                SkipReason        = $null
+                RebootCorrelation = $null
             }
         }
         
-        # The most recent event reflects the current state of the machine.
-        # If both 1808 and 1801 are present, 1808 (BIOS updated) should be more recent after remediation.
-        $latestEvent = $events | Sort-Object -Property { if ($_.TimeCreated) { $_.TimeCreated } else { $_.TimeGenerated } } -Descending | Select-Object -First 1
+        # If we have deployment events (1043-1045, 1036, etc.) but no state events,
+        # certs are being applied but no state conclusion yet
+        if ($stateEvents.Count -eq 0) {
+            $latest = $parsedEvents | Select-Object -Last 1
+            return @{
+                Status       = 'Pending'
+                EventId      = $latest.Id
+                EventTime    = $latest.Time
+                EventMessage      = 'Deployment events found but no state events (1801/1808) yet'
+                AllEvents         = $parsedEvents
+                EventSummary      = $eventSummary
+                BucketId          = $null
+                Confidence        = $null
+                SkipReason        = $null
+                RebootCorrelation = $null
+            }
+        }
         
-        # Normalize property names between Get-WinEvent (Id, TimeCreated) and Get-EventLog (InstanceId, TimeGenerated)
-        $eventId   = if ($null -ne $latestEvent.Id)          { $latestEvent.Id }          else { $latestEvent.InstanceId }
-        $eventTime = if ($null -ne $latestEvent.TimeCreated) { $latestEvent.TimeCreated } else { $latestEvent.TimeGenerated }
+        $latestState = $stateEvents[0]
         
-        Write-Log "INFO" "Most recent certificate event: ID $eventId at $eventTime"
-        
-        switch ($eventId) {
+        switch ($latestState.Id) {
             1808 {
-                return @{
-                    Status       = 'Compliant'
-                    EventId      = 1808
-                    EventTime    = $eventTime
-                    EventMessage = 'Certificates updated successfully in BIOS (Event 1808)'
-                }
+                $status = 'Compliant'
+                $msg    = 'Fully updated - all certs + boot manager applied (Event 1808)'
+            }
+            1800 {
+                $status = 'Pending'
+                $msg    = 'Reboot required to continue (Event 1800)'
             }
             1801 {
-                return @{
-                    Status       = 'ActionRequired'
-                    EventId      = 1801
-                    EventTime    = $eventTime
-                    EventMessage = 'Certificates updated in Windows but NOT yet in BIOS (Event 1801)'
-                }
+                $status = 'ActionRequired'
+                $msg    = 'Certs available but not applied (Event 1801)'
             }
             1799 {
-                return @{
-                    Status       = 'Pending'
-                    EventId      = 1799
-                    EventTime    = $eventTime
-                    EventMessage = 'Boot manager installed, awaiting BIOS update (Event 1799)'
-                }
+                $status = 'Pending'
+                $msg    = 'Boot manager signed with UEFI CA 2023 installed successfully (Event 1799)'
             }
             default {
-                Write-Log "WARNING" "Unexpected event ID $eventId encountered; treating as Pending"
-                return @{
-                    Status       = 'Pending'
-                    EventId      = $eventId
-                    EventTime    = $eventTime
-                    EventMessage = "Unexpected event ID $eventId found; treating as Pending"
+                $status = 'Pending'
+                $msg    = "Event $($latestState.Id) - treating as Pending"
+            }
+        }
+        
+        Write-Log "INFO" "Most recent state event: ID $($latestState.Id) at $($latestState.Time)"
+        
+        # Extract BucketId/Confidence from 1801 or 1808 events only (1800/1799 don't carry meaningful bucket metadata)
+        $bucketEvent = $stateEvents | Where-Object { $null -ne $_.BucketId -and $_.Id -in @(1801, 1808) } | Select-Object -First 1
+        if ($null -ne $bucketEvent) {
+            # Clean up Confidence: strip "UpdateType:" prefix if present (e.g., "UpdateType:ActionRequired" → "ActionRequired")
+            if ($bucketEvent.Confidence -match '^UpdateType:(.*)$') {
+                $bucketEvent.Confidence = $matches[1].Trim()
+            }
+            # If confidence is empty/whitespace after cleanup, null it out
+            if ([string]::IsNullOrWhiteSpace($bucketEvent.Confidence)) {
+                $bucketEvent.Confidence = $null
+            }
+            Write-Log "INFO" "Bucket: $($bucketEvent.BucketId)"
+            if ($null -ne $bucketEvent.Confidence) {
+                Write-Log "INFO" "Confidence: $($bucketEvent.Confidence)"
+            }
+            if ($null -ne $bucketEvent.SkipReason) {
+                Write-Log "WARNING" "SkipReason: $($bucketEvent.SkipReason) (Known firmware issue)"
+            }
+        }
+        
+        # Detect 1800 → 1799 progression (reboot between them confirms the sequence)
+        $rebootCorrelation = $null
+        $ev1800 = $parsedEvents | Where-Object { $_.Id -eq 1800 } | Sort-Object Time -Descending | Select-Object -First 1
+        $ev1799 = $parsedEvents | Where-Object { $_.Id -eq 1799 } | Sort-Object Time -Descending | Select-Object -First 1
+        if ($null -ne $ev1800 -and $null -ne $ev1799 -and $ev1799.Time -gt $ev1800.Time) {
+            $rebootCheck = Get-RebootsBetweenTimes -After $ev1800.Time -Before $ev1799.Time
+            if ($rebootCheck.Found) {
+                $bootTimeStr = $rebootCheck.BootTimes[-1].ToString('yyyy-MM-dd HH:mm')
+                Write-Log "INFO" "Reboot detected between 1800 ($($ev1800.Time.ToString('HH:mm'))) and 1799 ($($ev1799.Time.ToString('HH:mm'))): boot at $bootTimeStr"
+                $rebootCorrelation = @{
+                    Event1800Time = $ev1800.Time
+                    Event1799Time = $ev1799.Time
+                    BootTimes     = $rebootCheck.BootTimes
+                    BootCount     = $rebootCheck.Count
+                    Confirmed     = $true
                 }
             }
+            else {
+                Write-Log "INFO" "1800 ($($ev1800.Time.ToString('HH:mm'))) → 1799 ($($ev1799.Time.ToString('HH:mm'))) detected, but no reboot found between them"
+                $rebootCorrelation = @{
+                    Event1800Time = $ev1800.Time
+                    Event1799Time = $ev1799.Time
+                    BootTimes     = @()
+                    BootCount     = 0
+                    Confirmed     = $false
+                }
+            }
+        }
+        
+        return @{
+            Status            = $status
+            EventId           = $latestState.Id
+            EventTime         = $latestState.Time
+            EventMessage      = $msg
+            AllEvents         = $parsedEvents
+            EventSummary      = $eventSummary
+            BucketId          = if ($bucketEvent) { $bucketEvent.BucketId } else { $null }
+            Confidence        = if ($bucketEvent) { $bucketEvent.Confidence } else { $null }
+            SkipReason        = if ($bucketEvent) { $bucketEvent.SkipReason } else { $null }
+            RebootCorrelation = $rebootCorrelation
         }
     }
     
     # Helper function: Check for recent post-trigger events (1808, 1799) in last N minutes
     # Returns: 'Compliant' (1808 found), 'Pending1808' (1799 found, awaiting 1808),
-    #          or 'Pending1799' (neither found, awaiting 1799)
+    #          or 'Pending' (neither found yet)
     function Check-PostTriggerEvents {
         param (
             [int]$Minutes = 5
         )
         $startTime = (Get-Date).AddMinutes(-$Minutes)
         
-        # Check for 1808 first (best case — already fully compliant)
+        # Check for 1808 first (best case - already fully compliant)
         try {
             $ev1808 = Get-WinEvent -FilterHashtable @{
                 LogName      = 'System'
@@ -751,7 +1017,7 @@ begin {
             }
         }
         
-        return 'Pending1799'
+        return 'Pending'
     }
     
     # Helper function: Set the AvailableUpdates + MicrosoftUpdateManagedOptIn registry keys to trigger OS-side update
@@ -805,11 +1071,12 @@ begin {
     }
     
     # Helper function: Check Secure Boot opt-in and telemetry configuration status (read-only)
-    # Returns: hashtable with IsOptedIn, TelemetryMeetsMin, AvailableUpdatesSet, Summary, and raw values
+    # Returns: hashtable with IsOptedIn, TelemetryMeetsMin, AvailableUpdatesSet, Summary,
+    #          AvailableUpdatesPolicy, HighConfidenceOptOut, decoded bitmask meanings, and raw values
     function Check-OptInStatus {
         $dataCollectionPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection"
         $secureBootPath     = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
-
+        
         $allowTelemetry = (Get-ItemProperty -Path $dataCollectionPath -Name "AllowTelemetry" -ErrorAction SilentlyContinue |
                            Select-Object -ExpandProperty "AllowTelemetry" -ErrorAction SilentlyContinue)
         $maxTelemetry   = (Get-ItemProperty -Path $dataCollectionPath -Name "MaxTelemetryAllowed" -ErrorAction SilentlyContinue |
@@ -818,12 +1085,25 @@ begin {
                            Select-Object -ExpandProperty "MicrosoftUpdateManagedOptIn" -ErrorAction SilentlyContinue)
         $available      = (Get-ItemProperty -Path $secureBootPath -Name "AvailableUpdates" -ErrorAction SilentlyContinue |
                            Select-Object -ExpandProperty "AvailableUpdates" -ErrorAction SilentlyContinue)
-
+        
+        # AvailableUpdatesPolicy: GPO/MDM-driven persistent trigger (survives reboots, unlike AvailableUpdates)
+        $availablePolicy = (Get-ItemProperty -Path $secureBootPath -Name "AvailableUpdatesPolicy" -ErrorAction SilentlyContinue |
+                            Select-Object -ExpandProperty "AvailableUpdatesPolicy" -ErrorAction SilentlyContinue)
+        
+        # HighConfidenceOptOut: Opt-out flag for Microsoft's auto-deployment to high-confidence devices
+        $highConfOptOut  = (Get-ItemProperty -Path $secureBootPath -Name "HighConfidenceOptOut" -ErrorAction SilentlyContinue |
+                            Select-Object -ExpandProperty "HighConfidenceOptOut" -ErrorAction SilentlyContinue)
+        
         # Telemetry meets minimum if AllowTelemetry >= 1 or is not set (OS default allows it)
         $telemetryMeetsMin = ($null -eq $allowTelemetry) -or ($allowTelemetry -ge 1)
         $isOptedIn         = $optIn -eq 0x5944
-        $availableSet      = $available -eq 0x5944
-
+        $availableSet      = ($null -ne $available -and $available -ne 0)
+        $policySet         = ($null -ne $availablePolicy -and $availablePolicy -ne 0)
+        
+        # Decode AvailableUpdates bitmask (use whichever is set; policy takes precedence)
+        $effectiveAvailable = if ($policySet) { $availablePolicy } elseif ($availableSet) { $available } else { 0 }
+        $availableMeaning   = if ($effectiveAvailable -ne 0) { Get-AvailableUpdatesMeaning -Value $effectiveAvailable } else { @() }
+        
         # Determine summary
         if ($isOptedIn -and $telemetryMeetsMin) {
             $summary = 'Enabled'
@@ -834,19 +1114,188 @@ begin {
         else {
             $summary = 'Not enabled'
         }
-
+        
         return @{
-            IsOptedIn         = $isOptedIn
-            TelemetryMeetsMin = $telemetryMeetsMin
-            AvailableUpdatesSet = $availableSet
-            AllowTelemetry    = $allowTelemetry
-            MaxTelemetry      = $maxTelemetry
-            OptInValue        = $optIn
-            AvailableUpdates  = $available
-            Summary           = $summary
+            IsOptedIn              = $isOptedIn
+            TelemetryMeetsMin      = $telemetryMeetsMin
+            AvailableUpdatesSet    = $availableSet
+            AllowTelemetry         = $allowTelemetry
+            MaxTelemetry           = $maxTelemetry
+            OptInValue             = $optIn
+            AvailableUpdates       = $available
+            AvailableUpdatesPolicy = $availablePolicy
+            AvailableUpdatesPolicySet = $policySet
+            HighConfidenceOptOut   = $highConfOptOut
+            AvailableUpdatesMeaning = $availableMeaning
+            EffectiveAvailable     = $effectiveAvailable
+            Summary                = $summary
         }
     }
+    
+    # Helper function: Convert a Win32 or HRESULT error code to a human-readable message
+    # Returns: string with the error message, or the hex code if unknown
+    function Get-Win32ErrorMessage {
+        param ([uint32]$ErrorCode)
+        try {
+            # Only low 16 bits matter for Win32Exception
+            $win32 = $ErrorCode -band 0xFFFF
+            $ex = [System.ComponentModel.Win32Exception]::new([int]$win32)
+            return $ex.Message
+        }
+        catch {
+            return ('0x{0:X}' -f $ErrorCode)
+        }
+    }
+    
+    # Helper function: Read Secure Boot servicing registry state
+    # Returns: hashtable with UEFICA2023Status, Error, ErrorEvent, ErrorMessage, CanAttemptUpdateAfter
+    # Source: HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing
+    function Get-SecureBootServicingStatus {
+        $servPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing"
+        $attrPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing\DeviceAttributes"
+        
+        $result = @{
+            UEFICA2023Status           = $null
+            WindowsUEFICA2023Capable   = $null   # 0=not in DB, 1=cert in DB, 2=cert in DB + booting from 2023 boot mgr
+            UEFICA2023Error            = $null
+            UEFICA2023ErrorHex         = $null
+            UEFICA2023ErrorMessage     = $null
+            UEFICA2023ErrorEvent       = $null
+            UEFICA2023ErrorEventDesc   = $null
+            CanAttemptUpdateAfter      = $null
+            OEMManufacturerName        = $null
+            OEMModelNumber             = $null
+            FirmwareVersion            = $null
+            FirmwareReleaseDate        = $null
+        }
+        
+        # --- Servicing status ---
+        $serv = Get-ItemProperty -Path $servPath -ErrorAction SilentlyContinue
+        if ($null -ne $serv) {
+            # UEFICA2023Status: "Updated" = compliant, other values = in progress or error
+            if ($serv.PSObject.Properties.Match("UEFICA2023Status").Count -gt 0) {
+                $result.UEFICA2023Status = $serv.UEFICA2023Status
+            }
 
+            # WindowsUEFICA2023Capable: 0=not in DB, 1=cert in DB, 2=cert in DB + booting from 2023 boot manager
+            if ($serv.PSObject.Properties.Match("WindowsUEFICA2023Capable").Count -gt 0) {
+                $result.WindowsUEFICA2023Capable = [int]$serv.WindowsUEFICA2023Capable
+            }
+
+            # UEFICA2023Error: Win32 error code from last failed attempt
+            if ($serv.PSObject.Properties.Match("UEFICA2023Error").Count -gt 0 -and $null -ne $serv.UEFICA2023Error) {
+                $rawError = [uint32]$serv.UEFICA2023Error
+                $result.UEFICA2023Error = $rawError
+                $result.UEFICA2023ErrorHex = ('0x{0:X}' -f $rawError)
+                if ($rawError -ne 0) {
+                    $result.UEFICA2023ErrorMessage = Get-Win32ErrorMessage -ErrorCode $rawError
+                }
+            }
+            
+            # UEFICA2023ErrorEvent: maps to the event ID that describes the failure
+            if ($serv.PSObject.Properties.Match("UEFICA2023ErrorEvent").Count -gt 0 -and $null -ne $serv.UEFICA2023ErrorEvent) {
+                $errorEvent = [int]$serv.UEFICA2023ErrorEvent
+                $result.UEFICA2023ErrorEvent = $errorEvent
+                $result.UEFICA2023ErrorEventDesc = if ($script:SecureBootEventDescriptions.ContainsKey($errorEvent)) {
+                    $script:SecureBootEventDescriptions[$errorEvent]
+                } else {
+                    "Unknown event $errorEvent"
+                }
+            }
+        }
+        
+        # --- Device attributes ---
+        $attr = Get-ItemProperty -Path $attrPath -ErrorAction SilentlyContinue
+        if ($null -ne $attr) {
+            if ($attr.PSObject.Properties.Match("OEMManufacturerName").Count -gt 0)  { $result.OEMManufacturerName = $attr.OEMManufacturerName }
+            if ($attr.PSObject.Properties.Match("OEMModelNumber").Count -gt 0)       { $result.OEMModelNumber = $attr.OEMModelNumber }
+            if ($attr.PSObject.Properties.Match("FirmwareVersion").Count -gt 0)      { $result.FirmwareVersion = $attr.FirmwareVersion }
+            if ($attr.PSObject.Properties.Match("FirmwareReleaseDate").Count -gt 0)  { $result.FirmwareReleaseDate = $attr.FirmwareReleaseDate }
+            
+            # CanAttemptUpdateAfter: FILETIME (byte[] or long) - next allowed update attempt
+            if ($attr.PSObject.Properties.Match("CanAttemptUpdateAfter").Count -gt 0 -and $null -ne $attr.CanAttemptUpdateAfter) {
+                try {
+                    $raw = $attr.CanAttemptUpdateAfter
+                    if ($raw -is [byte[]]) {
+                        $filetime = [BitConverter]::ToInt64($raw, 0)
+                    } else {
+                        $filetime = [long]$raw
+                    }
+                    if ($filetime -gt 0) {
+                        $result.CanAttemptUpdateAfter = [DateTime]::FromFileTime($filetime)
+                    }
+                }
+                catch {
+                    Write-Log "WARNING" "Could not convert CanAttemptUpdateAfter FILETIME to DateTime"
+                }
+            }
+        }
+        
+        return $result
+    }
+    
+    # Helper function: Decode AvailableUpdates bitmask into human-readable meanings
+    # Source: Get-SecureBootCertInfo.ps1 (HorizonSecured) and MS KB5084567
+    # Returns: array of strings describing each set bit
+    function Get-AvailableUpdatesMeaning {
+        param ([int]$Value)
+        
+        if ($Value -eq 0) {
+            return @('No pending Secure Boot updates')
+        }
+        
+        $meaning = @()
+        
+        # KEK special case: both bits set together
+        if (($Value -band 0x4004) -eq 0x4004) { $meaning += 'KEK needs to be updated' }
+        if ($Value -band 0x0004)               { $meaning += 'Install Microsoft KEK 2023 signed by OEM PK' }
+        if ($Value -band 0x0040)               { $meaning += 'Apply Windows UEFI CA 2023 to DB' }
+        if ($Value -band 0x0100)               { $meaning += 'Install boot manager signed with UEFI CA 2023' }
+        if ($Value -band 0x0800)               { $meaning += 'Apply Microsoft Option ROM UEFI CA 2023' }
+        if ($Value -band 0x1000)               { $meaning += 'Apply Microsoft UEFI CA 2023' }
+        # 0x4000 = conditional qualifier (apply only if UEFI CA 2011 trusted) — always present, not displayed
+        
+        # Detect undocumented bits
+        $knownBits = 0x0004 -bor 0x0040 -bor 0x0100 -bor 0x0800 -bor 0x1000 -bor 0x4000 -bor 0x4004
+        $unknownBits = $Value -band (-bnot $knownBits)
+        if ($unknownBits -ne 0) {
+            $meaning += ('Unknown update bits: 0x{0:X}' -f $unknownBits)
+        }
+        
+        return $meaning
+    }
+    
+    # Helper function: Find system boot events between two timestamps
+    # Uses Kernel-General Event 12 (system startup marker) to detect reboots
+    # Returns: @{ Found = $true/$false; BootTimes = @([datetime]...); Count = int }
+    function Get-RebootsBetweenTimes {
+        param (
+            [Parameter(Mandatory)][datetime]$After,
+            [Parameter(Mandatory)][datetime]$Before
+        )
+        $bootTimes = @()
+        try {
+            $boots = Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                ProviderName = 'Microsoft-Windows-Kernel-General'
+                Id           = 12
+                StartTime    = $After
+                EndTime      = $Before
+            } -ErrorAction Stop
+            $bootTimes = @($boots | ForEach-Object { $_.TimeCreated } | Sort-Object)
+        }
+        catch {
+            if ($_.Exception.Message -notmatch 'No events were found') {
+                Write-Log "WARNING" "Failed to query boot events: $($_.Exception.Message)"
+            }
+        }
+        return @{
+            Found     = $bootTimes.Count -gt 0
+            BootTimes = $bootTimes
+            Count     = $bootTimes.Count
+        }
+    }
+    
     # Helper function: Check if a system reboot is pending and return the source(s)
     # Returns: hashtable @{ Pending = $true/$false; Sources = @('Windows Update', 'Component Servicing') }
     function Get-PendingRebootStatus {
@@ -1210,7 +1659,7 @@ begin {
     }
     
     # Helper function: Remove the Secure Boot opt-in gate (opt out of Windows Update management)
-    # Does NOT remove AvailableUpdates — already-triggered updates should complete
+    # Does NOT remove AvailableUpdates - already-triggered updates should complete
     function Remove-SecureBootOptInKeys {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
         
@@ -1301,16 +1750,11 @@ begin {
 }
 
 # =========================================
-# PROCESS Block: (Status Reporting Only)
+# PROCESS Block: Data Gathering & Logic
+#   Steps 1–2.6: Secure Boot status, cert parsing, dbx cross-check,
+#   event log, servicing registry, opt-in check, trigger logic
 # =========================================
 process {
-    
-}
-
-# =========================================
-# END Block: Core Logic & Output
-# =========================================
-end {
     Write-Host "`n=== Secure Boot Certificate Status Check ==="
     
     # -----------------------------------------------
@@ -1324,7 +1768,7 @@ end {
     # Step 1.5: If Enabled, parse db, KEK, and dbx certificates
     # -----------------------------------------------
     # The full set of 2023 certificates Microsoft is rotating to:
-    #   db certs:  Windows UEFI CA 2023, Microsoft Corporation UEFI CA 2023, Microsoft Option ROM UEFI CA 2023
+    #   db certs:  Windows UEFI CA 2023, Microsoft UEFI CA 2023, Microsoft Option ROM UEFI CA 2023
     #   KEK cert:  Microsoft Corporation KEK 2K CA 2023
     # KEK (Key Exchange Key) is the trust authority that authorizes writes to db.
     # When Windows Update pushes a signed update payload to write new certs into db,
@@ -1333,7 +1777,7 @@ end {
     # even if the UEFI attributes indicate db is runtime-writable.
     $updatedDbCertNames  = @(
         'Windows UEFI CA 2023',
-        'Microsoft Corporation UEFI CA 2023',
+        'Microsoft UEFI CA 2023',
         'Microsoft Option ROM UEFI CA 2023'
     )
     $updatedKekCertName  = 'Microsoft Corporation KEK 2K CA 2023'
@@ -1367,7 +1811,7 @@ end {
             Write-Log "WARNING" "Failed to parse db: $($_.Exception.Message)"
         }
         
-        # --- Parse KEK (key exchange keys — authorizes writes to db) ---
+        # --- Parse KEK (key exchange keys - authorizes writes to db) ---
         try {
             Write-Log "INFO" "Parsing KEK certificates"
             $kekBytes = (Get-SecureBootUEFI -Name KEK -ErrorAction Stop).Bytes
@@ -1409,6 +1853,30 @@ end {
             Write-Log "WARNING" "Failed to parse dbx: $($_.Exception.Message)"
         }
         
+        # --- Cross-check: are any 2011 CAs revoked in DBX? (Stage 3 indicator) ---
+        $ca2011RevokedInDbx = @()   # Which 2011 CAs appear in the revocation list
+        try {
+            $dbxRawText = [System.Text.Encoding]::ASCII.GetString($dbxBytes)
+            $oldCAs = @(
+                'Microsoft Corporation UEFI CA 2011'
+                'Microsoft Windows Production PCA 2011'
+            )
+            foreach ($oldCA in $oldCAs) {
+                if ($dbxRawText -match [regex]::Escape($oldCA)) {
+                    $ca2011RevokedInDbx += $oldCA
+                }
+            }
+            if ($ca2011RevokedInDbx.Count -gt 0) {
+                Write-Log "INFO" "2011 CA revoked in dbx: $($ca2011RevokedInDbx -join ', ')"
+            }
+            else {
+                Write-Log "INFO" "No 2011 CAs found in dbx (not yet revoked)"
+            }
+        }
+        catch {
+            Write-Log "WARNING" "Failed to cross-check 2011 CAs in dbx: $($_.Exception.Message)"
+        }
+
         # --- Check for 2023 certs in db (check all 3 db-level certs) ---
         try {
             $dbRawText = [System.Text.Encoding]::ASCII.GetString($dbBytes)
@@ -1440,17 +1908,23 @@ end {
         }
         
         # --- If not in db, check dbDefault ---
+        $dbDefaultCertsFound = @()   # Which 2023 certs are present in dbDefault
         if (-not $has2023InDb) {
             try {
                 $dbDefaultBytes = (Get-SecureBootUEFI -Name dbDefault -ErrorAction Stop).Bytes
                 $dbDefaultRawText = [System.Text.Encoding]::ASCII.GetString($dbDefaultBytes)
                 foreach ($certName in $updatedDbCertNames) {
                     if ($dbDefaultRawText -match [regex]::Escape($certName)) {
-                        $has2023InDbDefault = $true
-                        break
+                        $dbDefaultCertsFound += $certName
                     }
                 }
-                Write-Log "INFO" "2023 Cert in dbDefault: $has2023InDbDefault"
+                $has2023InDbDefault = $dbDefaultCertsFound.Count -gt 0
+                if ($has2023InDbDefault) {
+                    Write-Log "INFO" "2023 certs found in dbDefault: $($dbDefaultCertsFound -join ', ')"
+                }
+                else {
+                    Write-Log "INFO" "No 2023 certs found in dbDefault"
+                }
             }
             catch {
                 Write-Log "WARNING" "Failed to check 2023 cert in dbDefault: $($_.Exception.Message)"
@@ -1481,7 +1955,7 @@ end {
         }
         elseif ($uefiAllowsWrite -and -not $has2023InKek) {
             $dbIsOsWritable = $false
-            Write-Log "WARNING" "UEFI attributes allow runtime writes, but 2023 KEK authority cert is missing. Windows Update cannot sign the payload — db is NOT effectively OS-writable."
+            Write-Log "WARNING" "UEFI attributes allow runtime writes, but 2023 KEK authority cert is missing. Windows Update cannot sign the payload - db is NOT effectively OS-writable."
         }
         else {
             $dbIsOsWritable = $false
@@ -1511,6 +1985,61 @@ end {
     }
     
     # -----------------------------------------------
+    # Step 2.1: Read Secure Boot servicing registry (only when Secure Boot is Enabled)
+    # -----------------------------------------------
+    $servicingStatus = $null
+    if ($secureBoot -eq 'Enabled') {
+        Write-Host "`n === Secure Boot Servicing Registry ==="
+        $servicingStatus = Get-SecureBootServicingStatus
+        
+        if ($null -ne $servicingStatus.UEFICA2023Status) {
+            Write-Log "INFO" "UEFICA2023Status: $($servicingStatus.UEFICA2023Status)"
+        }
+        else {
+            Write-Log "INFO" "UEFICA2023Status: Not set"
+        }
+        
+        if ($null -ne $servicingStatus.WindowsUEFICA2023Capable) {
+            $capableDesc = switch ($servicingStatus.WindowsUEFICA2023Capable) {
+                1 { 'Cert in DB' }
+                2 { 'Cert in DB + booting from 2023 boot manager' }
+                default { 'Cert not in DB' }
+            }
+            Write-Log "INFO" "WindowsUEFICA2023Capable: $($servicingStatus.WindowsUEFICA2023Capable) ($capableDesc)"
+        }
+        
+        if ($null -ne $servicingStatus.UEFICA2023Error -and $servicingStatus.UEFICA2023Error -ne 0) {
+            Write-Log "WARNING" "UEFICA2023Error: $($servicingStatus.UEFICA2023ErrorHex) - $($servicingStatus.UEFICA2023ErrorMessage)"
+        }
+        
+        if ($null -ne $servicingStatus.UEFICA2023ErrorEvent) {
+            Write-Log "INFO" "UEFICA2023ErrorEvent: $($servicingStatus.UEFICA2023ErrorEvent) - $($servicingStatus.UEFICA2023ErrorEventDesc)"
+        }
+        
+        if ($null -ne $servicingStatus.CanAttemptUpdateAfter) {
+            $updateAfterStr = $servicingStatus.CanAttemptUpdateAfter.ToString('yyyy-MM-dd HH:mm')
+            if ($servicingStatus.CanAttemptUpdateAfter -gt (Get-Date)) {
+                Write-Log "WARNING" "CanAttemptUpdateAfter: $updateAfterStr (update delayed until this time)"
+            }
+            else {
+                Write-Log "INFO" "CanAttemptUpdateAfter: $updateAfterStr (past - update can proceed)"
+            }
+        }
+        
+        # Use UEFICA2023Status as supplemental compliance signal
+        if ($servicingStatus.UEFICA2023Status -eq 'Updated' -and $certStatus -and $certStatus.Status -ne 'Compliant') {
+            Write-Log "INFO" "Servicing registry reports 'Updated' but event log status is '$($certStatus.Status)' - servicing confirms compliance"
+        }
+        
+        # Log device attributes if available
+        if ($null -ne $servicingStatus.OEMManufacturerName) {
+            Write-Log "INFO" "OEM: $($servicingStatus.OEMManufacturerName) | Model: $($servicingStatus.OEMModelNumber) | FW: $($servicingStatus.FirmwareVersion)"
+        }
+        
+        Write-Host ""
+    }
+    
+    # -----------------------------------------------
     # Step 2.25: Execute SecureBootAction if specified
     # -----------------------------------------------
     if ($SecureBootAction) {
@@ -1536,7 +2065,7 @@ end {
                     # 3. Trigger Secure-Boot-Update scheduled task to kick off the update
                     Trigger-SecureBootTask
                     
-                    Write-Log "SUCCESS" "Secure Boot opt-in and telemetry enablement complete"
+                    Write-Log "SUCCESS" "Secure Boot opt-in, telemetry enablement, and scheduled-task run complete"
                 }
                 'Remove opt-in for SecureBoot management' {
                     if ($certStatus -and $certStatus.EventId -eq 1808) {
@@ -1563,7 +2092,8 @@ end {
                     
                     if ($null -eq $allowTelemetry) {
                         Write-Log "INFO" "AllowTelemetry: Not set (OS default)"
-                    } else {
+                    }
+                    else {
                         $telemetryLabel = switch ($allowTelemetry) { 0 { 'Off' } 1 { 'Required' } 2 { 'Enhanced' } 3 { 'Full' } default { $allowTelemetry } }
                         Write-Log "INFO" "AllowTelemetry: $allowTelemetry ($telemetryLabel)"
                     }
@@ -1578,7 +2108,7 @@ end {
                     
                     $telemetryMeetsMin = ($null -ne $allowTelemetry -and $allowTelemetry -ge 1) -or ($null -eq $allowTelemetry)
                     if (-not $telemetryMeetsMin) {
-                        Write-Log "WARNING" "AllowTelemetry is 0 (Off) — Windows Update cannot manage Secure Boot certs"
+                        Write-Log "WARNING" "AllowTelemetry is 0 (Off) - Windows Update cannot manage Secure Boot certs"
                     }
                     
                     # --- Secure Boot opt-in keys ---
@@ -1624,7 +2154,7 @@ end {
         }
         Write-Host ""
     }
-
+    
     # -----------------------------------------------
     # Step 2.3: Check opt-in status (always, after any action has run)
     # -----------------------------------------------
@@ -1632,23 +2162,49 @@ end {
     if ($secureBoot -eq 'Enabled') {
         Write-Host "`n === Opt-In Status Check ==="
         $optInStatus = Check-OptInStatus
-
+        
         $telemetryLabel = if ($null -eq $optInStatus.AllowTelemetry) { 'Not set (OS default)' }
                           else { switch ($optInStatus.AllowTelemetry) { 0 { '0 (Off)' } 1 { '1 (Required)' } 2 { '2 (Enhanced)' } 3 { '3 (Full)' } default { $optInStatus.AllowTelemetry } } }
         Write-Log "INFO" "AllowTelemetry: $telemetryLabel"
-
+        
         if ($optInStatus.IsOptedIn) {
             Write-Log "INFO" "MicrosoftUpdateManagedOptIn: 0x5944 (opted in)"
-        } else {
+        }
+        else {
             Write-Log "INFO" "MicrosoftUpdateManagedOptIn: $(if ($null -eq $optInStatus.OptInValue) { 'Not set' } else { $optInStatus.OptInValue }) (not opted in)"
         }
-
+        
         if ($optInStatus.AvailableUpdatesSet) {
-            Write-Log "INFO" "AvailableUpdates: 0x5944 (trigger set)"
-        } else {
+            $avHex = '0x{0:X}' -f $optInStatus.AvailableUpdates
+            Write-Log "INFO" "AvailableUpdates: $avHex (trigger set)"
+        }
+        else {
             Write-Log "INFO" "AvailableUpdates: $(if ($null -eq $optInStatus.AvailableUpdates) { 'Not set' } else { $optInStatus.AvailableUpdates })"
         }
-
+        
+        # AvailableUpdatesPolicy (GPO/MDM-driven, persists across reboots)
+        if ($optInStatus.AvailableUpdatesPolicySet) {
+            $apHex = '0x{0:X}' -f $optInStatus.AvailableUpdatesPolicy
+            Write-Log "INFO" "AvailableUpdatesPolicy: $apHex (GPO/MDM policy set)"
+        }
+        elseif ($null -ne $optInStatus.AvailableUpdatesPolicy) {
+            Write-Log "INFO" "AvailableUpdatesPolicy: $($optInStatus.AvailableUpdatesPolicy)"
+        }
+        
+        # HighConfidenceOptOut
+        if ($null -ne $optInStatus.HighConfidenceOptOut) {
+            if ($optInStatus.HighConfidenceOptOut -ne 0) {
+                Write-Log "WARNING" "HighConfidenceOptOut: $($optInStatus.HighConfidenceOptOut) - device is opted OUT of auto-deployment"
+            } else {
+                Write-Log "INFO" "HighConfidenceOptOut: 0 (not opted out)"
+            }
+        }
+        
+        # Decoded bitmask meaning
+        if ($optInStatus.AvailableUpdatesMeaning.Count -gt 0 -and $optInStatus.EffectiveAvailable -ne 0) {
+            Write-Log "INFO" "Requested updates: $($optInStatus.AvailableUpdatesMeaning -join '; ')"
+        }
+        
         switch ($optInStatus.Summary) {
             'Enabled'     { Write-Log "SUCCESS" "Windows Update Secure Boot management: Enabled" }
             'Blocked'     { Write-Log "WARNING" "Windows Update Secure Boot management: Opted in but telemetry too low (AllowTelemetry=0)" }
@@ -1656,49 +2212,87 @@ end {
         }
         Write-Host ""
     }
-
+    
     # -----------------------------------------------
     # Step 2.5: Automate registry trigger if needed
     # -----------------------------------------------
     $triggeredOsUpdate = $false
     $postTriggerState  = $null
-    # Trigger if 2023 cert is in db but OS hasn't confirmed via 1808 (stale 1801 or no events at all)
-    if ($secureBoot -eq 'Enabled' -and $has2023InDb -and $certStatus.EventId -ne 1808) {
-        if ($certStatus.EventId -eq 1799) {
-            $ageMinutes = ((Get-Date) - $certStatus.EventTime).TotalMinutes
-            Write-Log "INFO" "1799 event age: $ageMinutes minutes"
-            if ($ageMinutes -gt 20) {
-                $postTriggerState = 'PendingRestart'
-            }
-            else {
-                $postTriggerState = 'Pending1808'
-            }
+    # Trigger conditions (when servicing hasn't already confirmed Updated):
+    #   A) 2023 cert is in db but OS hasn't confirmed via 1808 (stale 1801 or no events)
+    #   B) Cert in dbDefault, KEK missing, no Event 1803 blocker — opt-in can push KEK + certs
+    # Skip trigger if 1800 (reboot required) or 1799 (boot manager installed) - these are in-progress states
+    # that re-triggering cannot advance; they need time, sometimes up to 9+ days
+    $servicingAlreadyUpdated = ($null -ne $servicingStatus -and $servicingStatus.UEFICA2023Status -eq 'Updated')
+    $has1803InLog = ($null -ne $certStatus -and $null -ne $certStatus.AllEvents -and @($certStatus.AllEvents | Where-Object { $_.Id -eq 1803 }).Count -gt 0)
+    $canTrigger = $secureBoot -eq 'Enabled' -and -not $servicingAlreadyUpdated -and $certStatus.EventId -notin @(1808, 1800, 1799)
+    $triggerReasonA = $canTrigger -and $has2023InDb
+    $triggerReasonB = $canTrigger -and -not $has2023InDb -and ($has2023InDbDefault -or -not $has2023InKek) -and -not $has1803InLog
+    if ($triggerReasonA -or $triggerReasonB) {
+        if ($triggerReasonA -and $certStatus.Status -eq 'ActionRequired') {
+            Write-Log "INFO" "2023 cert in db but stale 1801; attempting to trigger OS update"
+        }
+        elseif ($triggerReasonA) {
+            Write-Log "INFO" "2023 cert in db but no events logged; attempting to trigger OS update"
         }
         else {
-            if ($certStatus.Status -eq 'ActionRequired') {
-                Write-Log "INFO" "2023 cert in db but stale 1801; attempting to trigger OS update"
-            }
-            else {
-                Write-Log "INFO" "2023 cert in db but no events logged; attempting to trigger OS update"
-            }
-            $setReg     = Set-SecureBootUpdateRegKey
-            $appliedWcs = Apply-WinCsFeatureKey
-            $triggeredOsUpdate = $setReg -or $appliedWcs
-            if ($triggeredOsUpdate) {
-                $taskTriggered = Trigger-SecureBootTask
-                if ($taskTriggered) {
-                    Write-Log "INFO" "Waiting 60 seconds to check for post-trigger events"
-                    Start-Sleep -Seconds 60
-                    $postTriggerState = Check-PostTriggerEvents -Minutes 2  # Check last 2 min for safety
-                    Write-Log "INFO" "Post-trigger state: $postTriggerState"
+            Write-Log "INFO" "KEK/certs missing (no 1803 blocker); setting opt-in to let Windows Update push KEK + certs"
+        }
+        $setReg     = Set-SecureBootUpdateRegKey
+        $appliedWcs = Apply-WinCsFeatureKey
+        $triggeredOsUpdate = $setReg -or $appliedWcs
+        if ($triggeredOsUpdate) {
+            $taskTriggered = Trigger-SecureBootTask
+            if ($taskTriggered) {
+                Write-Log "INFO" "Waiting 60 seconds to check for post-trigger events"
+                Start-Sleep -Seconds 60
+                $postTriggerState = Check-PostTriggerEvents -Minutes 2  # Check last 2 min for safety
+                Write-Log "INFO" "Post-trigger event state: $postTriggerState"
+                
+                # Re-check servicing registry - it's the definitive signal
+                $postTriggerServicing = Get-SecureBootServicingStatus
+                if ($postTriggerServicing.UEFICA2023Status -eq 'Updated') {
+                    Write-Log "INFO" "Servicing registry now reports 'Updated' - overriding to Compliant"
+                    $postTriggerState = 'Compliant'
+                    $servicingStatus  = $postTriggerServicing
                 }
             }
         }
     }
     
     # -----------------------------------------------
+    # Step 2.6: 1799 without 1808 — informational note
+    #           Servicing confirms Updated but 1808 hasn't appeared in the event log.
+    #           The Secure-Boot-Update task runs at startup + every 12 hours and will
+    #           produce 1808 on its next cycle. No action needed — just annotate.
+    # -----------------------------------------------
+    $pending1808Note = $false
+    if ($secureBoot -eq 'Enabled' -and $certStatus.EventId -eq 1799 -and $servicingAlreadyUpdated) {
+        $pending1808Note = $true
+        Write-Log "INFO" "Event 1799 is latest, servicing confirms Updated — 1808 expected on next scheduled task cycle"
+    }
+    
+}
+
+# =========================================
+# END Block: State Mapping, Card Building & Output
+#   Steps 3–6: Final state resolution, HTML/local card,
+#   NinjaRMM custom field writes, console summary
+# =========================================
+end {
+    # -----------------------------------------------
     # Step 3: Map to one of the 7 final states
     # -----------------------------------------------
+    # Pre-compute cert labels for clear messaging
+    $dbCertLabel = if ($dbCertsFound.Count -gt 0) {
+        ($dbCertsFound | ForEach-Object { $_ -replace 'Microsoft ', '' -replace 'Windows ', '' }) -join ', '
+    }
+    else { 'None' }
+    $dbDefaultCertLabel = if ($dbDefaultCertsFound.Count -gt 0) {
+        ($dbDefaultCertsFound | ForEach-Object { $_ -replace 'Microsoft ', '' -replace 'Windows ', '' }) -join ', '
+    }
+    else { 'None' }
+    
     $cardIcon        = "fas fa-shield-alt"  # Same icon for all states; color differentiates them
     $eventRowHtml    = $null                # Omitted unless Secure Boot is Enabled
     
@@ -1726,15 +2320,37 @@ end {
             break
         }
         
-        # State 3: Compliant (Secure Boot enabled + Event 1808 found)
-        ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Compliant') {
+        # State 3: Compliant (Secure Boot enabled + Event 1808 found OR UEFICA2023Status == Updated)
+        ($secureBoot -eq 'Enabled' -and ($certStatus.Status -eq 'Compliant' -or ($null -ne $servicingStatus -and $servicingStatus.UEFICA2023Status -eq 'Updated'))) {
             $statusKey     = 'Compliant'
             $cardIconColor = '#26A644'
-            $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
-            $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.<br />No action required.'
-            $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
-            $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Event 1808 detected at ' + $eventTime
-            $plainText     = '✅ Secure Boot Enabled. Certificates up to date in BIOS (Event 1808). Compliant.'
+            
+            # Check if some certs are still missing (pending reboot to apply)
+            $missingDbCerts = @($updatedDbCertNames | Where-Object { $dbCertsFound -notcontains $_ })
+            $hasPending1800 = ($null -ne $certStatus -and $certStatus.EventId -eq 1800)
+            $certsPendingReboot = ($missingDbCerts.Count -gt 0 -and $hasPending1800)
+            
+            if ($certsPendingReboot) {
+                $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant <span style="color:#F0AD4E;">(reboot pending)</span>'
+                $missingShort  = ($missingDbCerts | ForEach-Object { $_ -replace 'Microsoft ', '' -replace 'Windows ', '' }) -join ', '
+                $detailRowHtml = "2023 Secure Boot update confirmed by servicing registry.<br />Pending reboot to apply remaining certs:<br />    $missingShort"
+                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Servicing: Updated <span style="color:#F0AD4E;">| Latest event: 1800 (reboot required)</span>'
+                $plainText     = "✅ Secure Boot Enabled. Compliant (UEFICA2023Status=Updated). Reboot pending for $($missingDbCerts.Count) cert(s)."
+            }
+            elseif ($certStatus.Status -eq 'Compliant') {
+                $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
+                $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.<br />No action required.'
+                $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Event 1808 detected at ' + $eventTime
+                $plainText     = '✅ Secure Boot Enabled. Certificates up to date in BIOS (Event 1808). Compliant.'
+            }
+            else {
+                $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
+                $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.<br />No action required.'
+                # Compliant via servicing registry (UEFICA2023Status=Updated) without Event 1808 in log
+                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Servicing status: Updated'
+                $plainText     = '✅ Secure Boot Enabled. Certificates up to date (UEFICA2023Status=Updated). Compliant.'
+            }
             $statusEmoji = '✅'
             break
         }
@@ -1765,25 +2381,50 @@ end {
                 $plainText     = '❌ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801; triggered reg update. Pending Windows Update rotation'
             }
             elseif ($has2023InDbDefault) {
+                # Check for Event 1803 (PK-signed KEK not available) — the definitive OEM blocker
+                $has1803 = ($null -ne $certStatus.AllEvents -and @($certStatus.AllEvents | Where-Object { $_.Id -eq 1803 }).Count -gt 0)
+                
                 if ($dbIsOsWritable) {
+                    # KEK present + UEFI writable — Windows Update will handle it
                     $statusKey     = 'ActionOptional'
                     $cardIconColor = '#F0AD4E'
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
-                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately.' + $bitlockerNote + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault; Windows will push to db directly, or reset keys to apply now.'
+                    $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately." + $bitlockerNote + $guideHtml
+                    $plainText     = "⚠️ Secure Boot Enabled. dbDefault has $dbDefaultCertLabel; Windows will push to db, or reset keys to apply now."
                     $statusEmoji = '⚠️'
                 }
+                elseif ($has1803) {
+                    # Event 1803 confirms OEM has NOT provided a PK-signed KEK
+                    # This is a genuine blocker — key reset or OEM firmware update required
+                    $detailRowHtml = "KEK 2K CA 2023 not available — OEM has not provided a<br />PK-signed KEK update (Event 1803).<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Wait for OEM firmware update that includes KEK 2023<br />• Reset Secure Boot keys in BIOS to apply from defaults" + $bitlockerNote + $guideHtml
+                    $plainText     = '❌ Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required.'
+                }
                 else {
-                    $detailRowHtml = 'Windows has applied 2023 Secure Boot certificates<br />but the BIOS active database has NOT been updated.<br />BIOS supports via default db; reset Secure Boot keys<br />in BIOS to apply before the June 2026 deadline.<br /> Re-Run script after secure boot keys are cleared!' + $bitlockerNote + $guideHtml
-                    $plainText     = '❌ Secure Boot Enabled. BIOS supports 2023 cert (in dbDefault); reset keys to apply (Event 1801).'+ $guidePlain + ' BIOS Key Reset Required.'
+                    # KEK missing but no 1803 — Windows Update may be able to push the KEK
+                    # via the 0x4004 bit in AvailableUpdates. Opt-in is the first step.
+                    $statusKey     = 'Pending'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
+                    $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />KEK 2K CA 2023 is not yet installed.<br />Windows Update can deliver the PK-signed KEK via opt-in (0x4004 bit)."
+                    if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
+                        $detailRowHtml += '<br /><br /><b>Not opted in yet.</b> Run this script in Update mode<br />to enable opt-in and trigger the KEK + cert deployment.'
+                        $plainText     = "⚠️ Secure Boot Enabled. dbDefault: $dbDefaultCertLabel. KEK 2023 pending. Not opted in — run Update mode."
+                    }
+                    else {
+                        $detailRowHtml += '<br /><br />Opt-in is enabled. Windows Update will push the KEK<br />and then apply certs. This may take time.'
+                        $plainText     = "⚠️ Secure Boot Enabled. dbDefault: $dbDefaultCertLabel. KEK 2023 pending. Opted in — waiting for WU."
+                    }
+                    $statusEmoji = '⚠️'
                 }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
             }
             else {
-                # 2023 cert not in db OR dbDefault — firmware update or OS-driven update needed
+                # 2023 cert not in db OR dbDefault - firmware update or OS-driven update needed
+                $has1803 = ($null -ne $certStatus.AllEvents -and @($certStatus.AllEvents | Where-Object { $_.Id -eq 1803 }).Count -gt 0)
                 $oemBiosGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosGuide) {
                     $biosGuideHtml = '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
@@ -1792,6 +2433,7 @@ end {
                     $biosGuideHtml = ''
                 }
                 if ($dbIsOsWritable) {
+                    # KEK present + UEFI writable — Windows Update will handle everything
                     $statusKey     = 'ActionOptional'
                     $cardIconColor = '#F0AD4E'
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
@@ -1800,10 +2442,27 @@ end {
                     $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if available.'
                     $statusEmoji = '⚠️'
                 }
-                else {
-                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $biosGuideHtml
-                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required.'
+                elseif ($has1803) {
+                    # Event 1803 confirms OEM blocker — KEK not available, cert not in defaults
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />OEM has not provided a PK-signed KEK update (Event 1803).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support. Update before June 2026.' + $biosGuideHtml
+                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing, OEM KEK not available (1803). BIOS update required.'
                     $statusEmoji = '❌'
+                }
+                else {
+                    # No cert in db/dbDefault but no 1803 either — opt-in may resolve via Windows Update
+                    $statusKey     = 'Pending'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
+                    if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
+                        $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />KEK 2023 is also missing, but no Event 1803 (OEM blocker).<br /><br /><b>Not opted in yet.</b> Run this script in Update mode<br />to enable opt-in. Windows Update may deliver KEK + certs.' + $biosGuideHtml
+                        $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing, KEK missing. Not opted in — run Update mode to enable.'
+                    }
+                    else {
+                        $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />KEK 2023 is also missing, but no Event 1803 (OEM blocker).<br />Opt-in is enabled — Windows Update may deliver KEK + certs.<br />If no progress, a BIOS update may be needed.' + $biosGuideHtml
+                        $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing, KEK missing. Opted in — waiting for WU. BIOS update may be needed.'
+                    }
+                    $statusEmoji = '⚠️'
                 }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
@@ -1812,13 +2471,31 @@ end {
             break
         }
         
-        # State 5: Pending (Secure Boot enabled, no certificate update events found)
+        # State 5a: Pending Reboot (Event 1800 - reboot required to continue)
+        ($secureBoot -eq 'Enabled' -and $certStatus.EventId -eq 1800 -and -not $postTriggerState) {
+            $statusKey     = 'Pending'
+            $cardIconColor = '#F0AD4E'
+            $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Reboot'
+            $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+            $eventRowHtml  = '<i class="fas fa-redo" style="color:#F0AD4E;"></i> Event 1800 detected at ' + $eventTime
+            $detailRowHtml = 'Secure Boot certificate update is in progress.<br />A system reboot is required to continue the update.<br />Reboot the machine to allow the update to proceed.'
+            $plainText     = '⚠️ Secure Boot Enabled. Reboot required to continue certificate update (Event 1800).'
+            $statusEmoji   = '⚠️'
+            $rebootStatus  = Get-PendingRebootStatus
+            if ($rebootStatus.Pending) {
+                $sourceList = $rebootStatus.Sources -join ', '
+                $detailRowHtml += '<br /><br />Reboot pending from: ' + $sourceList
+            }
+            break
+        }
+        
+        # State 5b: Pending (Secure Boot enabled, no state events or only non-state events)
         # Sub-branches based on whether 2023 cert exists in db or dbDefault
         ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Pending' -and -not $postTriggerState) {
             $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> No certificate update events (1808/1801) found'
             
             if ($has2023InDb) {
-                # 2023 cert already in active db but no events logged — possibly pre-installed by firmware or manually added
+                # 2023 cert already in active db but no events logged - possibly pre-installed by firmware or manually added
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
@@ -1826,7 +2503,7 @@ end {
                 $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize. Pending probable reboot.'
             }
             elseif ($has2023InDbDefault) {
-                # 2023 cert in firmware defaults but not deployed — Windows Update or key reset can resolve
+                # 2023 cert in firmware defaults but not deployed - Windows Update or key reset can resolve
                 $oemKeyGuide = Get-OemKeyResetGuide
                 $bitlockerNote = '<br /><br />Suspend BitLocker or have recovery keys handy for <br />each enabled volume before resetting keys.'
                 $bitlockerNotePlain = " Suspend BitLocker or have recovery keys for each enabled volume before resetting keys."
@@ -1838,24 +2515,47 @@ end {
                     $guideHtml = ''
                     $guidePlain = ''
                 }
-                $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Action Optional'
+                # Check for Event 1803 (PK-signed KEK not available)
+                $has1803 = ($null -ne $certStatus.AllEvents -and @($certStatus.AllEvents | Where-Object { $_.Id -eq 1803 }).Count -gt 0)
+                
                 if ($dbIsOsWritable) {
-                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately.' + $bitlockerNote + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault; Windows will push to db directly, or reset keys to apply now.'
-                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events — Windows capable of updating BIOS db'
+                    $statusKey     = 'ActionOptional'
+                    $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
+                    $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately." + $bitlockerNote + $guideHtml
+                    $plainText     = "⚠️ Secure Boot Enabled. dbDefault: $dbDefaultCertLabel; Windows will push to db, or reset keys to apply now."
+                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - Windows capable of updating BIOS db'
+                }
+                elseif ($has1803) {
+                    $statusKey     = 'ActionRequired'
+                    $cardIconColor = '#D9534F'
+                    $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
+                    $detailRowHtml = "KEK 2K CA 2023 not available — OEM has not provided a<br />PK-signed KEK update (Event 1803).<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Wait for OEM firmware update that includes KEK 2023<br />• Reset Secure Boot keys in BIOS to apply from defaults" + $bitlockerNote + $guideHtml
+                    $plainText     = '❌ Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required.'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> Event 1803 - OEM KEK blocker'
+                    $statusEmoji = '❌'
                 }
                 else {
-                    $detailRowHtml = '2023 Secure Boot certificate is in firmware defaults (dbDefault)<br />but not yet in the active database (db).<br /> Reset Secure Boot keys in BIOS to apply from defaults.<br /> Re-Run after for an updated status.' + $bitlockerNote + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in dbDefault but not db; Reset keys in BIOS (see card details) before Windows can complete the rotation. Pending BIOS key reset.'
+                    # KEK missing but no 1803 — opt-in can push KEK
+                    $statusKey     = 'Pending'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />KEK 2K CA 2023 is not yet installed.<br />Windows Update can deliver the PK-signed KEK via opt-in."
+                    if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
+                        $detailRowHtml += '<br /><br /><b>Not opted in yet.</b> Run this script in Update mode<br />to enable opt-in and trigger the KEK + cert deployment.'
+                        $plainText     = "⚠️ Secure Boot Enabled. dbDefault: $dbDefaultCertLabel. KEK pending. Not opted in — run Update mode."
+                    }
+                    else {
+                        $detailRowHtml += '<br /><br />Opt-in is enabled. Windows Update will push the KEK<br />and then apply certs. This may take time.'
+                        $plainText     = "⚠️ Secure Boot Enabled. dbDefault: $dbDefaultCertLabel. KEK pending. Opted in — waiting for WU."
+                    }
+                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - KEK pending via Windows Update'
                 }
                 if ($plainText.Length -gt 200) {
                     $plainText = $plainText.Substring(0, 197) + '...'
                 }
             }
             else {
-                # 2023 cert not in db OR dbDefault — firmware update or OS-driven update needed
+                # 2023 cert not in db OR dbDefault - firmware update or OS-driven update needed
                 $oemBiosUpdateGuide = Get-OemBIOSUpdateGuide
                 if ($oemBiosUpdateGuide) {
                     $guideHtml = '<br /><a href="' + $oemBiosUpdateGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>'
@@ -1864,12 +2564,12 @@ end {
                     $guideHtml = ''
                 }
                 if ($dbIsOsWritable) {
-                    $statusKey     = 'Pending'
+                    $statusKey     = 'ActionOptional'
                     $cardIconColor = '#F0AD4E'
-                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Action Optional'
+                    $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update may push the cert automatically,<br />or a manual BIOS update can be applied.' + $guideHtml
                     $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows can update BIOS db directly, or push BIOS update.'
-                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events — Windows capable of updating BIOS db'
+                    $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - Windows capable of updating BIOS db'
                     $statusEmoji = '⚠️'
                 }
                 else {
@@ -1878,7 +2578,7 @@ end {
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $guideHtml
                     $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required.'
-                    $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events — BIOS lacks 2023 certificate support'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events - BIOS lacks 2023 certificate support'
                     $statusEmoji = '❌'
                 }
                 if ($plainText.Length -gt 200) {
@@ -1899,72 +2599,54 @@ end {
         }
     }
     
-    # Override for triggered OS update based on post-trigger event state
+    # Override for triggered OS update based on post-trigger state
+    # Servicing registry is re-checked after trigger - if it says Updated, that's definitive.
     if ($postTriggerState) {
         switch ($postTriggerState) {
             'Compliant' {
-                # 1808 already appeared — fully done
+                # Servicing confirmed Updated, or 1808 appeared
                 $statusKey     = 'Compliant'
                 $cardIconColor = '#26A644'
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
-                $detailRowHtml = 'Triggered OS-side update.<br />Event 1808 detected — 2023 certificates successfully<br />applied to BIOS firmware. No action required.'
-                $plainText     = '✅ Secure Boot Enabled. Triggered OS update; 1808 detected. Certificates up to date. Compliant.'
-                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> 1808 detected after trigger — Compliant'
+                $detailRowHtml = 'Triggered OS-side update.<br />2023 certificates successfully applied to BIOS firmware.<br />No action required.'
+                $plainText     = '✅ Secure Boot Enabled. Triggered OS update; confirmed compliant. Certificates up to date.'
+                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Confirmed compliant after trigger'
                 $statusEmoji = '✅'
             }
             'Pending1808' {
-                # 1799 found, awaiting 1808
+                # 1799 found - update is in progress
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
-                $detailRowHtml = 'Event 1799 detected (boot manager installed).<br />Pending UEFI final validation (1808) ~15 min.'
-                $plainText     = '⚠️ Secure Boot Enabled. 1799 detected, awaiting 1808 (~15 min). Pending final event confirmation.'
-                $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> 1799 detected; awaiting 1808 (~15 min)'
+                $detailRowHtml = 'Triggered OS-side update.<br />Boot manager installed (Event 1799).<br />Update in progress - servicing will confirm when complete.'
+                $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; boot manager installed. Update in progress.'
+                $eventRowHtml  = '<i class="fas fa-cog" style="color:#F0AD4E;"></i> Boot manager installed; update in progress'
                 $statusEmoji = '⚠️'
-            }
-            'PendingRestart' {
-                # 1799 old, likely stuck pending restart
-                $statusKey     = 'Pending'
-                $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
-                $detailRowHtml = 'Event 1799 detected (boot manager installed).<br />But over 20 minutes ago without 1808.<br />Likely pending a system restart to complete.'
-                $plainText     = '⚠️ Secure Boot Enabled. 1799 old (>20 min), no 1808. Likely pending restart.'
-                $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> 1799 old; likely pending restart'
-                $statusEmoji = '⚠️'
-                $rebootStatus = Get-PendingRebootStatus
-                if ($rebootStatus.Pending) {
-                    $sourceList = $rebootStatus.Sources -join ', '
-                    Write-Log "INFO" "Reboot pending from: $sourceList"
-                    $detailRowHtml += '<br />Reboot pending from: ' + $sourceList
-                    $plainText     += ' Reboot pending (' + $sourceList + ').'
-                    if ($plainText.Length -gt 200) {
-                        $plainText = $plainText.Substring(0, 197) + '...'
-                    }
-                }
             }
             default {
-                # Neither 1808 nor 1799 yet — check if a reboot is pending
+                # No events yet - update may need a reboot to proceed
                 $rebootStatus = Get-PendingRebootStatus
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Restart'
+                $statusEmoji = '⚠️'
                 if ($rebootStatus.Pending) {
                     $sourceList = $rebootStatus.Sources -join ', '
                     Write-Log "INFO" "Reboot pending from: $sourceList"
-                    $detailRowHtml = 'Triggered OS-side update.<br />No 1799 yet (boot manager install).<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; no 1799 yet. Reboot pending (' + $sourceList + ').'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Reboot'
+                    $detailRowHtml = 'Triggered OS-side update.<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
+                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; reboot pending (' + $sourceList + ').'
                     if ($plainText.Length -gt 200) {
                         $plainText = $plainText.Substring(0, 197) + '...'
                     }
-                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Awaiting 1799 - reboot pending (' + $sourceList + ')'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Triggered - reboot pending (' + $sourceList + ')'
                 }
                 else {
-                    Write-Log "INFO" "No pending reboot detected"
-                    $detailRowHtml = 'Triggered OS-side update.<br />No 1799 yet (boot manager install).<br />Pending signed boot manager confirmation (1799) ~5 min.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; awaiting 1799 (~5 min). Pending event validation.'
-                    $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> Awaiting 1799 (~5 min)'
+                    Write-Log "INFO" "No pending reboot detected; update may still be processing"
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $detailRowHtml = 'Triggered OS-side update.<br />Update is processing - servicing will confirm when complete.'
+                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; processing.'
+                    $eventRowHtml  = '<i class="fas fa-cog" style="color:#F0AD4E;"></i> Triggered - processing'
                 }
-                $statusEmoji = '⚠️'
             }
         }
     }
@@ -1981,14 +2663,170 @@ end {
     if ($null -ne $eventRowHtml) {
         $cardProperties['Last Event'] = $eventRowHtml
     }
-    # KEK authority status (only when Secure Boot is Enabled)
+    # Event log summary (deployment timeline)
+    if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $certStatus.EventSummary.Count -gt 0) {
+        $summaryLines = @()
+        foreach ($entry in ($certStatus.EventSummary | Sort-Object FirstSeen)) {
+            $timeStr = $entry.LastSeen.ToString('yyyy-MM-dd HH:mm')
+            # Color-code by event type
+            $color = switch ($entry.Id) {
+                1808  { '#26A644' }  # green - compliant
+                1801  { '#D9534F' }  # red - action required
+                1800  { '#F0AD4E' }  # amber - reboot needed
+                1032  { '#D9534F' }  # red - blocker
+                1033  { '#D9534F' }  # red - blocker
+                1795  { '#D9534F' }  # red - firmware error
+                1796  { '#D9534F' }  # red - unexpected error
+                1797  { '#D9534F' }  # red - prerequisite failure
+                1798  { '#D9534F' }  # red - boot mgr not signed
+                1802  { '#D9534F' }  # red - blocked by known issue
+                1803  { '#D9534F' }  # red - OEM KEK issue
+                default { '#5BC0DE' } # blue - deployment progress
+            }
+            $summaryLines += "<span style='color:$color;'>$timeStr &nbsp; [$($entry.Id)] $($entry.Description) ($($entry.Count)x)</span>"
+        }
+        # Inject reboot correlation annotation if 1800 → reboot → 1799 was detected
+        if ($null -ne $certStatus.RebootCorrelation) {
+            $rc = $certStatus.RebootCorrelation
+            if ($rc.Confirmed) {
+                $bootTimeStr = $rc.BootTimes[-1].ToString('yyyy-MM-dd HH:mm')
+                $summaryLines += "<span style='color:#5BC0DE;'>&nbsp;&nbsp;&nbsp;<i class='fas fa-sync-alt' style='color:#5BC0DE;'></i> Reboot at $bootTimeStr bridged 1800 &rarr; 1799</span>"
+            }
+            else {
+                $summaryLines += "<span style='color:#F0AD4E;'>&nbsp;&nbsp;&nbsp;<i class='fas fa-question-circle' style='color:#F0AD4E;'></i> 1800 &rarr; 1799 detected but no reboot found between them</span>"
+            }
+        }
+        # Inject 1799 pending-1808 note
+        if ($pending1808Note) {
+            $summaryLines += "<span style='color:#5BC0DE;'>&nbsp;&nbsp;&nbsp;<i class='fas fa-info-circle' style='color:#5BC0DE;'></i> 1808 expected on next scheduled task cycle</span>"
+        }
+        $cardProperties['Event Log'] = $summaryLines -join '<br />'
+    }
+    # Certificate inventory (all four 2023 certs - only when Secure Boot is Enabled)
     if ($secureBoot -eq 'Enabled') {
-        if ($has2023InKek) {
-            $cardProperties['KEK Authority'] = '<i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 KEK authority cert present'
+        $certLines = @()
+        # db certs
+        foreach ($certName in $updatedDbCertNames) {
+            $present = $dbCertsFound -contains $certName
+            $icon    = if ($present) { '<i class="fas fa-check-circle" style="color:#26A644;"></i>' } else { '<i class="fas fa-times-circle" style="color:#D9534F;"></i>' }
+            $label   = ($certName -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', '')
+            $certLines += "$icon $label"
+        }
+        # KEK cert
+        $kekIcon = if ($has2023InKek) { '<i class="fas fa-check-circle" style="color:#26A644;"></i>' } else { '<i class="fas fa-times-circle" style="color:#D9534F;"></i>' }
+        $certLines += "$kekIcon KEK 2K CA 2023"
+        # 2011 CA revocation status (Stage 3)
+        if ($ca2011RevokedInDbx.Count -gt 0) {
+            foreach ($revokedCA in $ca2011RevokedInDbx) {
+                $rLabel = $revokedCA -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', ''
+                $certLines += "<i class='fas fa-ban' style='color:#5BC0DE;'></i> $rLabel <span style='color:#888;'>(revoked in dbx)</span>"
+            }
+        }
+        $cardProperties['Certificates'] = $certLines -join '<br />'
+    }
+    # Servicing status (only when Secure Boot is Enabled and servicing data exists)
+    if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
+        $servParts = @()
+        # UEFICA2023Status
+        if ($null -ne $servicingStatus.UEFICA2023Status) {
+            $servIcon = if ($servicingStatus.UEFICA2023Status -eq 'Updated') { '<i class="fas fa-check-circle" style="color:#26A644;"></i>' } else { '<i class="fas fa-info-circle" style="color:#F0AD4E;"></i>' }
+            $servParts += "$servIcon Service Status: $($servicingStatus.UEFICA2023Status)"
+        }
+        if ($null -ne $servicingStatus.WindowsUEFICA2023Capable) {
+            $capVal = $servicingStatus.WindowsUEFICA2023Capable
+            $capDesc = switch ($capVal) {
+                1 { 'Cert in DB' }
+                2 { 'Cert in DB + 2023 boot manager' }
+                default { 'Not in DB' }
+            }
+            $capIcon = if ($capVal -ge 2) { '<i class="fas fa-check-circle" style="color:#26A644;"></i>' } elseif ($capVal -eq 1) { '<i class="fas fa-info-circle" style="color:#5BC0DE;"></i>' } else { '<i class="fas fa-times-circle" style="color:#D9534F;"></i>' }
+            $servParts += "$capIcon Boot Manager: $capDesc"
+        }
+        # Error info
+        if ($null -ne $servicingStatus.UEFICA2023Error -and $servicingStatus.UEFICA2023Error -ne 0) {
+            # If the Full line is longer than 
+            $servParts += "<i class='fas fa-exclamation-triangle' style='color:#D9534F;'></i> Error: $($servicingStatus.UEFICA2023ErrorHex) - $($servicingStatus.UEFICA2023ErrorMessage)"
+        }
+        if ($null -ne $servicingStatus.UEFICA2023ErrorEvent) {
+            $servParts += "<i class='fas fa-info-circle' style='color:#D9534F;'></i> Error Event: [$($servicingStatus.UEFICA2023ErrorEvent)] $($servicingStatus.UEFICA2023ErrorEventDesc)"
+        }
+        # CanAttemptUpdateAfter
+        if ($null -ne $servicingStatus.CanAttemptUpdateAfter) {
+            $updateAfterStr = $servicingStatus.CanAttemptUpdateAfter.ToString('yyyy-MM-dd HH:mm')
+            if ($servicingStatus.CanAttemptUpdateAfter -gt (Get-Date)) {
+                $servParts += "<i class='fas fa-clock' style='color:#F0AD4E;'></i> Next attempt after: $updateAfterStr"
+            }
+        }
+        if ($servParts.Count -gt 0) {
+            $cardProperties['Servicing'] = $servParts -join '<br />'
+        }
+    }
+    # AvailableUpdates bitmask decoded (only when set and non-zero)
+    # Cross-reference manifest bits against actual cert inventory to determine what's truly applied
+    if ($secureBoot -eq 'Enabled' -and $null -ne $optInStatus -and $optInStatus.EffectiveAvailable -ne 0) {
+        $avHex  = '0x{0:X}' -f $optInStatus.EffectiveAvailable
+        $source = if ($optInStatus.AvailableUpdatesPolicySet) { 'Policy' } else { 'Registry' }
+        $avVal  = $optInStatus.EffectiveAvailable
+        
+        # Check each manifest bit against actual cert presence
+        $manifestPending = @()
+        if (($avVal -band 0x0004) -or ($avVal -band 0x4004)) {
+            if (-not $has2023InKek) { $manifestPending += 'KEK 2K CA 2023' }
+        }
+        if ($avVal -band 0x0040) {
+            if ($dbCertsFound -notcontains 'Windows UEFI CA 2023') { $manifestPending += 'Windows UEFI CA 2023' }
+        }
+        if ($avVal -band 0x0800) {
+            if ($dbCertsFound -notcontains 'Microsoft Option ROM UEFI CA 2023') { $manifestPending += 'Option ROM UEFI CA 2023' }
+        }
+        if ($avVal -band 0x1000) {
+            if ($dbCertsFound -notcontains 'Microsoft UEFI CA 2023') { $manifestPending += 'UEFI CA 2023' }
+        }
+        # Boot manager bit (0x0100) — if 1799 has occurred, boot manager is installed
+        if ($avVal -band 0x0100) {
+            $has1799 = ($null -ne $certStatus -and $certStatus.EventId -eq 1799) -or
+                       ($null -ne $certStatus -and $null -ne $certStatus.AllEvents -and ($certStatus.AllEvents | Where-Object { $_.Id -eq 1799 }))
+            if (-not $has1799) { $manifestPending += 'Boot manager (2023-signed)' }
+        }
+        
+        $allApplied = ($manifestPending.Count -eq 0)
+        $pendingReboot = ($null -ne $certStatus -and $certStatus.EventId -eq 1800)
+        
+        if ($allApplied) {
+            $headerNote = " <span style='color:#26A644;'>(all applied)</span>"
+        }
+        elseif ($pendingReboot) {
+            $headerNote = " <span style='color:#F0AD4E;'>(pending reboot for $($manifestPending.Count) cert$(if ($manifestPending.Count -ne 1) {'s'}))</span>"
         }
         else {
-            $cardProperties['KEK Authority'] = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> 2023 KEK authority cert missing. <br />Windows Update cannot authorize db writes'
+            $headerNote = " <span style='color:#F0AD4E;'>($($manifestPending.Count) pending)</span>"
         }
+        $meaningLines = @("<i class='fas fa-info-circle' style='color:#5BC0DE;'></i> $avHex ($source)$headerNote")
+        foreach ($m in $optInStatus.AvailableUpdatesMeaning) {
+            $meaningLines += "&nbsp;&nbsp;&bull; $m"
+        }
+        # If certs are pending, list which ones
+        if ($manifestPending.Count -gt 0) {
+            $meaningLines += "<span style='color:#F0AD4E;'>&nbsp;&nbsp;<i class='fas fa-exclamation-triangle' style='color:#F0AD4E;'></i> Still needed: $($manifestPending -join ', ')</span>"
+            if ($pendingReboot) {
+                $meaningLines += "<span style='color:#F0AD4E;'>&nbsp;&nbsp;<i class='fas fa-sync-alt' style='color:#F0AD4E;'></i> Reboot pending (Event 1800) to apply remaining certs</span>"
+            }
+        }
+        $sectionLabel = if ($allApplied) { 'Update Manifest' } else { 'Pending Updates' }
+        $cardProperties[$sectionLabel] = $meaningLines -join '<br />'
+    }
+    # Bucket / confidence (from event message metadata)
+    if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
+        $confColor = switch -Wildcard ($certStatus.Confidence) {
+            '*High*'   { '#26A644' }
+            '*Action*' { '#D9534F' }
+            default    { '#5BC0DE' }
+        }
+        $bucketHtml = "<span style='color:$confColor;'>$($certStatus.Confidence)</span>"
+        if ($null -ne $certStatus.SkipReason) {
+            $bucketHtml += " &nbsp;<i class='fas fa-exclamation-triangle' style='color:#D9534F;'></i> $($certStatus.SkipReason)"
+        }
+        $cardProperties['Rollout Tier'] = $bucketHtml
     }
     # Scheduled task status (only when Secure Boot is Enabled)
     if ($secureBoot -eq 'Enabled') {
@@ -2001,19 +2839,28 @@ end {
     }
     # Opt-in status (only when Secure Boot is Enabled and check ran)
     if ($secureBoot -eq 'Enabled' -and $null -ne $optInStatus) {
+        $optInParts = @()
         switch ($optInStatus.Summary) {
             'Enabled' {
-                $cardProperties['Opt-In Status'] = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Window Update Secure Boot management enabled'
+                $optInParts += '<i class="fas fa-check-circle" style="color:#26A644;"></i> WU Secure Boot management enabled'
             }
             'Blocked' {
-                $cardProperties['Opt-In Status'] = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Opted in but telemetry too low (AllowTelemetry=0)'
+                $optInParts += '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Opted in but telemetry too low (AllowTelemetry=0)'
             }
             'Not enabled' {
-                $cardProperties['Opt-In Status'] = '<i class="fas fa-info-circle" style="color:#6C757D;"></i> Windows Update Secure Boot management not enabled'
+                $optInParts += '<i class="fas fa-info-circle" style="color:#6C757D;"></i> WU Secure Boot management not enabled'
             }
         }
+        if ($null -ne $optInStatus.HighConfidenceOptOut -and $optInStatus.HighConfidenceOptOut -ne 0) {
+            $optInParts += '<i class="fas fa-ban" style="color:#D9534F;"></i> HighConfidenceOptOut is set'
+        }
+        if ($optInStatus.AvailableUpdatesPolicySet) {
+            $apHex = '0x{0:X}' -f $optInStatus.AvailableUpdatesPolicy
+            $optInParts += "<i class='fas fa-building' style='color:#5BC0DE;'></i> AvailableUpdatesPolicy: $apHex (GPO/MDM)"
+        }
+        $cardProperties['Opt-In Status'] = $optInParts -join '<br />'
     }
-
+    
     $cardInfo = [PSCustomObject]$cardProperties
     
     $cardHtml = Get-NinjaOneInfoCard `
@@ -2040,26 +2887,136 @@ end {
         if ($null -ne $eventRowHtml) {
             $localCardProperties['Last Event'] = ($eventRowHtml -replace $faPattern, '').Trim()
         }
-        if ($secureBoot -eq 'Enabled') {
-            if ($has2023InKek) {
-                $localCardProperties['KEK Authority'] = '✅ 2023 KEK authority cert present'
-            } else {
-                $localCardProperties['KEK Authority'] = '❌ 2023 KEK authority cert missing — Windows Update cannot authorize db writes'
+        # Event log summary for local card (plain text)
+        if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $certStatus.EventSummary.Count -gt 0) {
+            $localSummaryLines = @()
+            foreach ($entry in ($certStatus.EventSummary | Sort-Object FirstSeen)) {
+                $timeStr = $entry.LastSeen.ToString('yyyy-MM-dd HH:mm')
+                $localSummaryLines += "$timeStr  [$($entry.Id)] $($entry.Description) ($($entry.Count)x)"
             }
+            # Reboot correlation annotation
+            if ($null -ne $certStatus.RebootCorrelation) {
+                $rc = $certStatus.RebootCorrelation
+                if ($rc.Confirmed) {
+                    $bootTimeStr = $rc.BootTimes[-1].ToString('yyyy-MM-dd HH:mm')
+                    $localSummaryLines += "   ↳ Reboot at $bootTimeStr bridged 1800 → 1799"
+                }
+                else {
+                    $localSummaryLines += "   ↳ 1800 → 1799 detected but no reboot found between them"
+                }
+            }
+            # 1799 pending-1808 note
+            if ($pending1808Note) {
+                $localSummaryLines += "   ↳ 1808 expected on next scheduled task cycle"
+            }
+            $localCardProperties['Event Log'] = $localSummaryLines -join "`n"
+        }
+        # Certificate inventory
+        if ($secureBoot -eq 'Enabled') {
+            $localCertLines = @()
+            foreach ($certName in $updatedDbCertNames) {
+                $present = $dbCertsFound -contains $certName
+                $icon    = if ($present) { '✅' } else { '❌' }
+                $label   = ($certName -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', '')
+                $localCertLines += "$icon $label"
+            }
+            $kekIcon = if ($has2023InKek) { '✅' } else { '❌' }
+            $localCertLines += "$kekIcon KEK 2K CA 2023"
+            if ($ca2011RevokedInDbx.Count -gt 0) {
+                foreach ($revokedCA in $ca2011RevokedInDbx) {
+                    $rLabel = $revokedCA -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', ''
+                    $localCertLines += "🚫 $rLabel (revoked in dbx)"
+                }
+            }
+            $localCardProperties['Certificates'] = $localCertLines -join "`n"
+        }
+        # Servicing status
+        if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
+            $localServParts = @()
+            if ($null -ne $servicingStatus.UEFICA2023Status) {
+                $servIcon = if ($servicingStatus.UEFICA2023Status -eq 'Updated') { '✅' } else { 'ℹ️' }
+                $localServParts += "$servIcon UEFICA2023: $($servicingStatus.UEFICA2023Status)"
+            }
+            if ($null -ne $servicingStatus.WindowsUEFICA2023Capable) {
+                $capVal = $servicingStatus.WindowsUEFICA2023Capable
+                $capDesc = switch ($capVal) { 1 { 'Cert in DB' }; 2 { 'Cert in DB + 2023 boot manager' }; default { 'Not in DB' } }
+                $capIcon = if ($capVal -ge 2) { '✅' } elseif ($capVal -eq 1) { 'ℹ️' } else { '❌' }
+                $localServParts += "$capIcon Boot Manager: $capDesc"
+            }
+            if ($null -ne $servicingStatus.UEFICA2023Error -and $servicingStatus.UEFICA2023Error -ne 0) {
+                $localServParts += "⚠️ Error: $($servicingStatus.UEFICA2023ErrorHex) - $($servicingStatus.UEFICA2023ErrorMessage)"
+            }
+            if ($null -ne $servicingStatus.UEFICA2023ErrorEvent) {
+                $localServParts += "ℹ️ Error Event: [$($servicingStatus.UEFICA2023ErrorEvent)] $($servicingStatus.UEFICA2023ErrorEventDesc)"
+            }
+            if ($null -ne $servicingStatus.CanAttemptUpdateAfter -and $servicingStatus.CanAttemptUpdateAfter -gt (Get-Date)) {
+                $localServParts += "⏳ Next attempt after: $($servicingStatus.CanAttemptUpdateAfter.ToString('yyyy-MM-dd HH:mm'))"
+            }
+            if ($localServParts.Count -gt 0) {
+                $localCardProperties['Servicing'] = $localServParts -join "`n"
+            }
+        }
+        # AvailableUpdates decoded (cross-referenced against actual certs)
+        if ($secureBoot -eq 'Enabled' -and $null -ne $optInStatus -and $optInStatus.EffectiveAvailable -ne 0) {
+            $avHex  = '0x{0:X}' -f $optInStatus.EffectiveAvailable
+            $source = if ($optInStatus.AvailableUpdatesPolicySet) { 'Policy' } else { 'Registry' }
+            
+            if ($allApplied) {
+                $localHeaderNote = ' (all applied)'
+            }
+            elseif ($pendingReboot) {
+                $localHeaderNote = " (pending reboot for $($manifestPending.Count) cert$(if ($manifestPending.Count -ne 1) {'s'}))"
+            }
+            else {
+                $localHeaderNote = " ($($manifestPending.Count) pending)"
+            }
+            $localMeaningLines = @("$avHex ($source)$localHeaderNote")
+            foreach ($m in $optInStatus.AvailableUpdatesMeaning) {
+                $localMeaningLines += "  • $m"
+            }
+            if ($manifestPending.Count -gt 0) {
+                $localMeaningLines += "⚠️ Still needed: $($manifestPending -join ', ')"
+                if ($pendingReboot) {
+                    $localMeaningLines += "🔄 Reboot pending (Event 1800) to apply remaining certs"
+                }
+            }
+            $localSectionLabel = if ($allApplied) { 'Update Manifest' } else { 'Pending Updates' }
+            $localCardProperties[$localSectionLabel] = $localMeaningLines -join "`n"
+        }
+        # Bucket / confidence
+        if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
+            $bucketText = $certStatus.Confidence
+            if ($null -ne $certStatus.SkipReason) {
+                $bucketText += " ⚠️ $($certStatus.SkipReason)"
+            }
+            $localCardProperties['Rollout Tier'] = $bucketText
+        }
+        # Scheduled task
+        if ($secureBoot -eq 'Enabled') {
             if ($scheduledTaskPresent) {
                 $localCardProperties['Update Task'] = '✅ Secure-Boot-Update task present'
             } else {
                 $localCardProperties['Update Task'] = '⚠️ Secure-Boot-Update task missing'
             }
-            if ($null -ne $optInStatus) {
-                switch ($optInStatus.Summary) {
-                    'Enabled'     { $localCardProperties['Opt-In Status'] = '✅ Windows Update Secure Boot management enabled' }
-                    'Blocked'     { $localCardProperties['Opt-In Status'] = '⚠️ Opted in but telemetry too low (AllowTelemetry=0)' }
-                    'Not enabled' { $localCardProperties['Opt-In Status'] = 'ℹ️ Windows Update Secure Boot management not enabled' }
-                }
-            }
         }
-
+        # Opt-in status
+        if ($secureBoot -eq 'Enabled' -and $null -ne $optInStatus) {
+            $localOptParts = @()
+            switch ($optInStatus.Summary) {
+                'Enabled'     { $localOptParts += '✅ WU Secure Boot management enabled' }
+                'Blocked'     { $localOptParts += '⚠️ Opted in but telemetry too low (AllowTelemetry=0)' }
+                'Not enabled' { $localOptParts += 'ℹ️ WU Secure Boot management not enabled' }
+            }
+            if ($null -ne $optInStatus.HighConfidenceOptOut -and $optInStatus.HighConfidenceOptOut -ne 0) {
+                $localOptParts += '🚫 HighConfidenceOptOut is set'
+            }
+            if ($optInStatus.AvailableUpdatesPolicySet) {
+                $apHex = '0x{0:X}' -f $optInStatus.AvailableUpdatesPolicy
+                $localOptParts += "🏢 AvailableUpdatesPolicy: $apHex (GPO/MDM)"
+            }
+            $localCardProperties['Opt-In Status'] = $localOptParts -join "`n"
+        }
+        
         $localCardInfo = [PSCustomObject]$localCardProperties
         
         $localCardTitle = "🛡️ Secure Boot Status Card"
@@ -2137,6 +3094,50 @@ end {
         Write-Host "Update Task : $(if ($scheduledTaskPresent) { 'Present' } else { 'Missing' })"
         Write-Host "OS Writable : $dbIsOsWritable"
         Write-Host "Opt-In      : $(if ($null -ne $optInStatus) { $optInStatus.Summary } else { 'N/A' })"
+        if ($null -ne $servicingStatus -and $null -ne $servicingStatus.UEFICA2023Status) {
+            Write-Host "Servicing   : $($servicingStatus.UEFICA2023Status)"
+            if ($null -ne $servicingStatus.WindowsUEFICA2023Capable) {
+                $capDesc = switch ($servicingStatus.WindowsUEFICA2023Capable) { 1 { 'Cert in DB' }; 2 { 'Cert in DB + 2023 boot mgr' }; default { 'Not in DB' } }
+                Write-Host "Boot Mgr    : $capDesc (Capable=$($servicingStatus.WindowsUEFICA2023Capable))"
+            }
+            if ($null -ne $servicingStatus.UEFICA2023Error -and $servicingStatus.UEFICA2023Error -ne 0) {
+                Write-Host "Serv Error  : $($servicingStatus.UEFICA2023ErrorHex) - $($servicingStatus.UEFICA2023ErrorMessage)"
+            }
+            if ($null -ne $servicingStatus.CanAttemptUpdateAfter -and $servicingStatus.CanAttemptUpdateAfter -gt (Get-Date)) {
+                Write-Host "Next Attempt: $($servicingStatus.CanAttemptUpdateAfter.ToString('yyyy-MM-dd HH:mm'))"
+            }
+        }
+        if ($null -ne $certStatus -and $null -ne $certStatus.Confidence) {
+            Write-Host "Confidence  : $($certStatus.Confidence)"
+        }
+        if ($null -ne $certStatus -and $null -ne $certStatus.SkipReason) {
+            Write-Host "Skip Reason : $($certStatus.SkipReason)"
+        }
+        if ($null -ne $certStatus -and $null -ne $certStatus.RebootCorrelation) {
+            $rc = $certStatus.RebootCorrelation
+            if ($rc.Confirmed) {
+                Write-Host "Reboot Link : 1800 → reboot ($($rc.BootTimes[-1].ToString('yyyy-MM-dd HH:mm'))) → 1799 (confirmed)"
+            }
+            else {
+                Write-Host "Reboot Link : 1800 → 1799 (no reboot found between them)"
+            }
+        }
+        if ($pending1808Note) {
+            Write-Host "1808 Status : Expected on next scheduled task cycle (servicing confirms Updated)"
+        }
+        if ($null -ne $optInStatus -and $optInStatus.EffectiveAvailable -ne 0) {
+            $manifestLabel = if ($allApplied) { 'Manifest    :' } else { 'Pending     :' }
+            Write-Host "$manifestLabel $($optInStatus.AvailableUpdatesMeaning -join '; ')"
+            if ($manifestPending.Count -gt 0) {
+                Write-Host "Still Needed: $($manifestPending -join ', ')$(if ($pendingReboot) { ' (reboot pending)' })"
+            }
+        }
+        if ($null -ne $optInStatus -and $null -ne $optInStatus.HighConfidenceOptOut -and $optInStatus.HighConfidenceOptOut -ne 0) {
+            Write-Host "HC Opt-Out  : Yes"
+        }
+        if ($null -ne $optInStatus -and $optInStatus.AvailableUpdatesPolicySet) {
+            Write-Host "Policy      : 0x$($optInStatus.AvailableUpdatesPolicy.ToString('X')) (GPO/MDM)"
+        }
     }
     Write-Host "--------------------------------------`n"
     
