@@ -198,7 +198,7 @@ The certificate audit **always runs** regardless of the selected action. The `se
 |-----------------|--------------|
 | `Enable opt-in for Secure Boot management` | Sets telemetry to minimum required level (`AllowTelemetry=1`, `MaxTelemetryAllowed=1`, per-user `ShowedToastAtLevel=1`), sets `MicrosoftUpdateManagedOptIn=0x5944` and `AvailableUpdates=0x5944`, then triggers the `\Microsoft\Windows\PI\Secure-Boot-Update` scheduled task. If already compliant (1808 present), proceeds anyway but notes it wasn't strictly necessary. |
 | `Remove opt-in for Secure Boot management` | Removes telemetry enforcement keys (`AllowTelemetry`, `MaxTelemetryAllowed`) and `MicrosoftUpdateManagedOptIn`. Does **not** remove `AvailableUpdates` (already-triggered updates should complete). |
-| `Audit Secure Boot management status` | Read-only check of all opt-in and telemetry keys. Reports current state without making any changes. |
+| `Audit SecureBoot management status` | Read-only check of all opt-in and telemetry keys. Reports current state without making any changes. |
 | *(empty / not set)* | No action taken - audit only. |
 
 ---
