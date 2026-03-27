@@ -11,7 +11,7 @@ Rather than just reporting Secure Boot state, it audits the actual certificate d
 
 - :red_circle: **Action Required** - 2023 certs missing and Windows cannot write to the BIOS db; OEM firmware update or manual key reset required
 - :yellow_circle: **Action Optional** - 2023 certs missing (or in `dbDefault` only), but Windows is capable of writing to the BIOS cert db directly; Windows Update will eventually push the cert automatically, or a manual BIOS update / key reset can expedite
-- :yellow_circle: **Pending** - Rotation in progress; includes Event 1799 (boot manager installed), post-trigger monitoring, and cases where certs are in `db`/`dbDefault` but completion hasn't been confirmed yet
+- :yellow_circle: **Pending** - Rotation in progress; post-trigger monitoring, and cases where certs are in `db`/`dbDefault` but completion hasn't been confirmed yet
 - :green_circle: **Compliant** - Event 1808 or `UEFICA2023Status='Updated'` confirmed; BIOS updated
 - :black_circle: **Disabled** - Secure Boot off; cert check not applicable
 - :black_circle: **Not Applicable** - Legacy BIOS / non-UEFI
@@ -87,9 +87,9 @@ The script queries all 19 Secure Boot event IDs from the `Microsoft-Windows-TPM-
 | Event ID | Description | Status |
 |----------|-------------|--------|
 | `1808` | Fully updated - all certs + boot manager applied | :green_circle: Compliant |
+| `1799` | Boot manager signed with UEFI CA 2023 installed successfully | :green_circle: Compliant - Pending final 1808 event |
 | `1801` | Certs available but not applied | :red_circle: Action Required |
 | `1800` | Reboot required to continue | :yellow_circle: Pending Reboot |
-| `1799` | Boot manager signed with UEFI CA 2023 installed successfully | :yellow_circle: Pending |
 
 > **1799 → 1808 Note:** When Event 1799 is the latest state event and servicing confirms `Updated` but Event 1808 hasn't appeared yet, the script annotates this in the card. The `Secure-Boot-Update` scheduled task runs at startup + every 12 hours and will produce 1808 on its next cycle. Per Microsoft MVP confirmation, this can take up to 9+ days - no manual intervention needed.
 
