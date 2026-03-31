@@ -3,297 +3,361 @@
 **The June 2026 deadline is around the corner.** Microsoft's Windows UEFI CA 2023 certificate rotation is already in motion, and machines that miss it risk security compliance and future security fixes. Secure Boot is only half the battle...
 
 This script tells you the other half, and what actions are required.
----
-**What it does:**
-Rather than just reporting Secure Boot state, it audits the actual certificate database (`db`/`dbDefault`/`KEK`/`dbx`), checks the TPM-WMI event log for rotation progress (including BucketId/confidence/skip reason extraction), reads the Secure Boot **servicing registry** (`UEFICA2023Status`, `WindowsUEFICA2023Capable`, error codes, `CanAttemptUpdateAfter`), decodes the **AvailableUpdates bitmask** into human-readable pending operations, cross-checks **2011 CA revocation status** in the DBX, performs a **passive UEFI variable attributes check** to determine if Windows can write to the BIOS cert db directly, and where possible, **automatically triggers the OS-side update** (registry key + WinCsFlags + scheduled task) and reports the result.
-
-**Seven distinct states, all handled:**
-
-- :red_circle: **Action Required** - 2023 certs missing and Windows cannot write to the BIOS db; OEM firmware update or manual key reset required
-- :yellow_circle: **Action Optional** - 2023 certs missing (or in `dbDefault` only), but Windows is capable of writing to the BIOS cert db directly; Windows Update will eventually push the cert automatically, or a manual BIOS update / key reset can expedite
-- :yellow_circle: **Pending** - Rotation in progress; post-trigger monitoring, and cases where certs are in `db`/`dbDefault` but completion hasn't been confirmed yet
-- :green_circle: **Compliant** - Event 1808 or `UEFICA2023Status='Updated'` confirmed; BIOS updated
-- :black_circle: **Disabled** - Secure Boot off; cert check not applicable
-- :black_circle: **Not Applicable** - Legacy BIOS / non-UEFI
-- :grey_question: **Unknown** - Secure Boot enabled but no data available to determine state
-
-> **Pending Reboot** is a sub-state of Pending when Event 1800 is detected - the script differentiates this in the card detail and plain-text output.
 
 ---
 
-## Script Structure
+## What It Does
 
-The script uses PowerShell's `begin`/`process`/`end` blocks:
+Most tools just tell you whether Secure Boot is on or off. This script goes deeper - it audits the actual certificate databases in your firmware, tracks where each machine is in Microsoft's multi-stage certificate rotation, and tells you exactly what (if anything) needs to happen next.
 
-| Block | Contents |
-|-------|----------|
-| `begin` | Initialization & Functions - admin check, parameter validation, helper functions (cert parsing, P/Invoke, event lookup, servicing reads, bitmask decoding), constants |
-| `process` | Data Gathering & Logic (Steps 1–2.6) - Secure Boot status, cert parsing, dbx revocation cross-check, event log query, servicing registry, opt-in check, trigger logic, 1799/1808 annotation |
-| `end` | State Mapping, Card Building & Output (Steps 3–6) - final state resolution, HTML/local card construction, NinjaRMM custom field writes, console summary |
+At a glance, it answers:
+- **Are the new 2023 certificates installed?** Checks all four certs across `db`, `KEK`, and `dbDefault`
+- **Is the old stuff revoked?** Cross-checks whether the 2011 CAs have been removed from the trust chain
+- **Can Windows handle this automatically?** Tests whether the firmware allows OS-level writes (so Windows Update can push certs without a BIOS update)
+- **What's actually happening right now?** Reads the event log, servicing registry, and update manifest to show exactly where the rotation stands
+- **Is SVN (rollback protection) in place?** Checks boot manager version numbers to confirm the device can't be rolled back to a vulnerable state
+- **What stage is this device at?** Maps everything to one of four deployment stages with clear next steps
+
+It then outputs a color-coded status card to NinjaRMM (or local files) with all the detail you need for fleet-wide visibility.
+
+**On newer systems (KB5077241+, February 2025):** The script automatically uses the newer `Get-SecureBootUEFI -Decoded` and `Get-SecureBootSVN` cmdlets for richer data, falling back to raw byte parsing on older systems. You don't need to worry about compatibility - it handles both transparently.
 
 ---
 
-## Certificate Audit
+## Output States
 
-The script checks for all four 2023 certificates Microsoft is rotating to:
+Every device lands in one of eight states. The status card and plain-text field both reflect this.
 
-| Variable | Certificate | Purpose |
-|----------|-------------|---------|
+| State | Meaning |
+|-------|---------|
+| :green_circle: **Compliant** | Certificate rotation confirmed complete (Event 1808 or servicing registry confirms "Updated") |
+| :yellow_circle: **Pending** | Rotation in progress - certs are deploying, waiting on reboots, or the OS is working through the stages |
+| :yellow_circle: **Pending (Trigger)** | The script triggered the OS-side update and is monitoring for progress |
+| :yellow_circle: **Action Optional** | Certs are missing, but Windows *can* push them automatically - it'll happen on its own, or you can expedite with a BIOS update |
+| :red_circle: **Action Required** | Certs are missing and Windows *cannot* update them - a firmware update or manual key reset is needed |
+| :black_circle: **Disabled** | Secure Boot is off; certificate rotation doesn't apply until it's enabled |
+| :black_circle: **Not Applicable** | Legacy BIOS or non-UEFI hardware; not relevant |
+| :grey_question: **Unknown** | Secure Boot is on but there's not enough data to determine the state |
+
+> **Pending Reboot** appears as a sub-state of Pending when Event 1800 is detected - the card and plain-text output call this out specifically.
+
+---
+
+## NinjaRMM Variables & Parameters
+
+### Custom Fields (Device - Output)
+
+Create these in NinjaRMM before deploying the script.
+
+| Field Name | Type | Description |
+|------------|------|-------------|
+| `SecureBootCertStatusCard` | WYSIWYG | Detailed HTML status card with certificate inventory, event timeline, servicing status, SVN compliance, and more |
+| `SecureBootCertStatus` | Text (200 char) | One-line summary for the device table - great for quick at-a-glance views and filtering |
+
+### Script Variables (Inputs)
+
+Configure these as Script Variables in NinjaRMM attached to the script, or pass directly as PowerShell parameters.
+
+| Variable Name | Type | Default | Description |
+|---------------|------|---------|-------------|
+| `securebootAction` | Drop-down | `Audit SecureBoot management status` | What to do about Windows Update opt-in ([details below](#securebootaction)) |
+| `enforceSvnCompliance` | Drop-down | `Passive` | Whether to actively apply SVN hardening mitigations ([details below](#enforcesvncompliance)) |
+| `saveStatusLocal` | Checkbox | `false` | Save output to local files (useful outside NinjaRMM) |
+| `saveLogToDevice` | Checkbox | `true` | Save a timestamped activity log to the device |
+| `includeDefaultHive` | Checkbox | `true` | Apply per-user telemetry keys to the Default profile template (only matters when running as SYSTEM) |
+| `secureBootStatusCardField` | Text | `SecureBootCertStatusCard` | Override the WYSIWYG custom field name |
+| `secureBootPlainTextField` | Text | `SecureBootCertStatus` | Override the plain-text custom field name |
+
+#### `securebootAction`
+
+The certificate audit **always runs** regardless of this setting. This controls whether the script also configures the Windows Update opt-in for Secure Boot certificate management.
+
+| Value | What It Does |
+|-------|--------------|
+| **Enable opt-in for SecureBoot management** | Configures the machine so Windows Update will manage the certificate rotation automatically. Sets the required telemetry level, opt-in registry keys, and kicks the scheduled task. If the machine is already compliant, it proceeds but notes it wasn't needed. |
+| **Remove opt-in for SecureBoot management** | Removes the opt-in configuration and telemetry enforcement. Already-triggered updates will still complete - this just prevents future WU-managed pushes. |
+| **Audit SecureBoot management status** | Read-only. Reports the current opt-in and telemetry configuration without touching anything. |
+| *(empty / not set)* | Same as Audit - no changes made. |
+
+#### `enforceSvnCompliance`
+
+Controls whether the script actively applies Microsoft's Secure Boot hardening mitigations ([KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) / [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946)). See [SVN Enforcement](#svn-enforcement) for the full details.
+
+| Value | What It Does |
+|-------|--------------|
+| **Enforce SVN** | Applies all four mitigations in sequence when safe to do so. Checks current state first (won't re-apply what's already done). Has built-in safety gates to prevent dangerous out-of-order application. **If you use BitLocker, make sure recovery keys are backed up first.** |
+| **Passive** | Audit only - reports which stage the device is at and what's left. Does **not** apply any mitigations, but **does** run a safety check to clean up any prematurely triggered bits. This is the recommended default until Microsoft begins enforcement (June 2026). |
+
+### Card Customization
+
+Optional parameters - generally left at defaults.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CardTitle` | `Secure Boot` | Title at the top of the status card |
+| `CardIcon` | `fas fa-shield` | Font Awesome icon class |
+| `CardBorderRadius` | `10px` | CSS border radius |
+| `CardSeparationMargin` | `0 8px` | CSS margin between cards |
+
+### Output Files
+
+When local output is enabled, files are written to `C:\Logs\SecureBoot\`:
+
+| File | Enabled By | Description |
+|------|------------|-------------|
+| `SecureBootStatusCard.html` | `saveStatusLocal` | Full HTML status card |
+| `SecureBootStatus.txt` | `saveStatusLocal` | Plain-text summary |
+| `SecureBootStatus.log` | `saveLogToDevice` | Timestamped activity log |
+
+---
+
+## What the Script Checks
+
+### Certificate Audit
+
+Microsoft is rotating to four new certificates. The script checks for each one individually:
+
+| Location | Certificate | Role |
+|----------|-------------|------|
 | `db` | Windows UEFI CA 2023 | Signs Windows boot binaries |
 | `db` | Microsoft UEFI CA 2023 | Signs third-party UEFI drivers/apps |
 | `db` | Microsoft Option ROM UEFI CA 2023 | Signs option ROMs (add-in cards) |
 | `KEK` | Microsoft Corporation KEK 2K CA 2023 | **Authority** that signs updates to db/dbx |
 
-Each certificate is individually tracked in the status card with ✅/❌ indicators.
+Each cert is shown in the status card with a three-state icon: green (confirmed installed), blue (pending - triggered but not yet confirmed), or red (absent).
 
-When `dbDefault` is checked (because no certs are in `db` yet), the script reports **which specific certs** are found in firmware defaults - not just a boolean "present/absent."
+The script also checks `dbDefault` (firmware defaults) and reports exactly which certs are there - useful for understanding what a BIOS key reset would restore.
 
-### 2011 CA Revocation Cross-Check
+**Why the KEK matters:** The KEK is the authority that authorizes changes to the cert databases. Without the 2023 KEK, Windows Update can't push new certs into the firmware - even if the hardware supports it. The script checks for this and won't falsely report a machine as "Action Optional" when the KEK is missing.
 
-The script cross-references the `dbx` (revocation list) for the old 2011 CAs:
-- `Microsoft Corporation UEFI CA 2011`
-- `Microsoft Windows Production PCA 2011`
+**2011 CA Revocation:** The script checks whether the old 2011 CAs have been revoked in `dbx`. This is the Stage 3 milestone - once revoked, old boot components can no longer load. The status card shows this with color-coded icons (green = done, blue = pending reboot, yellow = status unclear).
 
-If found in `dbx`, they are displayed in the certificate inventory with a 🚫 ban icon, indicating **Stage 3** (Event 1037) has completed and the old CA can no longer be used to sign boot components.
+### Can Windows Update the Firmware Directly?
 
-### Why the KEK matters
+The script reads the UEFI `db` variable attributes using a low-level system call to determine if the firmware allows authenticated writes from the OS. This is how Windows Update pushes certificates into the BIOS without needing a firmware update.
 
-The **Key Exchange Key (KEK)** is the authority certificate that signs any updates to the `db` and `dbx` variables. Even if the UEFI `db` attributes allow runtime writes (`RUNTIME_ACCESS` + `TIME_BASED_AUTHENTICATED_WRITE_ACCESS`), the firmware will **reject** the write if the payload isn't signed by a trusted KEK. Without `Microsoft Corporation KEK 2K CA 2023` in the KEK database, Windows Update cannot authorize pushing the new db certificates - meaning the machine is **not effectively OS-writable** regardless of what the UEFI attributes report.
+It checks two things:
+1. **UEFI attributes** - Does the firmware allow runtime writes? (`RUNTIME_ACCESS` + `TIME_BASED_AUTHENTICATED_WRITE_ACCESS`)
+2. **KEK authority** - Is the 2023 KEK present to sign the payload?
 
-The script checks for the 2023 KEK and overrides `$dbIsOsWritable` to `$false` if it's missing, ensuring the status card correctly shows "Action Required" instead of "Action Optional."
+If both pass, the machine is marked as OS-writable, which downgrades "Action Required" to "Action Optional" (Windows will handle it automatically).
+
+This check is entirely passive and read-only - nothing is modified.
+
+### Event Log
+
+The script queries all 19 Secure Boot event IDs from the `Microsoft-Windows-TPM-WMI` provider ([KB5016061](https://support.microsoft.com/en-us/topic/secure-boot-db-and-dbx-variable-update-events-37e47cf8-608b-4a87-8175-bdead630eb69)). Events are aggregated with counts and timestamps, displayed as a color-coded timeline in the card.
+
+**Key state events:**
+
+| Event ID | What It Means |
+|----------|---------------|
+| `1808` | Fully updated - all done |
+| `1799` | Boot manager installed - nearly done, waiting for final confirmation |
+| `1801` | Certs are available but haven't been applied yet |
+| `1800` | Reboot needed to continue the update |
+
+**Deployment events** track individual operations (1043 KEK updated, 1036 DB applied, 1037 2011 CA revoked, 1042 SVN applied, etc.).
+
+**Blocker events** flag issues like BitLocker conflicts (1032), vulnerable bootloaders (1033), or OEM firmware problems (1803).
+
+> **1799 -> 1808 timing:** After Event 1799, it can take up to 9+ days for 1808 to appear. The scheduled task runs at startup + every 12 hours. The script notes this so you don't waste time investigating a normal delay.
+
+### Servicing Registry
+
+The Windows servicing registry provides the definitive compliance signal, independent of the event log.
+
+| Value | What It Tells You |
+|-------|-------------------|
+| `UEFICA2023Status` | The ground truth - `"Updated"` means done. Used alongside Event 1808 as the primary compliance check. |
+| `WindowsUEFICA2023Capable` | Boot manager readiness: `0` = cert not in DB, `1` = cert in DB, `2` = booting from 2023-signed boot manager |
+| `UEFICA2023Error` | Last error code (decoded to a readable message) |
+| `CanAttemptUpdateAfter` | If in the future, the update is intentionally delayed - explains "why isn't it updating?" |
+| OEM info | Manufacturer, model, firmware version |
+
+### SVN Compliance
+
+**Security Version Numbers (SVN)** are the rollback protection piece. Once applied, firmware will refuse to boot anything older than the recorded version - preventing attackers from rolling back to a vulnerable boot manager.
+
+The script checks SVN through two paths:
+1. **`Get-SecureBootSVN` cmdlet** (KB5077241+) - provides firmware, boot manager, and staged SVN values
+2. **Raw DBX byte parsing** (all devices) - extracts SVN from the firmware variables directly and compares against the Windows Update staging file to detect pending updates
+
+SVN progression: `0.0` (nothing applied) -> `2.0` (2011 CA revoked) -> `7.0` (full enforcement)
+
+### Rollout Metadata
+
+Events 1801 and 1808 contain Microsoft's rollout targeting metadata. The script extracts:
+
+- **BucketConfidenceLevel** - "High Confidence" devices get auto-deployed; "Action Required" devices need manual opt-in
+- **BucketId** - Device grouping hash for Microsoft's rollout orchestration
+- **SkipReason** - `KI_<number>` flags indicating known firmware issues that blocked deployment
+
+### Opt-In Status
+
+Regardless of the selected action, the script always reports the current opt-in configuration:
+
+| Status | Meaning |
+|--------|---------|
+| :green_circle: **Enabled** | Opted in and telemetry meets the minimum - Windows Update will manage certs |
+| :yellow_circle: **Blocked** | Opted in but telemetry is too low (`AllowTelemetry=0`) - WU can't proceed |
+| :black_circle: **Not enabled** | Opt-in key not set - Windows won't manage certs until opted in or Microsoft's enforcement begins |
+
+Also surfaces `AvailableUpdatesPolicy` (GPO/MDM-driven deployment) and `HighConfidenceOptOut` (if the device has opted out of auto-deployment).
 
 ---
 
-## Passive UEFI Variable Attributes Check
+## SVN Deployment Stages
 
-The script uses `GetFirmwareEnvironmentVariableExA` (P/Invoke) to read the UEFI `db` variable attributes at runtime. This determines whether the firmware allows authenticated writes from the OS, the mechanism Windows Update uses to push certificates directly into the BIOS signature database without a firmware update.
+Microsoft's Secure Boot hardening rolls out in four stages. The script detects and reports which stage each device is at.
 
-- Enables `SeSystemEnvironmentPrivilege` via token adjustment (required for UEFI variable access)
-- Reads the `db` variable under the EFI Image Security Database GUID (`{d719b2cb-3d3a-4596-a3bc-dad00e67656f}`)
-- Checks for `RUNTIME_ACCESS` (0x04) and `TIME_BASED_AUTHENTICATED_WRITE_ACCESS` (0x20)
-- Validates the 2023 KEK authority cert is present (required to sign the payload)
-- If all conditions are met, the machine is marked as OS-writable, downgrading "Action Required" to "Action Optional"
+| Stage | Timeline | What Happens | Mitigation |
+|-------|----------|--------------|------------|
+| Stage 1 | May 2024 | 2023 certificates added to the firmware `db` | Mitigation 1 (`0x40`) |
+| Stage 2 | Feb 2025 | New boot manager deployed, signed with 2023 cert | Mitigation 2 (`0x100`) |
+| Stage 3 | June 2026 | Old 2011 CA revoked in `dbx` - old boot components blocked | Mitigation 3 (`0x80`) |
+| Stage 4 | est. 2027 | Full enforcement - SVN written to firmware | Mitigation 4 (`0x200`) |
 
-This check is entirely passive and read-only; it does not modify any UEFI variables.
-
----
-
-## Event Log (TPM-WMI)
-
-The script queries all 19 Secure Boot event IDs from the `Microsoft-Windows-TPM-WMI` provider in the System log ([KB5016061](https://support.microsoft.com/en-us/topic/secure-boot-db-and-dbx-variable-update-events-37e47cf8-608b-4a87-8175-bdead630eb69)). Events are aggregated by ID with occurrence counts and displayed as a color-coded timeline in the status card.
-
-**State events** (determine the overall deployment status):
-
-| Event ID | Description | Status |
-|----------|-------------|--------|
-| `1808` | Fully updated - all certs + boot manager applied | :green_circle: Compliant |
-| `1799` | Boot manager signed with UEFI CA 2023 installed successfully | :green_circle: Compliant - Pending final 1808 event |
-| `1801` | Certs available but not applied | :red_circle: Action Required |
-| `1800` | Reboot required to continue | :yellow_circle: Pending Reboot |
-
-> **1799 → 1808 Note:** When Event 1799 is the latest state event and servicing confirms `Updated` but Event 1808 hasn't appeared yet, the script annotates this in the card. The `Secure-Boot-Update` scheduled task runs at startup + every 12 hours and will produce 1808 on its next cycle. Per Microsoft MVP confirmation, this can take up to 9+ days - no manual intervention needed.
-
-**Reboot correlation:** When Event 1800 (reboot required) is followed by Event 1799 (boot manager installed), the script checks the System event log for boot events (`Kernel-General` ID 12) between those timestamps to confirm a reboot bridged them.
-
-**Deployment events** (track individual cert/variable operations):
-
-| Event ID | Description |
-|----------|-------------|
-| `1043` | KEK updated with KEK CA 2023 |
-| `1044` | Option ROM CA 2023 added to DB |
-| `1045` | UEFI CA 2023 added to DB |
-| `1036` | DB variable applied |
-| `1034` | DBX variable applied |
-| `1037` | 2011 CA revoked from DBX (Mitigation 3 / Stage 3) |
-| `1042` | Boot Manager SVN applied to DBX (Mitigation 4 / Stage 4) |
-
-**Blocker / warning events:**
-
-| Event ID | Description |
-|----------|-------------|
-| `1032` | BitLocker conflict (would enter recovery) |
-| `1033` | Vulnerable bootloader in EFI partition |
-
-**Firmware / prerequisite error events:**
-
-| Event ID | Description |
-|----------|-------------|
-| `1795` | Firmware returned an error (rejected the variable write) |
-| `1796` | Unexpected error during update (Windows retries on reboot) |
-| `1797` | Windows UEFI CA 2023 not present in DB (prerequisite failure) |
-| `1798` | Boot manager not signed with 2023 cert (DBX update blocked) |
-| `1802` | Update blocked - known firmware/hardware limitation |
-| `1803` | PK-signed KEK not found for device (OEM hasn't provided signed KEK) |
+Stage detection uses multiple signals: event log entries, manifest bits in `AvailableUpdates`, and direct certificate/DBX inspection.
 
 ---
 
-## Servicing Registry
+## SVN Enforcement
 
-The script reads the Secure Boot servicing state from the Windows registry, providing a secondary compliance signal and diagnostic information independent of the event log.
+When [`enforceSvnCompliance`](#enforcesvncompliance) is set to `Enforce SVN`, the script applies Microsoft's mitigations per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) / [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946). In `Passive` mode, only the safety check runs.
 
-**`HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing`**
+### Mitigation Sequence
 
-| Value | Type | Description |
-|-------|------|-------------|
-| `UEFICA2023Status` | String | Definitive servicing state - `"Updated"` = compliant. The ground truth signal, used as the primary compliance check alongside Event 1808. |
-| `WindowsUEFICA2023Capable` | DWORD | Boot manager readiness: `0` = cert not in DB, `1` = cert in DB, `2` = cert in DB + booting from 2023-signed boot manager. Displayed in the Servicing card section with color-coded icons. |
-| `UEFICA2023Error` | DWORD | Win32 error code from the last failed update attempt. Decoded to human-readable message via `[System.ComponentModel.Win32Exception]`. |
-| `UEFICA2023ErrorEvent` | DWORD | Maps to the event ID that describes the failure (e.g., 1795, 1802, 1803). |
+Mitigations are applied in order. Each one sets a specific bit in the `AvailableUpdates` registry key and triggers the `Secure-Boot-Update` scheduled task.
 
-**`HKLM:\...\SecureBoot\Servicing\DeviceAttributes`**
+| Mitigation | Operation | How It's Confirmed |
+|-----------|-----------|-------------------|
+| 1 (`0x40`) | Add Windows UEFI CA 2023 to DB | Certificate appears in db (re-read after 30s) |
+| 2 (`0x100`) | Install 2023-signed boot manager | Event 1799 or 1808 |
+| 3 (`0x80`) | Revoke PCA 2011 in DBX | Event 1037 |
+| 4 (`0x200`) | Apply SVN to DBX firmware | Event 1042 |
+| 3+4 (`0x280`) | Combined - per KB5053946, applied together when both are needed | Events 1037 + 1042 |
 
-| Value | Type | Description |
-|-------|------|-------------|
-| `CanAttemptUpdateAfter` | FILETIME | Next allowed update attempt time. If in the future, the update is intentionally delayed. |
-| `OEMManufacturerName` | String | OEM manufacturer name from servicing metadata |
-| `OEMModelNumber` | String | Device model number |
-| `FirmwareVersion` | String | Current firmware version |
-| `FirmwareReleaseDate` | String | Firmware release date |
+If Mitigation 1 fails, the script stops. If Mitigation 2 triggers but can't be confirmed, it marks a reboot as required and blocks Mitigations 3+4.
+
+### Safety Gate: Why Stages 3+4 Are Gated
+
+**Stages 3 and 4 are irreversible.** Once the old CAs are revoked (Stage 3) or SVN is written to firmware (Stage 4), there's no going back without a BIOS factory reset. If these are applied before the new certs and boot manager are in place (Stages 1+2), the device could fail to boot.
+
+The script enforces a strict prerequisite gate before allowing Mitigations 3+4:
+
+| Prerequisite | What's Checked |
+|-------------|----------------|
+| Stage 1 complete | Cert **physically present** in db AND the `0x40` bit has been **consumed** (processed by Windows) |
+| Stage 2 complete | Event 1799 or 1808 **confirmed** AND the `0x100` bit has been **consumed** |
+| No pending reboot | Event 1800 (reboot required) is **not** the current state |
+
+Both the ground truth (is the cert actually there?) and the manifest (did Windows finish processing it?) must pass. If anything fails, Mitigations 3+4 are blocked with a clear reason.
+
+### Safety Repair
+
+The script includes a repair function that runs automatically in **both Enforce and Passive modes**:
+
+- **If Stage 3+4 bits are in the manifest but prerequisites aren't met:** The bits are cleared from the registry before the next reboot can process them. This is reversible - the DBX hasn't been modified yet.
+- **If Events 1037/1042 have already fired:** The DBX has been modified and it's too late to undo from Windows. The script detects this and provides OEM-specific BIOS key reset instructions.
+
+> Per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885): *"After the mitigation is enabled on a device, it cannot be reverted if you continue to use Secure Boot on that device."*
 
 ---
 
 ## AvailableUpdates Bitmask
 
-The `AvailableUpdates` registry value is not just a magic number - it's a bitmask where each bit requests a specific certificate operation. The script decodes it into human-readable descriptions in the status card.
+The `AvailableUpdates` registry value is a bitmask where each bit requests a specific update operation. The script decodes it into readable descriptions in the status card.
 
-| Bit(s) | Hex | Meaning |
-|--------|-----|---------|
-| 2 | `0x0004` | Install Microsoft KEK 2023 signed by OEM PK |
-| 6 | `0x0040` | Apply Windows UEFI CA 2023 to DB |
-| 8 | `0x0100` | Install boot manager signed with UEFI CA 2023 |
+| Bit | Hex | Meaning |
+|-----|-----|---------|
+| 2 | `0x0004` | Install Microsoft KEK 2023 (signed by OEM PK) |
+| 6 | `0x0040` | Apply Windows UEFI CA 2023 to DB (Mitigation 1) |
+| 7 | `0x0080` | Revoke PCA 2011 in DBX (Mitigation 3) |
+| 8 | `0x0100` | Install boot manager signed with UEFI CA 2023 (Mitigation 2) |
+| 9 | `0x0200` | Apply SVN to DBX firmware (Mitigation 4) |
 | 11 | `0x0800` | Apply Microsoft Option ROM UEFI CA 2023 |
 | 12 | `0x1000` | Apply Microsoft UEFI CA 2023 |
-| 14 | `0x4000` | Conditional qualifier (apply only if UEFI CA 2011 already trusted) - always present, not displayed in output |
+| 14 | `0x4000` | Conditional qualifier (always present, not shown in output) |
 | 2+14 | `0x4004` | KEK needs to be updated (combo) |
 
-The script also reads `AvailableUpdatesPolicy` (GPO/MDM-driven, persists across reboots) and `HighConfidenceOptOut` (opts the device out of Microsoft's automatic high-confidence deployment).
-
-> Unknown/undocumented bits are detected and flagged separately.
-
----
-
-## Rollout Metadata
-
-Event 1801 and 1808 messages contain Microsoft's rollout metadata, which the script extracts via regex:
-
-| Field | Description |
-|-------|-------------|
-| `BucketId` | SHA256-based device grouping hash used by Microsoft's rollout orchestration |
-| `BucketConfidenceLevel` | Rollout tier - **"High Confidence"** devices are auto-eligible for deployment; **"Action Required"** devices need manual opt-in |
-| `SkipReason` | `KI_<number>` known firmware issue identifier - indicates the device was skipped due to a documented firmware problem |
-
-The **Rollout Tier** is displayed in the status card when available. High Confidence devices will receive the update automatically via Windows Update (if telemetry is sufficient); Action Required devices need explicit opt-in via `secureBootAction`.
-
-> Bucket metadata is only extracted from Event 1801/1808 messages. Event 1800 messages contain these fields but with non-meaningful values.
-
----
-
-## `secureBootAction` - NinjaRMM Script Variable (Drop-down)
-
-The certificate audit **always runs** regardless of the selected action. The `secureBootAction` script variable controls whether the script also takes action on the Windows Update opt-in configuration for Secure Boot certificate management.
-
-> Configure as a **Drop-down** script variable in NinjaRMM with the values below, or pass directly via `-SecureBootAction`.
-
-| Drop-down Value | What It Does |
-|-----------------|--------------|
-| `Enable opt-in for Secure Boot management` | Sets telemetry to minimum required level (`AllowTelemetry=1`, `MaxTelemetryAllowed=1`, per-user `ShowedToastAtLevel=1`), sets `MicrosoftUpdateManagedOptIn=0x5944` and `AvailableUpdates=0x5944`, then triggers the `\Microsoft\Windows\PI\Secure-Boot-Update` scheduled task. If already compliant (1808 present), proceeds anyway but notes it wasn't strictly necessary. |
-| `Remove opt-in for Secure Boot management` | Removes telemetry enforcement keys (`AllowTelemetry`, `MaxTelemetryAllowed`) and `MicrosoftUpdateManagedOptIn`. Does **not** remove `AvailableUpdates` (already-triggered updates should complete). |
-| `Audit SecureBoot management status` | Read-only check of all opt-in and telemetry keys. Reports current state without making any changes. |
-| *(empty / not set)* | No action taken - audit only. |
-
----
-
-## Opt-In Status Check
-
-Regardless of the selected action, the script always checks the current opt-in configuration and reports it in the status card under **Opt-In Status**. This uses the `Check-OptInStatus` function which reads:
-
-| Registry Key | Path | Expected Value | Notes |
-|---|---|---|---|
-| `AllowTelemetry` | `HKLM:\...\Policies\DataCollection` | ≥ 1 (Required) | Must be ≥ 1 for WU to manage Secure Boot |
-| `MaxTelemetryAllowed` | `HKLM:\...\Policies\DataCollection` | ≥ 1 | |
-| `MicrosoftUpdateManagedOptIn` | `HKLM:\...\Control\SecureBoot` | `0x5944` | Opt-in gate |
-| `AvailableUpdates` | `HKLM:\...\Control\SecureBoot` | Non-zero bitmask | Volatile trigger (cleared after use) |
-| `AvailableUpdatesPolicy` | `HKLM:\...\Control\SecureBoot` | Non-zero bitmask | GPO/MDM-driven persistent trigger |
-| `HighConfidenceOptOut` | `HKLM:\...\Control\SecureBoot` | `0` or absent | If non-zero, device opts out of auto-deployment |
-
-The card displays:
-- :green_circle: **Enabled** - opted in + telemetry meets minimum
-- :yellow_circle: **Blocked** - opted in but `AllowTelemetry=0` prevents WU from managing certs
-- :black_circle: **Not enabled** - opt-in key not set
-- Additional indicators for `HighConfidenceOptOut` (if set) and `AvailableUpdatesPolicy` (if GPO/MDM is driving deployment)
+The script also reads `AvailableUpdatesPolicy` (GPO/MDM-driven, persists across reboots) and `HighConfidenceOptOut`. Unknown/undocumented bits are detected and flagged.
 
 ---
 
 ## Smart Handling
-- Stale 1801 events (cert already in `db`) are flagged as such (no false alarms)
-- OS-writable firmware correctly differentiates "wait for Windows Update" from "manual action needed"
-- KEK presence validated before declaring db as OS-writable
-- Opt-in status always checked and surfaced in the status card (including GPO/MDM policy and auto-deployment opt-out)
-- `UEFICA2023Status = "Updated"` used as the definitive compliance signal - catches cases where Event 1808 is missing from the log but the servicing stack confirms completion
-- `WindowsUEFICA2023Capable` surfaced in the Servicing card section - shows boot manager readiness (0/1/2)
-- Auto-trigger skipped when servicing already reports "Updated", even without Event 1808
-- Auto-trigger skipped when Event 1800 (reboot required) or 1799 (boot manager installed) is already present - these are in-progress states that need time (up to 9+ days per MS MVP), not another push
-- 1799 → 1808 informational note when servicing confirms Updated but 1808 hasn't appeared yet - no nudge, just annotation
-- 1800 → 1799 reboot correlation - confirms a reboot bridged the two events via System boot event cross-check
-- `CanAttemptUpdateAfter` checked - explains "why isn't it updating yet?" when the update is intentionally delayed
-- 2011 CA revocation cross-check - detects whether old CAs have been revoked in `dbx` (Stage 3 completion)
-- Servicing error codes decoded via `[System.ComponentModel.Win32Exception]` with the associated error event surfaced
-- AvailableUpdates bitmask decoded into specific pending operations (0x4000 conditional qualifier suppressed - always present, not actionable)
-- BucketId/BucketConfidenceLevel/SkipReason extracted from Event 1801/1808 messages - shows rollout tier and known firmware issues
-- All four 2023 certificates individually tracked in a Certificate Inventory card section
-- `dbDefault` cert tracking reports which specific certs are in firmware defaults (not just a boolean)
-- Three-way logic for missing KEK: OS-writable → Action Optional, Event 1803 → Action Required, no 1803 → Pending with opt-in guidance
-- OEM-specific BIOS update and key reset guide links included per manufacturer (Dell, HP, Lenovo, ASUS, Microsoft)
-- Scheduled task `\Microsoft\Windows\PI\Secure-Boot-Update` existence check with reporting
-- BitLocker warnings surfaced before any key reset guidance
-- Reboot-pending detection with source (Windows Update / Component Servicing) when the trigger stalls
+
+The script handles a lot of edge cases so you don't have to investigate them manually:
+
+- **Stale events** - A 1801 event when the cert is already in `db` is flagged as stale (no false alarms)
+- **OS-writable vs. not** - Correctly differentiates "Windows will handle it" from "you need to update the BIOS"
+- **KEK validation** - Won't falsely report OS-writable when the KEK authority cert is missing
+- **Trigger intelligence** - Won't re-trigger updates when Event 1800 (reboot needed) or 1799 (in progress) is present; these need time, not another push
+- **Delay detection** - `CanAttemptUpdateAfter` explains why an update hasn't happened yet
+- **Error decoding** - Servicing error codes are translated to readable messages
+- **Reboot correlation** - Confirms reboots actually happened between Event 1800 and 1799 using boot event cross-checks
+- **Three-way KEK logic** - Missing KEK with OS-writable = Action Optional; with Event 1803 (OEM blocker) = Action Required; neither = Pending with opt-in guidance
+- **OEM-specific guidance** - BIOS update and key reset links for Dell, HP, Lenovo, ASUS, and Microsoft
+- **BitLocker warnings** - Surfaced before any key reset guidance
+- **SVN safety** - Stage 1+2 prerequisite gate, passive mode safety checks, post-enforcement repair, boot-time cross-reference for reboot-pending detection
+- **Automatic fallback** - `Get-SecureBootUEFI -Decoded` when available, raw byte parsing when not; `Get-SecureBootSVN` cmdlet + raw DBX parsing together for complete coverage
+- **`WinCsFlags.exe`** - Used when available for more precise configuration application
 
 ---
 
-## NinjaRMM Variables
+## Script Internals
 
-### Custom Fields (Device)
+### Architecture
 
-These must be created in NinjaRMM before the script can write to them.
+The script uses PowerShell's `begin`/`process`/`end` blocks:
 
-| Field Name | Type | Description |
-|------------|------|-------------|
-| `SecureBootCertStatusCard` | WYSIWYG | Color-coded, detailed HTML status card with certificate inventory, event log, servicing status, and opt-in state |
-| `SecureBootCertStatus` | Text (200 char) | Plain-text summary line; add to the device table for quick at-a-glance viewing |
+| Block | What Happens |
+|-------|--------------|
+| `begin` | Loads all functions, runs admin check, detects KB5077241 capabilities |
+| `process` | Gathers all data (certs, events, servicing, SVN, opt-in), runs enforcement or safety checks, executes the selected action |
+| `end` | Maps everything to a final state, builds the status card, writes to NinjaRMM fields or local files |
 
-### Script Variables (Inputs)
+### Card Rendering
 
-Configure these as Script Variables in NinjaRMM attached to the script.
+The status card is built from modular `Build-*` functions that accept a `-Format` parameter (`'Html'` or `'Local'`). This means the HTML card (Font Awesome icons, colors) and plain-text output (emoji) are generated from the same logic - no drift between the two.
 
-| Variable Name | Type | Default | Description |
-|---------------|------|---------|-------------|
-| `securebootAction` | Drop-down | `Audit SecureBoot management status` | Controls whether the script takes action on opt-in configuration (see [secureBootAction](#securebootaction--ninjarmm-script-variable-drop-down)) |
-| `saveStatusLocal` | Checkbox | `false` | Saves the status card (HTML) and plain-text status to local files at `C:\Windows\Logs\SecureBoot` |
-| `saveLogToDevice` | Checkbox | `true` | Saves the script activity log to the device |
-| `includeDefaultHive` | Checkbox | `true` | Include the Default user profile hive when setting per-user telemetry keys |
-| `secureBootStatusCardField` | Text | `SecureBootCertStatusCard` | Override the WYSIWYG custom field name |
-| `secureBootPlainTextField` | Text | `SecureBootCertStatus` | Override the plain-text custom field name |
+| Function | Section |
+|----------|---------|
+| `Build-CertInventorySection` | Certificate inventory (three-state icons) |
+| `Build-ServicingSection` | Servicing registry status |
+| `Build-UpdatesSection` | AvailableUpdates manifest (decoded bitmask) |
+| `Build-SvnComplianceSection` | SVN compliance and enforcement results |
+| `Build-EnforcementMitigationLines` | Per-mitigation status lines |
+| `Build-RolloutTierSection` | Rollout tier / confidence metadata |
+| `Build-UpdateTaskSection` | Scheduled task presence |
+| `Build-OptInSection` | Opt-in configuration |
+| `Build-EventLogSection` | Color-coded event timeline |
 
-### Card Customization (Parameters)
+### Certificate Parsing
 
-These can be passed directly as script parameters but are generally left at defaults.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `CardTitle` | `Secure Boot` | Title displayed at the top of the status card |
-| `CardIcon` | `fas fa-shield` | Font Awesome icon class for the card header |
-| `CardBorderRadius` | `10px` | CSS border radius for the card |
-| `CardSeparationMargin` | `0 8px` | CSS margin between cards |
+The `Get-UefiDatabaseCerts` function handles cert parsing transparently:
+- Uses `Get-SecureBootUEFI -Decoded` when available (KB5077241+)
+- Falls back to raw `EFI_SIGNATURE_LIST` byte parsing on older systems
+- Returns X509 certificate objects either way
 
 ---
 
-## Output
+## Sources
 
-The script writes to the NinjaRMM custom fields listed above. When `saveStatusLocal` is enabled, it also saves to:
-- `C:\Windows\Logs\SecureBoot\SecureBootCertStatusCard.html`
-- `C:\Windows\Logs\SecureBoot\SecureBootCertStatus.txt`
+- [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) - Secure Boot hardening mitigations
+- [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946) - Combined Mitigation 3+4 guidance
+- [KB5077241](https://support.microsoft.com/en-us/topic/kb5077241) - February 2025 update (Get-SecureBootSVN, -Decoded)
+- [KB5016061](https://support.microsoft.com/en-us/topic/secure-boot-db-and-dbx-variable-update-events-37e47cf8-608b-4a87-8175-bdead630eb69) - Secure Boot event IDs
+- [KB5084567](https://support.microsoft.com/en-us/topic/kb5084567) - AvailableUpdates bitmask reference
+- [garlin/SecureBoot-CA-2023-Updates](https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates) - SVN parsing, DBX byte reading
+- [microsoft/secureboot_objects](https://github.com/microsoft/secureboot_objects) - Microsoft Secure Boot reference objects
+- [cjee21/Check-UEFISecureBootVariables](https://github.com/cjee21/Check-UEFISecureBootVariables) - UEFI variable inspection reference
+- [HorizonSecured/Get-SecureBootCertInfo.ps1](https://github.com/HorizonSecured) - Bitmask decoding reference
+- [Microsoft Official scripts](Microsoft%20Official/) - Detection and orchestration reference scripts
 
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-Example.png" alt="SecuerBoot-Card-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-NewExample.png" alt="SecuerBoot-Card-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleLight.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleDark.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
 
 [Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-CertCheck.ps1)
 
