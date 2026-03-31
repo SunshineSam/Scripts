@@ -359,6 +359,6 @@ The `Get-UefiDatabaseCerts` function handles cert parsing transparently:
 <img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleLight.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
 <img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleDark.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
 
-[Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-CertCheck.ps1)
+[Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-Management-CA2023.ps1)
 
 
