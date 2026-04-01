@@ -26,7 +26,7 @@
                 check with full Test-SvnStagePrerequisites call for Mitigation 3+4
                 (ground truth + manifest + reboot), with detailed gate logging.
     03-30-2026: SVN Enforcement engine (Invoke-SvnEnforcement): applies KB5025885 /
-                KB5053946 mitigations 1-4 when $EnforceSvnCompliance = 'Enforce SVN', only
+                CVE-2023-24932 enterprise deployment guidance mitigations 1-4 when $EnforceSvnCompliance = 'Enforce SVN', only
                 when applicable (stages 1-2 are fully complete with no pending updates, etc).
                 Each mitigation writes AvailableUpdates bitmask + triggers Secure-Boot-Update
                 task: Mitigation 1 (0x40, DB cert), Mitigation 2 (0x100, Boot manager),
@@ -2969,7 +2969,7 @@ $($sectionsHtml.ToString())
     # =======================================================================
     # SVN Enforcement Function
     # =======================================================================
-    # Applies the KB5025885 / KB5053946 Secure Boot hardening mitigations.
+    # Applies the KB5025885 Secure Boot hardening mitigations (CVE-2023-24932 enterprise deployment guidance).
     # Each mitigation is a specific AvailableUpdates bitmask value + scheduled task trigger.
     # The function is idempotent - it checks current state before each step and skips
     # mitigations that have already been applied.
@@ -2979,10 +2979,10 @@ $($sectionsHtml.ToString())
     # Mitigation 3 (0x80)  : Revoke PCA 2011 in DBX - blocks old boot managers
     # Mitigation 4 (0x200) : Apply SVN update to firmware DBX - prevents rollback
     #
-    # Combined Mitigation 3+4 (0x280) per KB5053946 - single reboot.
+    # Combined Mitigation 3+4 (0x280) per CVE-2023-24932 enterprise guidance - single reboot.
     #
-    # Source: https://support.microsoft.com/en-us/topic/kb5025885
-    # Source: https://support.microsoft.com/en-us/topic/kb5053946
+    # Source: https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d
+    # Source: https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967
     # =======================================================================
     function Invoke-SvnEnforcement {
         param (
@@ -3137,7 +3137,7 @@ $($sectionsHtml.ToString())
         
         # -----------------------------------------------
         # Mitigation 3 + 4: Revoke PCA 2011 + Apply SVN (0x280)
-        # Per KB5053946, these can be applied together in one step.
+        # Per CVE-2023-24932 enterprise guidance, these can be applied together in one step.
         # Uses Test-SvnStagePrerequisites for the Stage 1+2 gate check.
         # -----------------------------------------------
         $mit3Done = $pca2011Revoked -or $has1037
@@ -3179,7 +3179,7 @@ $($sectionsHtml.ToString())
         else {
             # Determine what to apply
             if (-not $mit3Done -and -not $mit4Done) {
-                # Apply both together (0x280) per KB5053946
+                # Apply both together (0x280) per CVE-2023-24932 enterprise guidance
                 $triggerValue = 0x280
                 $desc = "Mitigation 3+4 combined (revoke 2011 CA + apply SVN) (0x280)"
             }
@@ -3730,15 +3730,15 @@ process {
     # =======================================================================
     # Step 2.2: SVN Enforcement (when $EnforceSvnCompliance -eq 'Enforce SVN')
     # =======================================================================
-    # Applies KB5025885 / KB5053946 mitigations sequentially:
+    # Applies KB5025885 mitigations sequentially (CVE-2023-24932 enterprise guidance):
     #   Mitigation 1 (0x40)  : Add Windows UEFI CA 2023 to DB
     #   Mitigation 2 (0x100) : Install 2023-signed boot manager
     #   Mitigation 3 (0x80)  : Revoke PCA 2011 in DBX
     #   Mitigation 4 (0x200) : Apply SVN to DBX firmware
-    # Combined 3+4 (0x280) per KB5053946 when both needed - single reboot.
+    # Combined 3+4 (0x280) per CVE-2023-24932 enterprise guidance when both needed - single reboot.
     # Each step checks current state first (idempotent).
-    # Source: https://support.microsoft.com/en-us/topic/kb5025885
-    # Source: https://support.microsoft.com/en-us/topic/kb5053946
+    # Source: https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d
+    # Source: https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967
     # =======================================================================
     $svnEnforcementResult = $null
     if ($EnforceSvnCompliance -eq 'Enforce SVN' -and $secureBoot -eq 'Enabled') {
