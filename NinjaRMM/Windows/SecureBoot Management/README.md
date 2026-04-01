@@ -352,7 +352,7 @@ The `Get-UefiDatabaseCerts` function handles cert parsing transparently:
 - [garlin/SecureBoot-CA-2023-Updates](https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates) - SVN parsing, DBX byte reading
 - [microsoft/secureboot_objects](https://github.com/microsoft/secureboot_objects) - Microsoft Secure Boot reference objects
 - [cjee21/Check-UEFISecureBootVariables](https://github.com/cjee21/Check-UEFISecureBootVariables) - UEFI variable inspection reference
-- [Microsoft Official scripts](Microsoft%20Official/) - Detection and orchestration reference scripts
+- [Microsoft Official scripts](https://support.microsoft.com/en-us/topic/sample-secure-boot-e2e-automation-guide-f850b329-9a6e-40d1-823a-0925c965b8a0) - Detection and orchestration reference scripts
 
 <img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-NewExample.png" alt="SecureBoot-Card-Example" width="420px" />
 <img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleLight.png" alt="SecureBoot-LocalCard-Example" width="420px" />
