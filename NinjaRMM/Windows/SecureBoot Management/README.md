@@ -81,7 +81,7 @@ The certificate audit **always runs** regardless of this setting. This controls 
 
 #### `enforceSvnCompliance`
 
-Controls whether the script actively applies Microsoft's Secure Boot hardening mitigations ([KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) / [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946)). See [SVN Enforcement](#svn-enforcement) for the full details.
+Controls whether the script actively applies Microsoft's Secure Boot hardening mitigations ([KB5025885](https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d) / [CVE-2023-24932 enterprise guidance](https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967)). See [SVN Enforcement](#svn-enforcement) for the full details.
 
 | Value | What It Does |
 |-------|--------------|
@@ -224,7 +224,7 @@ Stage detection uses multiple signals: event log entries, manifest bits in `Avai
 
 ## SVN Enforcement
 
-When [`enforceSvnCompliance`](#enforcesvncompliance) is set to `Enforce SVN`, the script applies Microsoft's mitigations per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) / [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946). In `Passive` mode, only the safety check runs.
+When [`enforceSvnCompliance`](#enforcesvncompliance) is set to `Enforce SVN`, the script applies Microsoft's mitigations per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d) / [CVE-2023-24932 enterprise guidance](https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967). In `Passive` mode, only the safety check runs.
 
 ### Mitigation Sequence
 
@@ -236,7 +236,7 @@ Mitigations are applied in order. Each one sets a specific bit in the `Available
 | 2 (`0x100`) | Install 2023-signed boot manager | Event 1799 or 1808 |
 | 3 (`0x80`) | Revoke PCA 2011 in DBX | Event 1037 |
 | 4 (`0x200`) | Apply SVN to DBX firmware | Event 1042 |
-| 3+4 (`0x280`) | Combined - per KB5053946, applied together when both are needed | Events 1037 + 1042 |
+| 3+4 (`0x280`) | Combined - per CVE-2023-24932 enterprise guidance, applied together when both are needed | Events 1037 + 1042 |
 
 If Mitigation 1 fails, the script stops. If Mitigation 2 triggers but can't be confirmed, it marks a reboot as required and blocks Mitigations 3+4.
 
@@ -261,7 +261,7 @@ The script includes a repair function that runs automatically in **both Enforce 
 - **If Stage 3+4 bits are in the manifest but prerequisites aren't met:** The bits are cleared from the registry before the next reboot can process them. This is reversible - the DBX hasn't been modified yet.
 - **If Events 1037/1042 have already fired:** The DBX has been modified and it's too late to undo from Windows. The script detects this and provides OEM-specific BIOS key reset instructions.
 
-> Per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885): *"After the mitigation is enabled on a device, it cannot be reverted if you continue to use Secure Boot on that device."*
+> Per [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d): *"After the mitigation is enabled on a device, it cannot be reverted if you continue to use Secure Boot on that device."*
 
 ---
 
@@ -344,21 +344,18 @@ The `Get-UefiDatabaseCerts` function handles cert parsing transparently:
 
 ## Sources
 
-- [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885) - Secure Boot hardening mitigations
-- [KB5053946](https://support.microsoft.com/en-us/topic/kb5053946) - Combined Mitigation 3+4 guidance
-- [KB5077241](https://support.microsoft.com/en-us/topic/kb5077241) - February 2025 update (Get-SecureBootSVN, -Decoded)
+- [KB5025885](https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d) - Secure Boot hardening mitigations
+- [CVE-2023-24932 Enterprise Deployment Guidance](https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967) - Enterprise deployment steps, combined Mitigation 3+4 (0x280)
+- [KB5077241](https://support.microsoft.com/en-us/topic/february-24-2026-kb5077241-os-builds-26200-7922-and-26100-7922-preview-b8cc7bc8-d640-4f18-9437-3ee59298b970) - February 2025 update (Get-SecureBootSVN, -Decoded)
 - [KB5016061](https://support.microsoft.com/en-us/topic/secure-boot-db-and-dbx-variable-update-events-37e47cf8-608b-4a87-8175-bdead630eb69) - Secure Boot event IDs
-- [KB5084567](https://support.microsoft.com/en-us/topic/kb5084567) - AvailableUpdates bitmask reference
+- [KB5084567](https://support.microsoft.com/en-us/topic/sample-secure-boot-e2e-automation-guide-f850b329-9a6e-40d1-823a-0925c965b8a0) - AvailableUpdates bitmask reference
 - [garlin/SecureBoot-CA-2023-Updates](https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates) - SVN parsing, DBX byte reading
 - [microsoft/secureboot_objects](https://github.com/microsoft/secureboot_objects) - Microsoft Secure Boot reference objects
 - [cjee21/Check-UEFISecureBootVariables](https://github.com/cjee21/Check-UEFISecureBootVariables) - UEFI variable inspection reference
-- [HorizonSecured/Get-SecureBootCertInfo.ps1](https://github.com/HorizonSecured) - Bitmask decoding reference
 - [Microsoft Official scripts](Microsoft%20Official/) - Detection and orchestration reference scripts
 
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-NewExample.png" alt="SecuerBoot-Card-Example" width="420px" />
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleLight.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
-<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleDark.png" alt="SecuerBoot-LocalCard-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-NewExample.png" alt="SecureBoot-Card-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleLight.png" alt="SecureBoot-LocalCard-Example" width="420px" />
+<img src="https://raw.githubusercontent.com/SunshineSam/Scripts/main/NinjaRMM/Windows/SecureBoot%20Management/images/SecureBoot-LocalExampleDark.png" alt="SecureBoot-LocalCard-Example" width="420px" />
 
-[Powershell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-Management-CA2023.ps1)
-
-
+[PowerShell Script](https://github.com/SunshineSam/Scripts/blob/main/NinjaRMM/Windows/SecureBoot%20Management/SecureBoot-Management-CA2023.ps1)
