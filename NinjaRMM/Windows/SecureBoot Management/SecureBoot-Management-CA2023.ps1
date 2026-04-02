@@ -1,9 +1,27 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 03-31-2026
+    Last Edit: 04-01-2026
 
     Note:
+    04-01-2026; Addressed a small, out of place HTML cosmetic bug, with the
+                "What is this?" a tag link not processing through the build-*
+                pipeline. Examples how to handle additional title info dynamically.
+                CSS modification so a tags do not have underlining for HTML cards.
+                SecureBootAction no longer writes AvailableUpdates.
+                SVN Enforcement sub-section always visible for better insight.
+                Addressed inconsist reporting & accuracies between Passive & Enforce.
+                Cosmetic clarity and fine-tuning UI states/instances.
+                Improved WU Opt-In reporting to show only when needed.
+                Addressed a bug with Build-UpdatesSection that left persitent pending-
+                updates after all stages have been applied (causing confusion).
+                Has2023InDb now specifically checks for Windows UEFI CA 2023.
+                Identifies other 2023 certs in a new supplemental step, sets bitmask,
+                checks for added cert data after, warning and continuing on.
+                  During my testing of this, it worked flawlessly, setting the
+                  Update bits, triggering the task, firing events the events.
+                  No reboots were needed in my testing when applying
+                Removed Get-ShortCertName, caused too much confusion.
     03-31-2026: Stage 3+4 prerequisite gate (Test-SvnStagePrerequisites): prevents
                 mitigations 3 (0x80) and 4 (0x200) from executing unless Stage 1+2
                 are VERIFIED complete. Two-signal validation per stage:
@@ -53,7 +71,7 @@
                 event-based OR-ing of 0x0080/0x0200 ensures manifest accuracy.
                 Detail text now appends SVN summary: "Reboot required to complete SVN firmware
                 updates" / "No action required" / "SVN updates pending - awaiting Microsoft
-                rollout (June 2026 – 2027)". Replaces static "No action required" when SVN
+                rollout (June 2026 - 2027)". Replaces static "No action required" when SVN
                 needs action. Fixed stale 1801 detail text that incorrectly claimed "OS update
                 triggered via reg key" in Audit mode.
                 Rollout Tier: formats multi-value comma-separated confidence as numbered list,
@@ -225,7 +243,7 @@
           1037 (2011 CA revoked), 1042 (Boot Manager SVN applied)
         - Blocker events: 1032 (BitLocker conflict), 1033 (vulnerable bootloader)
         - Firmware/error events: 1795 (firmware rejected write), 1796 (unexpected
-          error), 1797 (2023 cert not in DB), 1798 (boot mgr not signed),
+          error), 1797 (Windows UEFI CA 2023 cert not in DB), 1798 (boot mgr not signed),
           1802 (blocked by known limitation), 1803 (PK-signed KEK not found)
         - Aggregated summary with occurrence counts displayed in the status card.
       
@@ -450,7 +468,7 @@ begin {
         )
         $sectionsHtml = [System.Text.StringBuilder]::new()
         foreach ($item in $Data.PSObject.Properties) {
-            $sectionName = [System.Net.WebUtility]::HtmlEncode($item.Name)
+            $sectionName = $item.Name
             $content = $item.Value
             [void]$sectionsHtml.Append(@"
             <div class="section">
@@ -471,9 +489,10 @@ begin {
     --accent: $AccentColor;
     --bg: #f5f6fa;
     --card-bg: #ffffff;
-    --text: #1a1a2e;
+    --text: #272727;
     --muted: #6b7280;
     --border: #e5e7eb;
+    --link: #447dcd;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -482,6 +501,7 @@ begin {
       --text: #e5e7eb;
       --muted: #9ca3af;
       --border: #4a4a4a;
+      --link: #447dcd;
     }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -536,7 +556,7 @@ begin {
     font-size: 11px;
     color: var(--muted);
   }
-  a { color: var(--accent); }
+  a { color: var(--link); text-decoration-line: none; }
 </style>
 </head>
 <body>
@@ -656,13 +676,6 @@ $($sectionsHtml.ToString())
         return $CertStatus.AllEvents | Where-Object { $_.Id -eq $EventId } | Sort-Object Time -Descending | Select-Object -First 1
     }
     
-    # Helper function: Shorten Microsoft cert names for display
-    # Replaces repeated: -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', ''
-    function Get-ShortCertName {
-        param ([string]$Name)
-        return ($Name -replace 'Microsoft Corporation ', '' -replace 'Microsoft ', '')
-    }
-    
     # Helper function: Test if SVN reboot is pending (revocation or SVN update awaiting reboot)
     # Replaces repeated: ($null -ne $svnStatus -and ($svnStatus.RebootPending -or $svnStatus.RevocationAppliedPendingReboot))
     function Test-SvnRebootPending {
@@ -764,14 +777,14 @@ $($sectionsHtml.ToString())
             'fa-check-circle'          = '✅'
             'fa-times-circle'          = '❌'
             'fa-exclamation-triangle'  = '⚠️'
-            'fa-exclamation-circle'    = '⚠️'
+            'fa-exclamation-circle'    = '❕'
             'fa-info-circle'           = 'ℹ️'
             'fa-sync-alt'              = '🔄'
             'fa-ban'                   = '🚫'
             'fa-clock'                 = '⏳'
             'fa-eye'                   = '👁️'
             'fa-building'              = '🏢'
-            'fa-question-circle'       = '❓'
+            'fa-question-circle'       = '﹖'
             'fa-circle'                = '⚪'
             'fa-cog'                   = '⚙️'
             'fa-calendar-check'        = '📅'
@@ -805,12 +818,14 @@ $($sectionsHtml.ToString())
         $lines = @()
         foreach ($certName in $updatedDbCertNames) {
             $present = $dbCertsFound -contains $certName
-            $label   = Get-ShortCertName $certName
-            if ($certsUnconfirmed -contains $label) {
-                $icon = Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format
-            }
-            elseif ($present) {
+            $label   = $certName
+            if ($present) {
+                # Ground truth wins: cert is physically in db = green regardless of manifest bits
                 $icon = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+            }
+            elseif ($certsUnconfirmed -contains $label) {
+                # Manifest bit set but cert not yet in db = blue (pending reboot/processing)
+                $icon = Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format
             }
             else {
                 $icon = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
@@ -818,11 +833,11 @@ $($sectionsHtml.ToString())
             $lines += "$icon $label"
         }
         # KEK cert
-        if ($certsUnconfirmed -contains 'KEK 2K CA 2023') {
-            $kekIcon = Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format
-        }
-        elseif ($has2023InKek) {
+        if ($has2023InKek) {
             $kekIcon = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+        }
+        elseif ($certsUnconfirmed -contains 'KEK 2K CA 2023') {
+            $kekIcon = Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format
         }
         else {
             $kekIcon = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
@@ -831,8 +846,8 @@ $($sectionsHtml.ToString())
         # 2011 CA revocation status
         if ($ca2011RevokedInDbx.Count -gt 0) {
             foreach ($revokedCA in $ca2011RevokedInDbx) {
-                $rLabel = Get-ShortCertName $revokedCA
-                if ($null -ne $svnStatus -and $svnStatus.RevocationAppliedPendingReboot) {
+                $rLabel = if ($revokedCA -match 'Production PCA') { 'PCA 2011' } elseif ($revokedCA -match 'UEFI CA') { 'UEFI CA 2011' } else { $revokedCA }
+                if ($null -ne $svnStatus -and ($svnStatus.RevocationAppliedPendingReboot -or $svnStatus.RebootPending)) {
                     $rIcon = Format-CardIcon -Type 'ban' -Color '#3B82F6' -Format $Format
                     $lines += "$rIcon $rLabel <span style='color:#888;'>(revoked in dbx - <span style='color:#3B82F6;'>pending SVN reboot</span>)</span>"
                 }
@@ -891,7 +906,7 @@ $($sectionsHtml.ToString())
     # Helper function: Build Updates/manifest section for card display
     function Build-UpdatesSection {
         param ([string]$Format)
-        if ($allApplied -and -not $svnRebootForManifest -and $enrichedMeaning.Count -eq 0) {
+        if ($allApplied -and -not $svnRebootForManifest) {
             $chk = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
             return "$chk No Updates Pending <span style='color:#26A644;'>(all applied)</span>"
         }
@@ -936,31 +951,37 @@ $($sectionsHtml.ToString())
             [bool]$SvnRebootPending        # Whether SVN reboot is pending
         )
         $mitigations = @(
-            @{ Key = 'Mitigation1'; Label = 'DB cert' }
+            @{ Key = 'Mitigation1'; Label = 'Windows CA2023' }
             @{ Key = 'Mitigation2'; Label = 'Boot manager' }
             @{ Key = 'Mitigation3'; Label = '2011 revocation' }
             @{ Key = 'Mitigation4'; Label = 'SVN update' }
         )
+        $rebootRequired = $EnfResult.RebootRequired
         $lines = @()
         foreach ($m in $mitigations) {
             $state = $EnfResult[$m.Key]
             $blockedReason = $EnfResult["$($m.Key)BlockedReason"]
+            $isMit12 = $m.Key -in @('Mitigation1', 'Mitigation2')
             $isMit34 = $m.Key -in @('Mitigation3', 'Mitigation4')
-            $pendingRebootOverride = ($isMit34 -and $SvnRebootPending -and $state -in @('AlreadyApplied', 'Applied'))
+            # Mit 1+2: show reboot pending when applied but overall reboot required
+            $mit12RebootPending = ($isMit12 -and $rebootRequired -and $state -eq 'Applied')
+            # Mit 3+4: show SVN reboot pending when already applied/applied but SVN reboot still needed
+            $mit34SvnReboot = ($isMit34 -and $SvnRebootPending -and $state -in @('AlreadyApplied', 'Applied'))
             $mIcon = switch ($state) {
-                'AlreadyApplied' { Format-CardIcon -Type 'check' -Color $(if ($pendingRebootOverride) { '#3B82F6' } else { '#26A644' }) -Format $Format }
-                'Applied'        { Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format }
+                'AlreadyApplied' { Format-CardIcon -Type 'check' -Color $(if ($mit34SvnReboot) { '#3B82F6' } else { '#26A644' }) -Format $Format }
+                'Applied'        { Format-CardIcon -Type $(if ($mit12RebootPending) { 'sync' } else { 'check' }) -Color '#3B82F6' -Format $Format }
                 'Blocked'        { Format-CardIcon -Type 'ban' -Color '#F59E0B' -Format $Format }
                 'Failed'         { Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format }
                 default          { Format-CardIcon -Type 'circle' -Color '#6B7280' -Format $Format }
             }
             $stateLabel = switch ($state) {
                 'AlreadyApplied' {
-                    if ($pendingRebootOverride) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
+                    if ($mit34SvnReboot) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
                     else { 'Complete' }
                 }
                 'Applied' {
-                    if ($pendingRebootOverride) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
+                    if ($mit12RebootPending) { "<span style='color:#3B82F6;'>Reboot pending</span>" }
+                    elseif ($mit34SvnReboot) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
                     else { 'Applied' }
                 }
                 'Blocked' {
@@ -968,7 +989,11 @@ $($sectionsHtml.ToString())
                     else { 'Blocked' }
                 }
                 'Failed'  { 'Failed' }
-                default   { '-' }
+                default   {
+                    if ($isMit34) { "<span style='color:#6B7280;'>Awaiting enforcement (June 2026 - 2027)</span>" }
+                    elseif ($isMit12) { "<span style='color:#6B7280;'>Not yet applied</span>" }
+                    else { "<span style='color:#6B7280;'>Pending</span>" }
+                }
             }
             $lines += "$mIcon $($m.Label): $stateLabel"
         }
@@ -1029,42 +1054,66 @@ $($sectionsHtml.ToString())
             }
             $parts += "$stageIcon $($svnStatus.Stage): $($svnStatus.StageDetail)"
         }
-        # Enforcement (active or passive)
+        # Enforcement overview - always shown as a playbook status of where each mitigation stands
         $enfSvnReboot = Test-SvnRebootPending -SvnStatus $svnStatus
-        if ($null -ne $svnEnforcementResult) {
-            $parts += '<b>SVN Enforcement</b>'
-            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot
+        # Mode indicator
+        if ($EnforceSvnCompliance -eq 'Enforce SVN') {
+            $modeIcon = Format-CardIcon -Type 'cog' -Color '#3B82F6' -Format $Format
+            $parts += "$modeIcon Enforcement: Active"
+            if ($enforceMissingOptIn) {
+                $warnIcon = Format-CardIcon -Type 'warning' -Color '#F59E0B' -Format $Format
+                $parts += "$warnIcon <span style='color:#F59E0B;'>WU opt-in not enabled. Set securebootAction to &quot;Enable opt-in&quot; for full deployment</span>"
+            }
         }
         elseif ($EnforceSvnCompliance -eq 'Passive') {
-            $msEnforcementDate = [datetime]'2026-06-26'
+            $eyeIcon = Format-CardIcon -Type 'eye' -Color '#6B7280' -Format $Format
+            $parts += "$eyeIcon Enforcement: Passive (June 2026 - 2027) <span style=`"font-size:0.85em; color:#888;`">(last run)</span>"
+        }
+        else {
+            $eyeIcon = Format-CardIcon -Type 'eye' -Color '#6B7280' -Format $Format
+            $parts += "$eyeIcon Enforcement: Not configured (MS enforcement: June 2026 - 2027)"
+        }
+        $parts += '<b>SVN Enforcement</b>'
+        if ($null -ne $svnEnforcementResult) {
+            # Active enforcement just ran - use its results
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot
+        }
+        else {
+            # Build ground-truth status from available signals
+            $has1799 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1799)
+            $has1808 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1808)
+            $has1037 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1037)
+            $has1042 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1042)
+            $pca2011Revoked = ($ca2011RevokedInDbx.Count -gt 0)
+            $svnInDbx = ($null -ne $svnStatus.DbxSVN -and $svnStatus.DbxSVN -ne 0 -and $svnStatus.DbxSVN -ne '0.0')
+            $rebootPending = ($null -ne $certStatus -and $certStatus.EventId -eq 1800)
+            $bootMgrConfirmed = ($has1799 -or $has1808 -or ($null -ne $servicingStatus -and $servicingStatus.WindowsUEFICA2023Capable -ge 2))
+            # Detect if stages 3+4 were pushed ahead of Microsoft's enforcement deadline
+            $msEnforcementDate = [datetime]'2026-06-24'
             $ev1037 = Get-LatestSecureBootEvent -CertStatus $certStatus -EventId 1037
             $ev1042 = Get-LatestSecureBootEvent -CertStatus $certStatus -EventId 1042
             $previouslyEnforced = (($null -ne $ev1037 -and $ev1037.Time -lt $msEnforcementDate) -or
                                    ($null -ne $ev1042 -and $ev1042.Time -lt $msEnforcementDate))
-            $eyeIcon = Format-CardIcon -Type 'eye' -Color '#6B7280' -Format $Format
-            $parts += "$eyeIcon Enforcement: Passive (June 2026 - 2027)"
             if ($previouslyEnforced) {
                 $piIcon = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
-                $parts += "&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:#5BC0DE;'>$piIcon Previously enforced</span>"
-                if ($enfSvnReboot) {
-                    $parts += '<b>SVN Enforcement</b>'
-                    $greenCheck = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
-                    $blueCheck  = Format-CardIcon -Type 'check' -Color '#3B82F6' -Format $Format
-                    $parts += "$greenCheck DB cert: Complete"
-                    $parts += "$greenCheck Boot manager: Complete"
-                    $mit3Pending = ($null -ne $ev1037 -and $svnStatus.RevocationAppliedPendingReboot)
-                    $mit3Label = if ($mit3Pending) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
-                                 else { 'Complete' }
-                    $parts += "$(if ($mit3Pending) { $blueCheck } else { $greenCheck }) 2011 revocation: $mit3Label"
-                    $mit4Pending = ($null -ne $ev1042 -and $svnStatus.RebootPending)
-                    $mit4Label = if ($mit4Pending) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
-                                 else { 'Complete' }
-                    $parts += "$(if ($mit4Pending) { $blueCheck } else { $greenCheck }) SVN update: $mit4Label"
-                }
+                $parts += "&nbsp;&nbsp;&nbsp;&nbsp;<span style='color:#5BC0DE;'>$piIcon Previously enforced (ahead of schedule)</span>"
             }
-            else {
-                $parts[-1] += ' <span style="font-size:0.85em; color:#888;">(last run)</span>'
+            # Build a virtual enforcement result for consistent rendering
+            $groundTruth = @{
+                Mitigation1             = if ($has2023InDb) { 'AlreadyApplied' }
+                                          else { $null }
+                Mitigation2             = if ($bootMgrConfirmed) { 'AlreadyApplied' }
+                                          elseif ($has2023InDb -and $rebootPending) { 'Applied' }
+                                          else { $null }
+                Mitigation3             = if ($pca2011Revoked -or $has1037) { 'AlreadyApplied' } else { $null }
+                Mitigation4             = if ($svnInDbx -or $has1042) { 'AlreadyApplied' } else { $null }
+                Mitigation1BlockedReason = $null
+                Mitigation2BlockedReason = $null
+                Mitigation3BlockedReason = $null
+                Mitigation4BlockedReason = $null
+                RebootRequired          = $rebootPending
             }
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $groundTruth -SvnRebootPending $enfSvnReboot
         }
         return Join-CardLines -Lines $parts -Format $Format
     }
@@ -1497,7 +1546,7 @@ $($sectionsHtml.ToString())
             return @{ Certs = @(); Bytes = $null; UsedDecoded = $false }
         }
     }
-
+    
     # Helper function: Check if Secure Boot is enabled on this machine
     # Returns: 'Enabled', 'Disabled', or 'NotApplicable' (non-UEFI / exception thrown)
     # Uses direct UEFI variable access to bypass Windows validation failures (e.g., 1801 logic)
@@ -1735,7 +1784,7 @@ $($sectionsHtml.ToString())
     # Certificate deployment events (success):
     #   1043 = KEK updated with KEK CA 2023
     #   1044 = Option ROM CA 2023 added to DB
-    #   1045 = UEFI CA 2023 added to DB
+    #   1045 = Microsoft UEFI CA 2023 added to DB
     #   1036 = DB variable applied
     #   1034 = DBX variable applied
     #   1037 = 2011 CA revoked in DBX (Mitigation 3)
@@ -1764,7 +1813,7 @@ $($sectionsHtml.ToString())
         # Deployment success events
         1043 = 'KEK updated with KEK CA 2023'
         1044 = 'Option ROM CA 2023 added to DB'
-        1045 = 'UEFI CA 2023 added to DB'
+        1045 = 'Microsoft UEFI CA 2023 added to DB'
         1036 = 'DB variable applied'
         1034 = 'DBX variable applied'
         1037 = '2011 CA revoked in DBX (Mitigation 3)'
@@ -1775,7 +1824,7 @@ $($sectionsHtml.ToString())
         # Firmware / prerequisite errors
         1795 = 'Firmware returned an error'
         1796 = 'Unexpected update error (will retry on reboot)'
-        1797 = 'UEFI CA 2023 not in DB (prerequisite failure)'
+        1797 = 'Windows UEFI CA 2023 not in DB (DBX prerequisite failure)'
         1798 = 'Boot manager not signed with 2023 cert'
         1802 = 'Update blocked (known firmware limitation)'
         1803 = 'PK-signed KEK not found (OEM issue)'
@@ -1935,7 +1984,7 @@ $($sectionsHtml.ToString())
             }
             1799 {
                 $status = 'Pending'
-                $msg    = 'Boot manager signed with UEFI CA 2023 installed successfully (Event 1799)'
+                $msg    = 'Boot manager signed with Windows UEFI CA 2023 installed successfully (Event 1799)'
             }
             default {
                 $status = 'Pending'
@@ -2267,7 +2316,7 @@ $($sectionsHtml.ToString())
         if ($Value -band 0x0004)               { $meaning += 'Install Microsoft KEK 2023 signed by OEM PK' }
         if ($Value -band 0x0040)               { $meaning += 'Apply Windows UEFI CA 2023 to DB' }
         if ($Value -band 0x0080)               { $meaning += 'Revoke PCA 2011 in DBX (Mitigation 3)' }
-        if ($Value -band 0x0100)               { $meaning += 'Install boot manager signed with UEFI CA 2023' }
+        if ($Value -band 0x0100)               { $meaning += 'Install boot manager signed with Windows UEFI CA 2023' }
         if ($Value -band 0x0200)               { $meaning += 'Apply SVN to DBX firmware (Mitigation 4)' }
         if ($Value -band 0x0800)               { $meaning += 'Apply Microsoft Option ROM UEFI CA 2023' }
         if ($Value -band 0x1000)               { $meaning += 'Apply Microsoft UEFI CA 2023' }
@@ -2664,21 +2713,20 @@ $($sectionsHtml.ToString())
         Write-Log "INFO" "Per-user ShowedToastAtLevel keys left as-is (default value is 1; no enforcement to remove)"
     }
     
-    # Helper function: Set the Secure Boot opt-in gate AND trigger keys
-    # Sets both MicrosoftUpdateManagedOptIn (opt-in gate) and AvailableUpdates (trigger bitmask)
+    # Helper function: Set the Secure Boot opt-in gate key (MicrosoftUpdateManagedOptIn only)
+    # Does NOT write AvailableUpdates - stage pushing is handled by EnforceSvnCompliance
     function Set-SecureBootOptInKeys {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
         $optInValue = 0x5944  # Microsoft Update managed opt-in magic value
         
         try {
-            Write-Log "INFO" "Setting Secure Boot opt-in and trigger keys"
+            Write-Log "INFO" "Setting Secure Boot opt-in key (MicrosoftUpdateManagedOptIn)"
             RegistryShouldBe -KeyPath $regPath -Name "MicrosoftUpdateManagedOptIn" -Value $optInValue
-            RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $optInValue
-            Write-Log "SUCCESS" "Secure Boot opt-in keys set (MicrosoftUpdateManagedOptIn + AvailableUpdates = 0x5944)"
+            Write-Log "SUCCESS" "Secure Boot opt-in key set (MicrosoftUpdateManagedOptIn = 0x5944)"
             return $true
         }
         catch {
-            Write-Log "ERROR" "Failed to set opt-in keys: $($_.Exception.Message)"
+            Write-Log "ERROR" "Failed to set opt-in key: $($_.Exception.Message)"
             return $false
         }
     }
@@ -2800,7 +2848,7 @@ $($sectionsHtml.ToString())
             Stage3BitPending  = $stage3BitPending   # 0x80 in manifest but no 1037 yet
             Stage4BitPending  = $stage4BitPending   # 0x200 in manifest but no 1042 yet
             CurrentManifest   = $currentAv
-            BlockReason       = if ($rebootPending) { 'Reboot pending' }
+            BlockReason       = if ($rebootPending) { 'Enforce again after stages 1-2 complete' }
                                 elseif (-not $stage1Done) { $stage1Detail }
                                 elseif (-not $stage2Done) { $stage2Detail }
                                 else { $null }
@@ -2991,7 +3039,8 @@ $($sectionsHtml.ToString())
             [hashtable]$SvnStatus,
             [hashtable]$CertStatus,
             [byte[]]$DbxBytes,
-            [array]$Ca2011RevokedInDbx
+            [array]$Ca2011RevokedInDbx,
+            [string[]]$DbCertsFound = @()
         )
         
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
@@ -3005,6 +3054,7 @@ $($sectionsHtml.ToString())
             Mitigation3BlockedReason = $null
             Mitigation4BlockedReason = $null
             RebootRequired = $false
+            SupplementaryCertsAttempted = $false
             ActionsApplied = @()
             ActionsSkipped = @()
         }
@@ -3061,9 +3111,12 @@ $($sectionsHtml.ToString())
                 } | ForEach-Object {
                     if ($_.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() }
                 })
-                if ($recheckNames.Count -gt 0) {
-                    Write-Log "SUCCESS" "Mitigation 1: Verified - $($recheckNames -join ', ') now in db"
+                if ($recheckNames -contains 'Windows UEFI CA 2023') {
+                    Write-Log "SUCCESS" "Mitigation 1: Verified - Windows UEFI CA 2023 now in db$(if ($recheckNames.Count -gt 1) { " (also found: $(($recheckNames | Where-Object { $_ -ne 'Windows UEFI CA 2023' }) -join ', '))" })"
                     $Has2023InDb = $true
+                }
+                elseif ($recheckNames.Count -gt 0) {
+                    Write-Log "WARNING" "Mitigation 1: Found $($recheckNames -join ', ') in db but Windows UEFI CA 2023 not yet visible - may require reboot"
                 }
                 else {
                     Write-Log "WARNING" "Mitigation 1: Cert not yet visible in db - may require reboot"
@@ -3073,6 +3126,70 @@ $($sectionsHtml.ToString())
                 Write-Log "ERROR" "Mitigation 1 failed: $($_.Exception.Message)"
                 $results.Mitigation1 = 'Failed'
                 return $results
+            }
+        }
+        
+        # -----------------------------------------------
+        # Supplementary: Best-effort application of optional db certs
+        # Microsoft UEFI CA 2023 (0x1000) + Option ROM UEFI CA 2023 (0x0800)
+        # These are not required for enforcement progression but are preferred
+        # for full compliance. Attempt only after Mitigation 1 confirms the
+        # required Windows UEFI CA 2023 is in db. Does NOT gate Mitigation 2.
+        # -----------------------------------------------
+        if ($Has2023InDb) {
+            # Determine current db cert inventory (use recheck if Mitigation 1 just ran, else use caller data)
+            $currentDbCerts = if ($recheckNames -and $recheckNames.Count -gt 0) {
+                # Merge: recheck captures what's in db now; also keep caller's original findings
+                @($DbCertsFound) + @($recheckNames) | Select-Object -Unique
+            }
+            else {
+                @($DbCertsFound)
+            }
+            
+            $optionalCerts = @(
+                @{ Name = 'Microsoft UEFI CA 2023';            Bit = 0x1000 }
+                @{ Name = 'Microsoft Option ROM UEFI CA 2023'; Bit = 0x0800 }
+            )
+            $missingOptional = @($optionalCerts | Where-Object { $currentDbCerts -notcontains $_.Name })
+            
+            if ($missingOptional.Count -gt 0) {
+                $combinedBits = 0
+                $missingOptional | ForEach-Object { $combinedBits = $combinedBits -bor $_.Bit }
+                $missingNames = ($missingOptional | ForEach-Object { $_.Name }) -join ', '
+                Write-Log "INFO" "Supplementary certs: Attempting best-effort install of $missingNames (0x$($combinedBits.ToString('X4')))"
+                try {
+                    $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $combinedBits
+                    $null = Trigger-SecureBootTask
+                    Write-Log "SUCCESS" "Supplementary certs: Triggered update (0x$($combinedBits.ToString('X4')))"
+                    $results.SupplementaryCertsAttempted = $true
+                    
+                    # Short wait and verify, don't block enforcement for long
+                    Write-Log "INFO" "Supplementary certs: Waiting 30 seconds for processing"
+                    Start-Sleep -Seconds 30
+                    
+                    # Re-read db to see if any appeared
+                    $suppRecheck = Get-UefiDatabaseCerts -Name db
+                    $suppRecheckNames = @($suppRecheck.Certs | Where-Object {
+                        $_.Subject -match '2023'
+                    } | ForEach-Object {
+                        if ($_.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() }
+                    })
+                    $suppApplied = @($missingOptional | Where-Object { $suppRecheckNames -contains $_.Name })
+                    $suppStillMissing = @($missingOptional | Where-Object { $suppRecheckNames -notcontains $_.Name })
+                    
+                    if ($suppApplied.Count -gt 0) {
+                        Write-Log "SUCCESS" "Supplementary certs: Applied - $(($suppApplied | ForEach-Object { $_.Name }) -join ', ')"
+                    }
+                    if ($suppStillMissing.Count -gt 0) {
+                        Write-Log "INFO" "Supplementary certs: Not yet visible - $(($suppStillMissing | ForEach-Object { $_.Name }) -join ', ') (may require reboot or firmware support)"
+                    }
+                }
+                catch {
+                    Write-Log "WARNING" "Supplementary certs: Best-effort install failed - $($_.Exception.Message) (non-blocking)"
+                }
+            }
+            else {
+                Write-Log "INFO" "Supplementary certs: All optional db certs already present"
             }
         }
         
@@ -3292,6 +3409,7 @@ process {
     $updatedKekCertName  = 'Microsoft Corporation KEK 2K CA 2023'
     
     $has2023InDb        = $false
+    $allDbCertsPresent  = $false
     $has2023InDbDefault = $false
     $has2023InKek       = $false
     $dbCertsFound       = @()   # Which 2023 db certs are present
@@ -3410,9 +3528,16 @@ process {
                     }
                 }
             }
-            $has2023InDb = $dbCertsFound.Count -gt 0
+            $has2023InDb = $dbCertsFound -contains 'Windows UEFI CA 2023'
+            $allDbCertsPresent = ($dbCertsFound.Count -eq $updatedDbCertNames.Count)
             if ($has2023InDb) {
-                Write-Log "INFO" "2023 certs found in db: $($dbCertsFound -join ', ')"
+                if ($allDbCertsPresent) {
+                    Write-Log "INFO" "All 2023 certs found in db: $($dbCertsFound -join ', ')"
+                }
+                else {
+                    $missingDb = $updatedDbCertNames | Where-Object { $dbCertsFound -notcontains $_ }
+                    Write-Log "WARNING" "2023 certs found in db: $($dbCertsFound -join ', ') | Missing: $($missingDb -join ', ')"
+                }
             }
             else {
                 Write-Log "INFO" "No 2023 certs found in db"
@@ -3741,7 +3866,18 @@ process {
     # Source: https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967
     # =======================================================================
     $svnEnforcementResult = $null
+    $enforceMissingOptIn  = $false
     if ($EnforceSvnCompliance -eq 'Enforce SVN' -and $secureBoot -eq 'Enabled') {
+        # Check if opt-in is set (Step 2.3 hasn't run yet, read directly)
+        # Only warn when certs are missing AND not pending install, if certs are in db or a reboot
+        # will deliver them, enforcement handles stage pushing directly via AvailableUpdates.
+        $earlyOptIn = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot' -Name 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue |
+                       Select-Object -ExpandProperty 'MicrosoftUpdateManagedOptIn' -ErrorAction SilentlyContinue)
+        $certsPendingOrPresent = ($has2023InDb -or ($null -ne $certStatus -and $certStatus.EventId -in @(1800, 1799, 1808)))
+        if (($null -eq $earlyOptIn -or $earlyOptIn -eq 0) -and -not $certsPendingOrPresent) {
+            $enforceMissingOptIn = $true
+            Write-Log "WARNING" "SVN Enforcement is enabled but WU Secure Boot management is NOT opted in and 2023 certs are not in db. Set securebootAction to 'Enable opt-in' for full deployment."
+        }
         Write-Host "`n==================================================================="
         Write-Host " ===    SVN Enforcement Mode - Applying KB5025885 Mitigations    ==="
         Write-Host " ==================================================================="
@@ -3751,7 +3887,8 @@ process {
             -SvnStatus        $svnStatus `
             -CertStatus       $certStatus `
             -DbxBytes         $dbxBytes `
-            -Ca2011RevokedInDbx $ca2011RevokedInDbx
+            -Ca2011RevokedInDbx $ca2011RevokedInDbx `
+            -DbCertsFound     $dbCertsFound
         
         # Re-query event log after enforcement to capture new events (1037, 1042, etc.)
         # This ensures the event log summary and card show the full up-to-date picture
@@ -3760,6 +3897,30 @@ process {
             if ($null -ne $postEnforcementStatus -and $null -ne $postEnforcementStatus.AllEvents) {
                 $certStatus = $postEnforcementStatus
                 Write-Log "INFO" "Event log re-queried after enforcement: $($certStatus.AllEvents.Count) event(s)"
+            }
+        }
+
+        # Re-read db certs after enforcement if supplementary certs were attempted
+        # This ensures the cert inventory card reflects newly-applied optional certs
+        if ($null -ne $svnEnforcementResult -and $svnEnforcementResult.SupplementaryCertsAttempted) {
+            Write-Log "INFO" "Re-reading db certs after supplementary cert application"
+            try {
+                $postEnfDb = Get-UefiDatabaseCerts -Name db
+                $postEnfDbCerts = @($postEnfDb.Certs | Where-Object {
+                    $_.Subject -match '2023'
+                } | ForEach-Object {
+                    if ($_.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() }
+                })
+                if ($postEnfDbCerts.Count -gt $dbCertsFound.Count) {
+                    $newCerts = @($postEnfDbCerts | Where-Object { $dbCertsFound -notcontains $_ })
+                    Write-Log "SUCCESS" "Post-enforcement db update: +$($newCerts -join ', ') (was: $($dbCertsFound -join ', '))"
+                    $dbCertsFound = $postEnfDbCerts
+                    $has2023InDb = $dbCertsFound -contains 'Windows UEFI CA 2023'
+                    $allDbCertsPresent = ($dbCertsFound.Count -eq $updatedDbCertNames.Count)
+                }
+            }
+            catch {
+                Write-Log "WARNING" "Failed to re-read db certs after enforcement: $($_.Exception.Message)"
             }
         }
         
@@ -3849,13 +4010,13 @@ process {
                     # 1. Set required telemetry (machine + per-user)
                     Enable-RequiredTelemetry
                     
-                    # 2. Set opt-in gate + trigger keys
+                    # 2. Set opt-in gate key (MicrosoftUpdateManagedOptIn only - no stage pushing)
                     Set-SecureBootOptInKeys
                     
-                    # 3. Trigger Secure-Boot-Update scheduled task to kick off the update
+                    # 3. Trigger Secure-Boot-Update scheduled task to nudge Windows Update
                     Trigger-SecureBootTask
                     
-                    Write-Log "SUCCESS" "Secure Boot opt-in, telemetry enablement, and scheduled-task run complete"
+                    Write-Log "SUCCESS" "Secure Boot opt-in and telemetry enablement complete"
                 }
                 'Remove opt-in for SecureBoot management' {
                     if ($certStatus -and $certStatus.EventId -eq 1808) {
@@ -4297,6 +4458,10 @@ end {
                 $sourceList = $rebootStatus.Sources -join ', '
                 $detailRowHtml += '<br /><br />Reboot pending from: ' + $sourceList
             }
+            if ($enforceMissingOptIn) {
+                $detailRowHtml += '<br /><br /><span style="color:#F59E0B;"><i class="fas fa-exclamation-triangle" style="color:#F59E0B;"></i> SVN Enforcement is active but WU opt-in is not enabled.<br />Set securebootAction to &quot;Enable opt-in&quot; for full deployment.</span>'
+                $plainText     += ' ⚠️ SVN Enforcement active but WU opt-in not enabled.'
+            }
             break
         }
         
@@ -4479,13 +4644,17 @@ end {
         elseif ($svnStatus.IsCompliant) {
             'No action required.'
         }
+        elseif ($statusKey -eq 'Compliant' -and ($svnStatus.RevocationPending -or $svnStatus.SvnUpdatePending)) {
+            # Cert rotation complete - SVN stages 3+4 are future enforcement and not a pending action
+            $null
+        }
         elseif ($svnStatus.RevocationPending -or $svnStatus.SvnUpdatePending) {
             'SVN updates pending. Awaiting Microsoft rollout (June 2026 - 2027).'
         }
         else {
             'SVN update in progress.'
         }
-        $detailRowHtml += "<br />$svnSummary"
+        if ($svnSummary) { $detailRowHtml += "<br />$svnSummary" }
         # Keep $statusEmoji unchanged. Cert compliance is still valid, SVN info is supplemental
     }
     
@@ -4588,7 +4757,7 @@ end {
             if ($dbCertsFound -notcontains 'Microsoft Option ROM UEFI CA 2023') { $manifestPending += 'Option ROM UEFI CA 2023' }
         }
         if ($avVal -band 0x1000) {
-            if ($dbCertsFound -notcontains 'Microsoft UEFI CA 2023') { $manifestPending += 'UEFI CA 2023' }
+            if ($dbCertsFound -notcontains 'Microsoft UEFI CA 2023') { $manifestPending += 'Microsoft UEFI CA 2023' }
         }
         # Boot manager bit (0x0100) - if 1799 has occurred, boot manager is installed
         if ($avVal -band 0x0100) {
@@ -4617,10 +4786,10 @@ end {
         $cardProperties['Updates'] = Build-UpdatesSection -Format 'Html'
     }
     # SVN Compliance (Get-SecureBootSVN cmdlet or raw DBX byte fallback)
+    $svnWhatIsThis = '<a href="https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d" target="_blank" rel="nofollow noopener noreferrer" style="font-size:0.75em;">What is this <i class="fas fa-question-circle" style="color:#6B7280;"></i></a>'
+    $svnSectionTitle = "SVN Compliance $svnWhatIsThis"
     if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
-        $svnWhatIsThis = ' <a href="https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d" target="_blank" rel="nofollow noopener noreferrer" style="font-size:0.75em;"><i class="fas fa-question-circle" style="color:#6B7280;"></i> What is this?</a>'
-        $svnTitle = "SVN Compliance$svnWhatIsThis"
-        $cardProperties[$svnTitle] = Build-SvnComplianceSection -Format 'Html'
+        $cardProperties[$svnSectionTitle] = Build-SvnComplianceSection -Format 'Html'
     }
     # Bucket / confidence (from event message metadata)
     if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
@@ -4673,7 +4842,7 @@ end {
             $localCardProperties['Updates'] = Convert-FaIconsToEmoji (Build-UpdatesSection -Format 'Html')
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
-            $localCardProperties['SVN Compliance'] = Convert-FaIconsToEmoji (Build-SvnComplianceSection -Format 'Html')
+            $localCardProperties[(Convert-FaIconsToEmoji $svnSectionTitle)] = Convert-FaIconsToEmoji (Build-SvnComplianceSection -Format 'Html')
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
             $localCardProperties['Rollout Tier'] = Convert-FaIconsToEmoji (Build-RolloutTierSection -Format 'Html')
