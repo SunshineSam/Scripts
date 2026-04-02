@@ -4386,9 +4386,6 @@ end {
                     }
                     $statusEmoji = '⚠️'
                 }
-                if ($plainText.Length -gt 200) {
-                    $plainText = $plainText.Substring(0, 197) + '...'
-                }
             }
             else {
                 # 2023 cert not in db OR dbDefault - firmware update or OS-driven update needed
@@ -4436,13 +4433,10 @@ end {
                     }
                     $statusEmoji = '⚠️'
                 }
-                if ($plainText.Length -gt 200) {
-                    $plainText = $plainText.Substring(0, 197) + '...'
-                }
             }
             break
         }
-        
+
         # State 5a: Pending Cert Reboot (Event 1800 - reboot required to continue)
         ($secureBoot -eq 'Enabled' -and $certStatus.EventId -eq 1800 -and -not $postTriggerState) {
             $statusKey     = 'Pending'
@@ -4523,9 +4517,6 @@ end {
                     }
                     $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - KEK pending via Windows Update'
                 }
-                if ($plainText.Length -gt 200) {
-                    $plainText = $plainText.Substring(0, 197) + '...'
-                }
             }
             else {
                 # 2023 cert not in db OR dbDefault - firmware update or OS-driven update needed
@@ -4554,13 +4545,10 @@ end {
                     $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events - BIOS lacks 2023 certificate support'
                     $statusEmoji = '❌'
                 }
-                if ($plainText.Length -gt 200) {
-                    $plainText = $plainText.Substring(0, 197) + '...'
-                }
             }
             break
         }
-        
+
         # Fallback: unexpected state combination
         default {
             $statusKey     = 'Unknown'
@@ -4608,9 +4596,6 @@ end {
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Cert Reboot'
                     $detailRowHtml = 'Triggered OS-side update.<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
                     $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; reboot pending (' + $sourceList + ').'
-                    if ($plainText.Length -gt 200) {
-                        $plainText = $plainText.Substring(0, 197) + '...'
-                    }
                     $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Triggered - reboot pending (' + $sourceList + ')'
                 }
                 else {
@@ -4904,7 +4889,9 @@ end {
         
         Write-Log "INFO" "Writing plain-text status to '$PlainTextFieldName'"
         try {
-            Invoke-NinjaPropertySet -FieldName $PlainTextFieldName -Value $plainText
+            # Ninja text fields have a 200-char limit; truncate only for the Ninja write
+            $ninjaPlainText = if ($plainText.Length -gt 200) { $plainText.Substring(0, 197) + '...' } else { $plainText }
+            Invoke-NinjaPropertySet -FieldName $PlainTextFieldName -Value $ninjaPlainText
             Write-Log "SUCCESS" "Plain-text status written to '$PlainTextFieldName'"
         }
         catch {
