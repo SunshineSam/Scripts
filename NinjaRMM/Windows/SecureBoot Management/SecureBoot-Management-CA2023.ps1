@@ -1,10 +1,24 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 04-01-2026
-
+    Last Edit: 04-03-2026
+    
     Note:
-    04-01-2026; Addressed a small, out of place HTML cosmetic bug, with the
+    04-03-2026: Fixed an enforcement branch (stage 2) event bug incorrectly
+                missing an event check, resulting in a weird card output.
+                Fixed update section visibility in this same case.
+                Allows stage branch to correctly show all cases accurately
+                Major bug fix for preliminary certs and improper ORing of updatebits,
+                which were overriding any pending bits, breaking any pending updates
+                from going through.
+                Enforcing stage 3+4 caused a security trigger to break if they
+                were already pending a reboot, which resulted in reverting the
+                stage 3-4 updatebits/progress for them to apply.
+                Added AS1 signature strip in Parse-UefiSignatureDatabase.
+                Fixed stateEventIds to help finalization undestanding & Accuracy.
+                Fixed State 5b-pre branch logic to properly report state.
+                Addressed Final stage pending accuracy based on events and SVN #
+    04-01-2026: Addressed a small, out of place HTML cosmetic bug, with the
                 "What is this?" a tag link not processing through the build-*
                 pipeline. Examples how to handle additional title info dynamically.
                 CSS modification so a tags do not have underlining for HTML cards.
@@ -22,6 +36,7 @@
                   Update bits, triggering the task, firing events the events.
                   No reboots were needed in my testing when applying
                 Removed Get-ShortCertName, caused too much confusion.
+                Addressed a missing firmware and event check for 1795.
     03-31-2026: Stage 3+4 prerequisite gate (Test-SvnStagePrerequisites): prevents
                 mitigations 3 (0x80) and 4 (0x200) from executing unless Stage 1+2
                 are VERIFIED complete. Two-signal validation per stage:
@@ -239,7 +254,7 @@
         - State events: 1808 (compliant), 1801 (action required), 1800 (reboot
           required), 1799 (boot manager installed)
         - Deployment events: 1043 (KEK updated), 1044 (Option ROM CA added),
-          1045 (UEFI CA added), 1036 (DB applied), 1034 (DBX applied),
+          1045 (Microsoft UEFI CA added), 1036 (DB applied), 1034 (DBX applied),
           1037 (2011 CA revoked), 1042 (Boot Manager SVN applied)
         - Blocker events: 1032 (BitLocker conflict), 1033 (vulnerable bootloader)
         - Firmware/error events: 1795 (firmware rejected write), 1796 (unexpected
@@ -847,9 +862,10 @@ $($sectionsHtml.ToString())
         if ($ca2011RevokedInDbx.Count -gt 0) {
             foreach ($revokedCA in $ca2011RevokedInDbx) {
                 $rLabel = if ($revokedCA -match 'Production PCA') { 'PCA 2011' } elseif ($revokedCA -match 'UEFI CA') { 'UEFI CA 2011' } else { $revokedCA }
-                if ($null -ne $svnStatus -and ($svnStatus.RevocationAppliedPendingReboot -or $svnStatus.RebootPending)) {
+                if ($null -ne $svnStatus -and $svnStatus.RevocationAppliedPendingReboot) {
+                    # 1037 fired but revocation not yet visible in DBX bytes, needs reboot
                     $rIcon = Format-CardIcon -Type 'ban' -Color '#3B82F6' -Format $Format
-                    $lines += "$rIcon $rLabel <span style='color:#888;'>(revoked in dbx - <span style='color:#3B82F6;'>pending SVN reboot</span>)</span>"
+                    $lines += "$rIcon $rLabel <span style='color:#888;'>(revoked in dbx - <span style='color:#3B82F6;'>pending reboot</span>)</span>"
                 }
                 elseif ($null -ne $svnStatus) {
                     $rIcon = Format-CardIcon -Type 'ban' -Color '#26A644' -Format $Format
@@ -948,7 +964,8 @@ $($sectionsHtml.ToString())
         param (
             [string]$Format,
             [hashtable]$EnfResult,         # The enforcement result hashtable
-            [bool]$SvnRebootPending        # Whether SVN reboot is pending
+            [bool]$SvnRebootPending,       # Whether SVN reboot is pending (firmware SVN mismatch)
+            [bool]$RevocationRebootPending # Whether revocation is pending reboot (1037 fired but not yet in DBX)
         )
         $mitigations = @(
             @{ Key = 'Mitigation1'; Label = 'Windows CA2023' }
@@ -965,8 +982,11 @@ $($sectionsHtml.ToString())
             $isMit34 = $m.Key -in @('Mitigation3', 'Mitigation4')
             # Mit 1+2: show reboot pending when applied but overall reboot required
             $mit12RebootPending = ($isMit12 -and $rebootRequired -and $state -eq 'Applied')
-            # Mit 3+4: show SVN reboot pending when already applied/applied but SVN reboot still needed
-            $mit34SvnReboot = ($isMit34 -and $SvnRebootPending -and $state -in @('AlreadyApplied', 'Applied'))
+            # Mit 3: only "pending reboot" when revocation not yet visible in DBX
+            # Mit 4: "pending SVN reboot" when firmware SVN hasn't absorbed the update
+            $mit3RevocReboot = ($m.Key -eq 'Mitigation3' -and $RevocationRebootPending -and $state -in @('AlreadyApplied', 'Applied'))
+            $mit4SvnReboot   = ($m.Key -eq 'Mitigation4' -and $SvnRebootPending -and $state -in @('AlreadyApplied', 'Applied'))
+            $mit34SvnReboot  = ($mit3RevocReboot -or $mit4SvnReboot)
             $mIcon = switch ($state) {
                 'AlreadyApplied' { Format-CardIcon -Type 'check' -Color $(if ($mit34SvnReboot) { '#3B82F6' } else { '#26A644' }) -Format $Format }
                 'Applied'        { Format-CardIcon -Type $(if ($mit12RebootPending) { 'sync' } else { 'check' }) -Color '#3B82F6' -Format $Format }
@@ -1055,7 +1075,8 @@ $($sectionsHtml.ToString())
             $parts += "$stageIcon $($svnStatus.Stage): $($svnStatus.StageDetail)"
         }
         # Enforcement overview - always shown as a playbook status of where each mitigation stands
-        $enfSvnReboot = Test-SvnRebootPending -SvnStatus $svnStatus
+        $enfSvnReboot = ($null -ne $svnStatus -and $svnStatus.RebootPending)
+        $enfRevocReboot = ($null -ne $svnStatus -and $svnStatus.RevocationAppliedPendingReboot)
         # Mode indicator
         if ($EnforceSvnCompliance -eq 'Enforce SVN') {
             $modeIcon = Format-CardIcon -Type 'cog' -Color '#3B82F6' -Format $Format
@@ -1076,7 +1097,7 @@ $($sectionsHtml.ToString())
         $parts += '<b>SVN Enforcement</b>'
         if ($null -ne $svnEnforcementResult) {
             # Active enforcement just ran - use its results
-            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot
         }
         else {
             # Build ground-truth status from available signals
@@ -1113,7 +1134,7 @@ $($sectionsHtml.ToString())
                 Mitigation4BlockedReason = $null
                 RebootRequired          = $rebootPending
             }
-            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $groundTruth -SvnRebootPending $enfSvnReboot
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $groundTruth -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot
         }
         return Join-CardLines -Lines $parts -Format $Format
     }
@@ -1225,7 +1246,18 @@ $($sectionsHtml.ToString())
         
         $certs = @()
         $X509_GUID = [Guid]::new("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
+        
+        # Strip optional authenticode signature wrapper (ASN.1 SEQUENCE header)
+        # Some firmware prepends a DER signature to the EFI_SIGNATURE_LIST payload.
+        # Garlin/Cjee21 reference implementations detect this at offset 40.
         $offset = 0
+        if ($Bytes.Length -gt 44 -and $Bytes[40] -eq 0x30 -and $Bytes[41] -eq 0x82) {
+            $sigLength = $Bytes[42] * 256 + $Bytes[43] + 4
+            if ($sigLength -lt $Bytes.Length) {
+                Write-Log "INFO" "Stripping $sigLength-byte authenticode signature wrapper from UEFI variable"
+                $Bytes = [byte[]]$Bytes[$sigLength..($Bytes.Length - 1)]
+            }
+        }
         
         while ($offset -lt $Bytes.Length) {
             $start = $offset
@@ -1929,9 +1961,15 @@ $($sectionsHtml.ToString())
             }
         }
         
-        # Determine state from the most recent STATE event (1808 > 1800 > 1801 > 1799)
-        # These are the events that indicate overall deployment status
-        $stateEventIds = @(1799, 1800, 1801, 1808)
+        # Determine state from the most recent STATE event
+        # These are the events that indicate overall deployment status:
+        #   1801 = certs available but not applied (action required)
+        #   1800 = reboot required to continue
+        #   1799 = 2023 boot manager installed
+        #   1037 = PCA 2011 revoked in DBX (Stage 3 complete)
+        #   1042 = SVN applied to DBX (Stage 4 complete)
+        #   1808 = fully compliant
+        $stateEventIds = @(1037, 1042, 1799, 1800, 1801, 1808)
         $stateEvents = @($parsedEvents | Where-Object { $stateEventIds -contains $_.Id } | Sort-Object Time -Descending)
         
         if ($stateEvents.Count -eq 0 -and $parsedEvents.Count -eq 0) {
@@ -1973,6 +2011,14 @@ $($sectionsHtml.ToString())
             1808 {
                 $status = 'Compliant'
                 $msg    = 'Fully updated - all certs + boot manager applied (Event 1808)'
+            }
+            1042 {
+                $status = 'Pending'
+                $msg    = 'SVN applied to DBX - reboot required to finalize (Event 1042)'
+            }
+            1037 {
+                $status = 'Pending'
+                $msg    = 'PCA 2011 revoked in DBX - reboot required to finalize (Event 1037)'
             }
             1800 {
                 $status = 'Pending'
@@ -2813,16 +2859,18 @@ $($sectionsHtml.ToString())
         $stage4BitPending = ($currentAv -band 0x0200) -ne 0   # SVN update (0x200) in manifest
         
         # --- Stage 1: 2023 cert in UEFI db ---
-        $stage1Done = $Has2023InDb -and -not $stage1BitPending
+        # 1808 = fully compliant (cert + boot mgr + booting from it) - overrides manifest bit
+        $stage1Done = $Has2023InDb -and (-not $stage1BitPending -or $has1808)
         $stage1Detail = if (-not $Has2023InDb) { 'Cert not in db' }
-                        elseif ($stage1BitPending) { 'Cert in db but 0x40 still pending in manifest' }
+                        elseif ($stage1BitPending -and -not $has1808) { 'Cert in db but 0x40 still pending in manifest' }
                         else { 'Complete' }
         
         # --- Stage 2: Boot manager confirmed via event ---
         $bootMgrConfirmed = ($has1799 -or $has1808)
-        $stage2Done = $bootMgrConfirmed -and -not $stage2BitPending
+        # 1808 = definitive confirmation, overrides manifest bit still pending
+        $stage2Done = $bootMgrConfirmed -and (-not $stage2BitPending -or $has1808)
         $stage2Detail = if (-not $bootMgrConfirmed) { 'No 1799/1808 event (boot manager unconfirmed)' }
-                        elseif ($stage2BitPending) { 'Event confirmed but 0x100 still pending in manifest' }
+                        elseif ($stage2BitPending -and -not $has1808) { 'Event confirmed but 0x100 still pending in manifest' }
                         else { 'Complete' }
         
         # --- Reboot pending ---
@@ -2836,19 +2884,23 @@ $($sectionsHtml.ToString())
         $stage3Applied = $has1037
         $stage4Applied = $has1042
         
+        # When stages 1+2 are done, a pending reboot is for stage 3+4 progression - not a blocker.
+        # Only treat reboot as blocking when stages 1 or 2 are still incomplete.
+        $rebootBlocks = $rebootPending -and (-not $stage1Done -or -not $stage2Done)
+        
         return @{
             Stage1Done        = $stage1Done
             Stage1Detail      = $stage1Detail
             Stage2Done        = $stage2Done
             Stage2Detail      = $stage2Detail
             RebootPending     = $rebootPending
-            AllPrereqsMet     = ($stage1Done -and $stage2Done -and -not $rebootPending)
+            AllPrereqsMet     = ($stage1Done -and $stage2Done -and -not $rebootBlocks)
             Stage3Applied     = $stage3Applied      # 1037 event = DBX already modified
             Stage4Applied     = $stage4Applied      # 1042 event = SVN already in DBX
             Stage3BitPending  = $stage3BitPending   # 0x80 in manifest but no 1037 yet
             Stage4BitPending  = $stage4BitPending   # 0x200 in manifest but no 1042 yet
             CurrentManifest   = $currentAv
-            BlockReason       = if ($rebootPending) { 'Enforce again after stages 1-2 complete' }
+            BlockReason       = if ($rebootBlocks) { 'Reboot required to complete stages 1-2' }
                                 elseif (-not $stage1Done) { $stage1Detail }
                                 elseif (-not $stage2Done) { $stage2Detail }
                                 else { $null }
@@ -3059,6 +3111,22 @@ $($sectionsHtml.ToString())
             ActionsSkipped = @()
         }
         
+        # --- Pre-flight: trigger scheduled task to capture post-reboot events ---
+        # After a reboot, events like 1799 (boot manager installed) only appear once the
+        # Secure-Boot-Update task runs. Trigger it now so mitigation evaluation sees current state.
+        Write-Log "INFO" "SVN Enforcement: Triggering scheduled task to capture post-reboot events"
+        $null = Trigger-SecureBootTask
+        Start-Sleep -Seconds 10
+        # Re-query events so mitigation checks see any newly-fired events (e.g. 1799 after reboot)
+        $postBootStatus = Get-CertUpdateEventStatus
+        if ($null -ne $postBootStatus -and $null -ne $postBootStatus.AllEvents) {
+            $preEventCount = if ($null -ne $CertStatus -and $null -ne $CertStatus.AllEvents) { $CertStatus.AllEvents.Count } else { 0 }
+            if ($postBootStatus.AllEvents.Count -gt $preEventCount) {
+                Write-Log "INFO" "SVN Enforcement: Post-boot event refresh found $($postBootStatus.AllEvents.Count) events (was $preEventCount)"
+                $CertStatus = $postBootStatus
+            }
+        }
+        
         # --- Pre-flight checks ---
         Write-Log "INFO" "SVN Enforcement: Evaluating current mitigation state"
         
@@ -3093,9 +3161,13 @@ $($sectionsHtml.ToString())
         else {
             Write-Log "INFO" "Mitigation 1: Applying - adding Windows UEFI CA 2023 to DB (0x40)"
             try {
-                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value 0x40
+                $currentAv1 = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty AvailableUpdates -ErrorAction SilentlyContinue)
+                if ($null -eq $currentAv1) { $currentAv1 = 0 }
+                $mergedAv1 = $currentAv1 -bor 0x40
+                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedAv1
                 $null = Trigger-SecureBootTask
-                Write-Log "SUCCESS" "Mitigation 1: Triggered DB cert update (0x40)"
+                Write-Log "SUCCESS" "Mitigation 1: Triggered DB cert update (0x$($mergedAv1.ToString('X4')))"
                 $results.Mitigation1 = 'Applied'
                 $results.ActionsApplied += 'Mitigation 1 (DB cert)'
                 $results.RebootRequired = $true
@@ -3137,35 +3209,48 @@ $($sectionsHtml.ToString())
         # required Windows UEFI CA 2023 is in db. Does NOT gate Mitigation 2.
         # -----------------------------------------------
         if ($Has2023InDb) {
-            # Determine current db cert inventory (use recheck if Mitigation 1 just ran, else use caller data)
-            $currentDbCerts = if ($recheckNames -and $recheckNames.Count -gt 0) {
-                # Merge: recheck captures what's in db now; also keep caller's original findings
-                @($DbCertsFound) + @($recheckNames) | Select-Object -Unique
-            }
-            else {
-                @($DbCertsFound)
+            # Always do a fresh db read - the caller's $DbCertsFound may have used raw byte
+            # fallback (no -Decoded) which can miss certs that are actually present
+            $suppFreshDb = Get-UefiDatabaseCerts -Name db
+            $currentDbCerts = @($suppFreshDb.Certs | Where-Object {
+                $_.Subject -match '2023'
+            } | ForEach-Object {
+                if ($_.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() }
+            })
+            if ($currentDbCerts.Count -gt $DbCertsFound.Count) {
+                Write-Log "INFO" "Supplementary certs: Fresh db read found certs missed by initial scan: $($currentDbCerts -join ', ')"
             }
             
+            # Also check events 1044/1045 - on devices without -Decoded, raw byte parsing
+            # may miss certs that are actually in db. Events are the definitive signal.
+            $has1044 = (Test-HasSecureBootEvent -CertStatus $CertStatus -EventId 1044)
+            $has1045 = (Test-HasSecureBootEvent -CertStatus $CertStatus -EventId 1045)
+            
             $optionalCerts = @(
-                @{ Name = 'Microsoft UEFI CA 2023';            Bit = 0x1000 }
-                @{ Name = 'Microsoft Option ROM UEFI CA 2023'; Bit = 0x0800 }
+                @{ Name = 'Microsoft UEFI CA 2023';            Bit = 0x1000; EventConfirmed = [bool]$has1045 }
+                @{ Name = 'Microsoft Option ROM UEFI CA 2023'; Bit = 0x0800; EventConfirmed = [bool]$has1044 }
             )
-            $missingOptional = @($optionalCerts | Where-Object { $currentDbCerts -notcontains $_.Name })
+            $missingOptional = @($optionalCerts | Where-Object { $currentDbCerts -notcontains $_.Name -and -not $_.EventConfirmed })
             
             if ($missingOptional.Count -gt 0) {
                 $combinedBits = 0
                 $missingOptional | ForEach-Object { $combinedBits = $combinedBits -bor $_.Bit }
                 $missingNames = ($missingOptional | ForEach-Object { $_.Name }) -join ', '
-                Write-Log "INFO" "Supplementary certs: Attempting best-effort install of $missingNames (0x$($combinedBits.ToString('X4')))"
+                # OR with current AvailableUpdates to preserve existing bits (e.g. 0x100 boot manager)
+                $currentAv = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
+                              Select-Object -ExpandProperty 'AvailableUpdates' -ErrorAction SilentlyContinue)
+                if ($null -eq $currentAv) { $currentAv = 0 }
+                $mergedBits = $currentAv -bor $combinedBits
+                Write-Log "INFO" "Supplementary certs: Attempting best-effort install of $missingNames (0x$($combinedBits.ToString('X4')), merged with existing 0x$($currentAv.ToString('X4')) = 0x$($mergedBits.ToString('X4')))"
                 try {
-                    $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $combinedBits
+                    $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedBits
                     $null = Trigger-SecureBootTask
-                    Write-Log "SUCCESS" "Supplementary certs: Triggered update (0x$($combinedBits.ToString('X4')))"
+                    Write-Log "SUCCESS" "Supplementary certs: Triggered update (0x$($mergedBits.ToString('X4')))"
                     $results.SupplementaryCertsAttempted = $true
                     
-                    # Short wait and verify, don't block enforcement for long
-                    Write-Log "INFO" "Supplementary certs: Waiting 30 seconds for processing"
-                    Start-Sleep -Seconds 30
+                    # Short wait and verify - don't block enforcement for long
+                    Write-Log "INFO" "Supplementary certs: Waiting 15 seconds for processing"
+                    Start-Sleep -Seconds 15
                     
                     # Re-read db to see if any appeared
                     $suppRecheck = Get-UefiDatabaseCerts -Name db
@@ -3211,9 +3296,14 @@ $($sectionsHtml.ToString())
         else {
             Write-Log "INFO" "Mitigation 2: Applying - installing 2023-signed boot manager (0x100)"
             try {
-                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value 0x100
+                # OR with current AvailableUpdates to preserve existing bits
+                $currentAv2 = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
+                               Select-Object -ExpandProperty 'AvailableUpdates' -ErrorAction SilentlyContinue)
+                if ($null -eq $currentAv2) { $currentAv2 = 0 }
+                $mergedAv2 = $currentAv2 -bor 0x100
+                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedAv2
                 $null = Trigger-SecureBootTask
-                Write-Log "SUCCESS" "Mitigation 2: Triggered boot manager update (0x100)"
+                Write-Log "SUCCESS" "Mitigation 2: Triggered boot manager update (0x$($mergedAv2.ToString('X4')))"
                 $results.Mitigation2 = 'Applied'
                 $results.ActionsApplied += 'Mitigation 2 (Boot manager)'
                 $results.RebootRequired = $true
@@ -3293,6 +3383,28 @@ $($sectionsHtml.ToString())
                 $results.ActionsSkipped += 'Mitigation 4 (SVN update)'
             }
         }
+        elseif ((-not $mit3Done -and $prereqs.Stage3BitPending) -or (-not $mit4Done -and $prereqs.Stage4BitPending)) {
+            # Bits already in manifest, just waiting for reboot - don't re-trigger
+            $pendingParts = @()
+            if (-not $mit3Done -and $prereqs.Stage3BitPending) { $pendingParts += 'Mitigation 3 (0x80)' }
+            if (-not $mit4Done -and $prereqs.Stage4BitPending) { $pendingParts += 'Mitigation 4 (0x200)' }
+            Write-Log "INFO" "Mitigation 3+4: Already pending in manifest ($($pendingParts -join ', ')) - reboot required to finalize"
+            if (-not $mit3Done) {
+                $results.Mitigation3 = 'PendingReboot'
+                $results.ActionsSkipped += 'Mitigation 3 (pending reboot)'
+            } else {
+                $results.Mitigation3 = 'AlreadyApplied'
+                $results.ActionsSkipped += 'Mitigation 3 (2011 revocation)'
+            }
+            if (-not $mit4Done) {
+                $results.Mitigation4 = 'PendingReboot'
+                $results.ActionsSkipped += 'Mitigation 4 (pending reboot)'
+            } else {
+                $results.Mitigation4 = 'AlreadyApplied'
+                $results.ActionsSkipped += 'Mitigation 4 (SVN update)'
+            }
+            $results.RebootRequired = $true
+        }
         else {
             # Determine what to apply
             if (-not $mit3Done -and -not $mit4Done) {
@@ -3311,7 +3423,15 @@ $($sectionsHtml.ToString())
             
             Write-Log "INFO" "$desc"
             try {
-                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $triggerValue
+                # OR with current AvailableUpdates to preserve existing bits
+                $currentAv34 = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
+                                Select-Object -ExpandProperty 'AvailableUpdates' -ErrorAction SilentlyContinue)
+                if ($null -eq $currentAv34) { $currentAv34 = 0 }
+                $mergedValue = $currentAv34 -bor $triggerValue
+                if ($mergedValue -ne $triggerValue) {
+                    Write-Log "INFO" "Mitigation 3+4: OR with existing 0x$($currentAv34.ToString('X4')) = 0x$($mergedValue.ToString('X4'))"
+                }
+                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedValue
                 $null = Trigger-SecureBootTask
                 Write-Log "SUCCESS" "Triggered $desc"
                 if (-not $mit3Done) {
@@ -3654,7 +3774,26 @@ process {
     else {
         Write-Log "INFO" "Skipping event log check (Secure Boot is $secureBoot)"
     }
-    
+
+    # --- Augment dbCertsFound with event 1044/1045 for devices where raw byte parsing missed optional certs ---
+    if ($null -ne $certStatus -and -not $allDbCertsPresent) {
+        $eventAugmented = $false
+        if ($dbCertsFound -notcontains 'Microsoft UEFI CA 2023' -and (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1045)) {
+            $dbCertsFound += 'Microsoft UEFI CA 2023'
+            $eventAugmented = $true
+            Write-Log "INFO" "Event 1045 confirms Microsoft UEFI CA 2023 is in db (not visible via raw parse)"
+        }
+        if ($dbCertsFound -notcontains 'Microsoft Option ROM UEFI CA 2023' -and (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1044)) {
+            $dbCertsFound += 'Microsoft Option ROM UEFI CA 2023'
+            $eventAugmented = $true
+            Write-Log "INFO" "Event 1044 confirms Microsoft Option ROM UEFI CA 2023 is in db (not visible via raw parse)"
+        }
+        if ($eventAugmented) {
+            $allDbCertsPresent = ($dbCertsFound.Count -eq $updatedDbCertNames.Count)
+            Write-Log "INFO" "Updated db cert inventory via events: $($dbCertsFound -join ', ')$(if ($allDbCertsPresent) { ' (all present)' })"
+        }
+    }
+
     # -----------------------------------------------
     # Step 2.1: Read Secure Boot servicing registry (only when Secure Boot is Enabled)
     # -----------------------------------------------
@@ -3899,7 +4038,7 @@ process {
                 Write-Log "INFO" "Event log re-queried after enforcement: $($certStatus.AllEvents.Count) event(s)"
             }
         }
-
+        
         # Re-read db certs after enforcement if supplementary certs were attempted
         # This ensures the cert inventory card reflects newly-applied optional certs
         if ($null -ne $svnEnforcementResult -and $svnEnforcementResult.SupplementaryCertsAttempted) {
@@ -4339,9 +4478,25 @@ end {
             }
             
             if ($has2023InDb) {
-                $detailRowHtml = '2023 Secure Boot certificates are present in the active<br />database (db), but the OS-side validation is stuck on 1801.<br />Windows Update should* resolve this automatically<br />before the June 2026 enforcement deadline.'
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801. Pending Windows Update validation.'
-                $statusEmoji = '⚠️'
+                # Check if firmware is actively rejecting a write (1795) alongside a missing KEK
+                $has1795 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
+                if ($has1795 -and -not $has2023InKek) {
+                    # Firmware is rejecting the KEK write - OEM BIOS update likely needed
+                    $statusKey     = 'ActionRequired'
+                    $cardIconColor = '#D9534F'
+                    $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Event 1795 detected at ' + $eventTime
+                    $oemBiosGuide = Get-OemBIOSUpdateGuide
+                    $biosGuideHtml = if ($oemBiosGuide) { '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>' } else { '' }
+                    $detailRowHtml = '2023 db certs are present, but the firmware is rejecting<br />the KEK 2K CA 2023 write (Event 1795).<br />A BIOS/firmware update from the OEM is likely required<br />to support the new KEK signing authority.' + $biosGuideHtml
+                    $plainText     = "❌ Secure Boot Enabled. Firmware rejecting KEK write (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
+                    $statusEmoji = '❌'
+                }
+                else {
+                    $detailRowHtml = '2023 Secure Boot certificates are present in the active<br />database (db), but the OS-side validation is stuck on 1801.<br />Windows Update should* resolve this automatically<br />before the June 2026 enforcement deadline.'
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801. Pending Windows Update validation.'
+                    $statusEmoji = '⚠️'
+                }
             }
             elseif ($has2023InDbDefault) {
                 # Check for Event 1803 (PK-signed KEK not available) - the definitive OEM blocker
@@ -4436,7 +4591,7 @@ end {
             }
             break
         }
-
+        
         # State 5a: Pending Cert Reboot (Event 1800 - reboot required to continue)
         ($secureBoot -eq 'Enabled' -and $certStatus.EventId -eq 1800 -and -not $postTriggerState) {
             $statusKey     = 'Pending'
@@ -4459,18 +4614,58 @@ end {
             break
         }
         
+        # State 5b-pre: All mitigations applied (1037+1042+1799 present), awaiting final 1808
+        # This device has completed all stages but 1808 hasn't fired yet (needs scheduled task run post-reboot).
+        ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Pending' -and -not $postTriggerState -and
+         $has2023InDb -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1799) -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1037) -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1042)) {
+            $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+            $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Event ' + $certStatus.EventId + ' detected at ' + $eventTime
+            $statusKey     = 'Compliant'
+            $cardIconColor = '#26A644'
+            $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant <span style="color:#F0AD4E;">(pending 1808)</span>'
+            $detailRowHtml = 'All mitigations have been applied:<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 cert in db (Stage 1)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 boot manager installed (Event 1799)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> PCA 2011 revoked in DBX (Event 1037)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> SVN applied to DBX (Event 1042)<br /><br />Awaiting Event 1808 confirmation from OS'
+            $plainText     = '✅ Secure Boot Enabled. All mitigations applied. Awaiting 1808 confirmation.'
+            $statusEmoji   = '✅'
+            break
+        }
+        
         # State 5b: Pending (Secure Boot enabled, no state events or only non-state events)
         # Sub-branches based on whether 2023 cert exists in db or dbDefault
         ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Pending' -and -not $postTriggerState) {
-            $eventRowHtml  = '<i class="fas fa-search" style="color:#F0AD4E;"></i> No certificate update events (1808/1801) found'
+            # Check if we have meaningful deployment events (1799/1800/1037/1042) vs truly no events
+            $hasDeploymentEvents = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1799) -or
+                                   (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1800) -or
+                                   (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1037) -or
+                                   (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1042)
+            $eventTime = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+            
+            if ($hasDeploymentEvents) {
+                $eventRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Event ' + $certStatus.EventId + ' detected at ' + $eventTime
+            }
+            else {
+                $eventRowHtml = '<i class="fas fa-search" style="color:#F0AD4E;"></i> No certificate update events (1808/1801) found'
+            }
             
             if ($has2023InDb) {
-                # 2023 cert already in active db but no events logged - possibly pre-installed by firmware or manually added
-                $statusKey     = 'Pending'
-                $cardIconColor = '#F0AD4E'
-                $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
-                $detailRowHtml = '2023 Secure Boot certificate is present in the active db<br />but no completion events (1808/1801) were logged.<br />Cert may have been pre-installed by firmware.<br />Awaiting Windows Update to finalize validation.'
-                $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize. Pending probable reboot.'
+                if ($hasDeploymentEvents) {
+                    # Has cert + deployment events - mitigations in progress, just not all 3 completion events yet
+                    $statusKey     = 'Pending'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $detailRowHtml = 'Secure Boot certificate update is in progress.<br />2023 cert is present in db. Deployment events logged.<br />Awaiting remaining mitigations to complete.'
+                    $plainText     = '⚠️ Secure Boot Enabled. Update in progress. Awaiting remaining mitigations.'
+                }
+                else {
+                    # Has cert but no deployment events at all - possibly pre-installed by firmware
+                    $statusKey     = 'Pending'
+                    $cardIconColor = '#F0AD4E'
+                    $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
+                    $detailRowHtml = '2023 Secure Boot certificate is present in the active db<br />but no completion events (1808/1801) were logged.<br />Cert may have been pre-installed by firmware.<br />Awaiting Windows Update to finalize validation.'
+                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize.'
+                }
             }
             elseif ($has2023InDbDefault) {
                 # 2023 cert in firmware defaults but not deployed - Windows Update or key reset can resolve
@@ -4548,7 +4743,7 @@ end {
             }
             break
         }
-
+        
         # Fallback: unexpected state combination
         default {
             $statusKey     = 'Unknown'
@@ -4562,6 +4757,8 @@ end {
     
     # Override for triggered OS update based on post-trigger state
     # Servicing registry is re-checked after trigger - if it says Updated, that's definitive.
+    # NOTE: $eventRowHtml is never overridden here - the newest-event logic (below) resolves
+    # the actual last event from the log, regardless of post-trigger state.
     if ($postTriggerState) {
         switch ($postTriggerState) {
             'Compliant' {
@@ -4571,7 +4768,6 @@ end {
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
                 $detailRowHtml = 'Triggered OS-side update.<br />2023 certificates successfully applied to BIOS firmware.'
                 $plainText     = '✅ Secure Boot Enabled. Triggered OS update; confirmed compliant. Certificates up to date.'
-                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Confirmed compliant after trigger'
                 $statusEmoji = '✅'
             }
             'Pending1808' {
@@ -4581,7 +4777,6 @@ end {
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = 'Triggered OS-side update.<br />Boot manager installed (Event 1799).<br />Update in progress - servicing will confirm when complete.'
                 $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; boot manager installed. Update in progress.'
-                $eventRowHtml  = '<i class="fas fa-cog" style="color:#F0AD4E;"></i> Boot manager installed; update in progress'
                 $statusEmoji = '⚠️'
             }
             default {
@@ -4596,14 +4791,12 @@ end {
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Cert Reboot'
                     $detailRowHtml = 'Triggered OS-side update.<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
                     $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; reboot pending (' + $sourceList + ').'
-                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Triggered - reboot pending (' + $sourceList + ')'
                 }
                 else {
                     Write-Log "INFO" "No pending reboot detected; update may still be processing"
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                     $detailRowHtml = 'Triggered OS-side update.<br />Update is processing - servicing will confirm when complete.'
                     $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; processing.'
-                    $eventRowHtml  = '<i class="fas fa-cog" style="color:#F0AD4E;"></i> Triggered - processing'
                 }
             }
         }
@@ -4646,9 +4839,10 @@ end {
     # Update "Last Event" if a newer event exists beyond the cert-state event (e.g. 1037, 1042)
     # The state machine picks the latest STATE event (1799/1800/1801/1808) for cert compliance,
     # but 1037/1042 may be more recent and should be reflected as the actual last event.
+    # Also fires when $eventRowHtml is null (e.g. post-trigger default path doesn't set it).
     if ($null -ne $certStatus -and $null -ne $certStatus.AllEvents -and $certStatus.AllEvents.Count -gt 0) {
         $newestEvent = $certStatus.AllEvents | Sort-Object Time -Descending | Select-Object -First 1
-        if ($null -ne $newestEvent -and $null -ne $certStatus.EventTime -and $newestEvent.Time -gt $certStatus.EventTime) {
+        if ($null -ne $newestEvent -and ($null -eq $eventRowHtml -or ($null -ne $certStatus.EventTime -and $newestEvent.Time -gt $certStatus.EventTime))) {
             $newestTimeStr = $newestEvent.Time.ToString('yyyy-MM-dd HH:mm')
             $newestDesc = $newestEvent.Description
             $newestColor = switch ($newestEvent.Id) {
@@ -4765,10 +4959,18 @@ end {
         $allApplied = ($manifestPending.Count -eq 0)
         $pendingReboot = ($null -ne $certStatus -and $certStatus.EventId -eq 1800)
         
-        $svnRebootForManifest = (Test-SvnRebootPending -SvnStatus $svnStatus)
+        # Only show SVN reboot in Updates section when mitigations are still pending reboot to write to DBX
+        # (RevocationAppliedPendingReboot = 1037 fired but not visible in DBX yet)
+        # NOT when firmware SVN just needs to absorb, that is shown in SVN Compliance section
+        $svnRebootForManifest = ($null -ne $svnStatus -and $svnStatus.RevocationAppliedPendingReboot)
         # Log the registry data to console (not shown on card)
         Write-Log "INFO" "Update Manifest: $avHex ($source) | Enriched meaning: $($enrichedMeaning -join '; ')"
         $cardProperties['Updates'] = Build-UpdatesSection -Format 'Html'
+    }
+    elseif ($secureBoot -eq 'Enabled') {
+        # No manifest data and no event-confirmed mitigations - still show the section
+        $chk = '<i class="fas fa-check-circle" style="color:#26A644;"></i>'
+        $cardProperties['Updates'] = "$chk No Updates Pending <span style='color:#26A644;'>(all applied)</span>"
     }
     # SVN Compliance (Get-SecureBootSVN cmdlet or raw DBX byte fallback)
     $svnWhatIsThis = '<a href="https://support.microsoft.com/en-us/topic/kb5025885-how-to-manage-the-windows-boot-manager-revocations-for-secure-boot-changes-associated-with-cve-2023-24932-41a975df-beb2-40c1-99a3-b3ff139f832d" target="_blank" rel="nofollow noopener noreferrer" style="font-size:0.75em;">What is this <i class="fas fa-question-circle" style="color:#6B7280;"></i></a>'
@@ -4825,6 +5027,10 @@ end {
         }
         if ($secureBoot -eq 'Enabled' -and ($hasRegistryManifest -or $hasEventMitigations)) {
             $localCardProperties['Updates'] = Convert-FaIconsToEmoji (Build-UpdatesSection -Format 'Html')
+        }
+        elseif ($secureBoot -eq 'Enabled') {
+            $chk = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+            $localCardProperties['Updates'] = "$chk No Updates Pending <span style='color:#26A644;'>(all applied)</span>"
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
             $localCardProperties[(Convert-FaIconsToEmoji $svnSectionTitle)] = Convert-FaIconsToEmoji (Build-SvnComplianceSection -Format 'Html')
