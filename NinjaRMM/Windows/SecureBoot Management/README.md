@@ -39,7 +39,7 @@ _Audits CA 2023 rotation state, optionally configures Windows Update opt-in or a
 
 ---
 
-## Parameter Deep-Dive
+## 🎯 Parameter Deep-Dive
 
 ### `securebootAction`
 
