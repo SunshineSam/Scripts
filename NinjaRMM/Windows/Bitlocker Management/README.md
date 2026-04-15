@@ -33,15 +33,55 @@ _Manages encryption state, rotates/stores recovery keys, and publishes a consoli
 |--------------------------------|--------------|------------------------------------------------------------------------------------|
 | **$MountPoint**                | *string[]*   | Volume letter(s) to process (e.g., C:, D:). Defaults to system volume.             |
 | **$ApplyToAllFixedDisk**       | *switch*     | If set, targets all fixed disks (ignores **$MountPoint**).                         |
-| **$BitLockerProtection**       | *dropdown*   | Desired action: Enable, Maintain, Suspend, or Disable.                             |
-| **$RecoveryKeyAction**         | *dropdown*   | Recovery key operation: Ensure, Rotate, or Remove.                                 |
-| **$BitlockerEncryptionMethod** | *dropdown*   | Encryption method: Aes128, Aes256, XtsAes128, XtsAes256 (default).                 |
+| **$BitLockerProtection**       | *dropdown*   | Desired action: Enable, Maintain, Suspend, or Disable. See [`BitLockerProtection`](#bitlockerprotection). |
+| **$RecoveryKeyAction**         | *dropdown*   | Recovery key operation: Ensure, Rotate, or Remove. See [`RecoveryKeyAction`](#recoverykeyaction). |
+| **$BitlockerEncryptionMethod** | *dropdown*   | Encryption method: Aes128, Aes256, XtsAes128, XtsAes256 (default). See [`BitlockerEncryptionMethod`](#bitlockerencryptionmethod). |
 | **$UseTpmProtector**           | *switch*     | Enforce TPM protector. Defaults to true.                                           |
 | **$UseUsedSpaceOnly**          | *switch*     | Encrypt only used space when enabling. Defaults to true.                           |
 | **$BackupToAD**                | *switch*     | Backup recovery keys to AD/AAD. Defaults to false.                                 |
 | **$SaveLogToDevice**           | *switch*     | Save logs to `C:\Logs\BitLockerManagement.log` on the device. Defaults to false.   |
 
 > **Maintain mode**: Keeps all drives in their current encryption state — does not enable, disable, suspend, or resume BitLocker. Only reconciles protectors (TPM, recovery key), generates status cards, and backs up recovery keys. Fully decrypted drives are skipped. Useful for key rotation or protector enforcement without changing drive state.
+
+### 🎯 Parameter Deep-Dive
+
+Each of the three dropdowns has clearly defined behavior and cross-parameter guardrails. The script auto-corrects incompatible combinations before any BitLocker operation runs — see [Cross-Parameter Enforcement](#cross-parameter-enforcement) below.
+
+#### `$BitLockerProtection`
+
+Controls the protection state applied to each target volume.
+
+| Value | What It Does |
+|-------|--------------|
+| **Enable** | Enables BitLocker from a fully-decrypted state, **or** resumes protection on a suspended volume. Uses `$BitlockerEncryptionMethod` and `$UseUsedSpaceOnly` when starting fresh encryption. Enforces `$UseTpmProtector` and ensures a recovery key per `$RecoveryKeyAction`. Auto-unlock is enabled for non-OS volumes when `$AutoUnlockNonOSVolumes` is true. |
+| **Maintain** | **No state changes.** Reconciles protectors (TPM, recovery key), manages auto-unlock, updates the status card, and backs up recovery keys. Fully-decrypted drives are skipped. Use this for key rotation or protector enforcement on already-encrypted fleets without touching the encryption state. |
+| **Suspend** | Suspends BitLocker for `$SuspensionRebootCount` reboots (default 1). Ensures TPM and recovery-key protectors exist first. Skips volumes currently encrypting (`EncryptionInProgress`) or already suspended. |
+| **Disable** | Fully decrypts the volume via `Disable-BitLocker`. If targeting the OS volume, auto-unlock is disabled on all data drives first (required — auto-unlock depends on the OS volume's key). **Forces** `$RecoveryKeyAction = Remove`. |
+
+> **Enable is idempotent**: running Enable on an already-encrypted volume does not re-encrypt — it just reconciles protectors and refreshes the status card. Safe to schedule on a cron.
+
+#### `$RecoveryKeyAction`
+
+Controls the `RecoveryPassword` protector lifecycle. Always evaluated against the current protector set on each volume.
+
+| Value | What It Does |
+|-------|--------------|
+| **Ensure** | Guarantees **exactly one** `RecoveryPassword` protector exists. If duplicates are found, the newest is kept and the rest are removed. If none exists, a new one is generated. If exactly one valid key is already present, this is a no-op. |
+| **Rotate** | Removes the existing `RecoveryPassword` protector and generates a new one. Requires the volume to be encrypted — **skipped on fully-decrypted volumes** (rotation without encryption is meaningless). The previous key is tracked internally to confirm the rotation actually changed the protector ID before writing to the secure field. |
+| **Remove** | Deletes the `RecoveryPassword` protector entirely. **Only permitted when the volume is fully-decrypted AND protection is off.** Blocked when `$PreventKeyPromptOnEveryBoot` is true. Forced automatically when `$BitLockerProtection = Disable`. |
+
+> **Rotate preserves continuity**: the old key stays valid in AD/AAD backup (if `$BackupToAD` is true) until the new key backup succeeds. The script never removes a key without confirming its replacement is live.
+
+#### `$BitlockerEncryptionMethod`
+
+Controls the encryption algorithm **only when starting fresh encryption** (fully-decrypted → encrypting). Ignored on resume, suspend, maintain, and disable paths — you cannot re-encrypt an existing volume with a different algorithm without fully decrypting it first.
+
+| Value | What It Does |
+|-------|--------------|
+| **Aes128** | Legacy AES-CBC 128-bit. Compatible with pre-Windows 10 v1511 systems and removable media. **Not recommended** for new fixed-disk encryption. |
+| **Aes256** | Legacy AES-CBC 256-bit. Same compatibility caveats as Aes128. **Not recommended** for new fixed-disk encryption. |
+| **XtsAes128** | XTS-AES 128-bit. Modern mode designed for disk encryption, resistant to ciphertext manipulation. Appropriate for fixed disks where performance is a concern. |
+| **XtsAes256** *(default)* | XTS-AES 256-bit. Strongest option, recommended for all modern fixed-disk encryption. |
 
 ### 🛠️ Other Optional Management Options
 
