@@ -1,9 +1,91 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 04-03-2026
+    Last Edit: 04-24-2026
     
     Note:
+    04-24-2026: Event 1803 (PK-signed KEK 2023 not available via WU) is now recognized
+                  as a state event and routed to Action Required. Previously 1803 was
+                  not in $stateEventIds, so a device with 1803 as its most recent
+                  event was not recognized as an actionable branch.
+                - Added an explicit $has2023InDb + $has1803 branch describing 1803:
+                  the PK is valid, the OEM has simply not published a
+                  PK-signed KEK 2023 update to Microsoft for WU to serve. This is
+                  NOT a firmware/PK authority issue (that is 1795). While a BIOS
+                  update COULD be the fix, OEM publication through WU is also supported.
+                  PK row stays green for 1803 (as it is a valid OEM PK).
+                - Updated the two pre-existing 1803 branches with the same reframing
+                  and corrected their event-row label to "Event 1803" instead of
+                  "Event 1801". Event-row label in the generic ActionRequired case
+                  is now dynamic (1801 or 1803 as applicable).
+    04-23-2026: Pre-rollout DBX validation notice now fires correctly when a non-SVN
+                  hash is also missing alongside the three SVN-component entries.
+                  Previous gate required $missingComponents.Count == $MissingCount,
+                  which flunked whenever a single unrelated dbxupdate.bin hash was
+                  outstanding (common on Stage 1/2 devices). New gate only checks
+                  that every SVN-component miss has no firmware SVN yet; the non-SVN
+                  hash surfaces under its own per-file row as before. Per-file
+                  "missing: BootMgr (staged X, raw firmware absent)" sub-rows are
+                  suppressed when pre-rollout so the breakdown does not contradict
+                  the reassurance notice above it.
+                - Fixed a known bug with the Get-SecureBootSVN cmdlet, which in its
+                current state, is almost entirely useless for firmware SVN readout:
+                https://github.com/PowerShell/PowerShell/issues/27058
+                  Same defect existed in Get-DbxBootMgrSVN and the firmwareSvnByGuid
+                  build (both used a lex-sort that returned the DBX-order-last entry
+                  instead of the numeric max). Replaced with explicit max-by-[version]
+                  parsing across all three SVN-keyed GUIDs (BootMgr / CdBoot / WdsMgr).
+                - Added cmdlet cross-check: when Get-SecureBootSVN returns a different
+                  FirmwareSVN than the raw-DBX max.
+                - Three-way SVN miss classification added: PendingUpdate (firmware at
+                  prior SVN, reboot will apply) vs SvnNotApplied (firmware refused to
+                  absorb after reboot - OEM BIOS update may be required) vs
+                  PartialCommit (residual asymmetric rejection). Cross-references
+                  Win32_OperatingSystem.LastBootUpTime against the latest Event
+                  1034/1042 timestamp to tell "pre-reboot" from "stuck-after-reboot".
+    04-22-2026: Major QoL update with the following improvements:
+                  - Added PK (Platform Key) parsing; PK CN and trust indicator now shown
+                    in the Certificates section.
+                  - Added VMware / VirtualBox hypervisor detection (via SignatureOwner GUID
+                    a3d5e95b-0a8f-4753-8735-445afb708f62 for VMware, Subject regex for
+                    VirtualBox). New "Virtualized" card state routes VM guests out of the
+                    Action Required / Pending ladder.
+                  - Added PKDefault / KEKDefault / dbxDefault parsing alongside existing
+                    dbDefault. When defaults are missing, a "Factory Defaults" section
+                    surfaces with short-paragraph manual-resolution guidance adapted from
+                    garlin's README_UEFI.TXT (PK+KEK enrollment, KEK-only).
+                  - Added Compare-DbxAgainstStagedBins: parses every dbx*.bin file
+                    staged by Windows servicing under
+                    C:\Windows\System32\SecureBootUpdates\ and reports which
+                    signatures the firmware has absorbed. Answers the actionable
+                    question "did the Secure-Boot-Update scheduled task commit what
+                    servicing staged?". SVN-aware: revocations already superseded
+                    by the live BootMgr / CdBoot / WdsMgr SVN, are reported as superseded
+                    instead of missing. Runs whenever Secure Boot is Enabled and DBX bytes
+                    are available.
+                  - Added Get-KekUpdateAvailability: downloads kek_update_map.json and
+                    reports whether a vendor-signed KEK 2023 update is available for the
+                    current PK thumbprint. Runs only when KEK 2023 missing + Event 1795/1803.
+                  - Added Test-BootMediaPca2023 + -DeepBootMediaScan switch. Always scans
+                    removable/optical volumes for PCA-2011-signed bootX.efi files. Card
+                    section surfaces only when outdated media is present.
+                    Plaintext SecureBootStatus field flags the count when detected.
+                  - Added Get-UefiCertSubjects consolidation helper (wraps
+                    Get-UefiDatabaseCerts with CN/hypervisor/trust post-processing plus
+                    an optional -MicrosoftOnly filter.
+                  - Stage suffix (e.g. " | Stage 3+4") now appended to the plaintext
+                    SecureBootStatus field for all non-Compliant/Disabled/NotApplicable/
+                    Virtualized states so the single-line field is self-describing.
+                  - Fixed: $enforceMissingOptIn is now re-evaluated with fresh
+                    Check-OptInStatus result after Step 2.3 so that when
+                    SecureBootAction='Enable opt-in...' transitions a device from
+                    not-opted-in to opted-in during the same run, the card and
+                    plaintext field no longer show stale "WU opt-in not enabled" warnings.
+                  - PK security branch, providing insight and remediation information for
+                    CVE-2024-8105, also known as PKFail.
+                  - Imporoved clarity, reporting details, and accuracy.
+    04-13-2026: Small, cosmetic wording fix for the event section when there is an
+                updated status, but no SecureBoot events in the event log.
     04-03-2026: Fixed an enforcement branch (stage 2) event bug incorrectly
                 missing an event check, resulting in a weird card output.
                 Fixed update section visibility in this same case.
@@ -178,7 +260,7 @@
                 Fixed inconsistent $statusKey ('Pending' vs card showing 'Action Optional').
                 Fixed trigger logic: Step 2.5 no longer re-triggers when Event 1800
                 (reboot required) or 1799 (boot manager installed) is the latest state.
-                These are in-progress states that need a reboot, not another push.
+                These are in-progress states that need a reboot.
                 Added distinct state handling for Event 1800 ("Pending Cert Reboot") and
                 Event 1799 ("Pending" with age-based reboot detection) in the state
                 switch, replacing the generic "Pending" catch-all for these events.
@@ -223,17 +305,25 @@
 
 <#
 .SYNOPSIS
-    Audits Secure Boot certificate rotation (Microsoft 2023 certs) across db,
-    KEK, and dbDefault, and reports actionable status via NinjaRMM custom fields.
-    Optionally enables or removes the Windows Update opt-in for Secure Boot management.
+    Audits Secure Boot certificate rotation (Microsoft 2023 certs) across PK, KEK,
+    db, dbx, and the full set of factory default variables (PKDefault / KEKDefault /
+    dbDefault / dbxDefault), and reports actionable status via NinjaRMM custom fields,
+    or LocalHTMLCard. Flags PKFail / CVE-2024-8105 (publicly-leaked AMI Test PK) as
+    a dedicated PK Untrusted state. Optionally enables or removes the Windows Update
+    opt-in for Secure Boot management. Also scans attached removable/optical media
+    for outdated PCA-2011-signed boot loaders, and validates the firmware DBX against
+    every dbx*.bin staging file Windows has shipped. Reporting matched / missing /
+    superseded signatures plus a three-way SVN miss classification
+    (PendingUpdate / SvnNotApplied / PartialCommit) whenever Secure Boot is Enabled.
 
 .DESCRIPTION
     Checks whether the machine supports UEFI Secure Boot, whether it is enabled,
     and (if enabled) performs a comprehensive audit:
       
       Certificate databases:
-        - Parses db (allowed signatures), KEK (key exchange keys), dbx (revocations),
-          and dbDefault (firmware defaults) for X509 certificates.
+        - Parses PK (platform root of trust), KEK (key exchange keys), db (allowed
+          signatures), dbx (revocations), and the four factory defaults (PKDefault /
+          KEKDefault / dbDefault / dbxDefault) for X509 certificates.
         - Checks for all four 2023 certificates Microsoft is rotating to:
             db:  Windows UEFI CA 2023, Microsoft UEFI CA 2023,
                  Microsoft Option ROM UEFI CA 2023
@@ -241,6 +331,49 @@
         - KEK is the trust authority that authorizes writes to db. If the 2023 KEK
           authority cert is missing, Windows Update cannot sign the payload needed
           to push new certs into db - even if UEFI attributes allow runtime writes.
+        - PK trust check: flags placeholder/example PKs (Subject match "DO NOT" or
+          "Example") as untrusted.
+        - Factory defaults check: when defaults are partially or fully missing,
+          surfaces a "Factory Defaults" card row with manual-recovery guidance.
+      
+      Virtualization awareness:
+        - Detects VMware guests via SignatureOwner GUID
+          a3d5e95b-0a8f-4753-8735-445afb708f62 in PK with an empty certificate payload.
+        - Detects VirtualBox via a Subject regex match on "VirtualBox".
+        - Virtualized guests route to a dedicated "Virtualized" card state instead
+          of the physical-host Action Required / Pending ladder.
+      
+      Local-file validation:
+        - DBX validation (any time Secure Boot is Enabled): parses every dbx*.bin
+          file staged by Windows servicing under
+          C:\Windows\System32\SecureBootUpdates\ and reports which signatures the
+          firmware has absorbed (matched / missing / superseded-by-SVN). Surfaces
+          a per-staged-file breakdown when anything is outstanding. No network.
+        - SVN-component miss classification: when any of the three SVN-keyed DBX
+          entries (BootMgr / CdBoot / WdsMgr) is outstanding, the card narrates
+          which of four states the device is in:
+            * Pre-rollout         - firmware has no SVN entries at all; reassuring
+                                    notice (expected pre-enforcement state, awaiting
+                                    Microsoft rollout June 2026 - 2027).
+            * PendingUpdate       - firmware at a prior SVN; reboot will absorb.
+            * SvnNotApplied (red) - firmware booted after the DBX write and still
+                                    refused the SVN; OEM BIOS/firmware update may
+                                    be required. Detected via LastBootUpTime >
+                                    max(Event 1034, Event 1042) timestamps.
+            * PartialCommit       - asymmetric rejection (some SVN components
+                                    absorbed, others refused).
+
+      Network-sourced validation (opt-in, bounded):
+        - KEK update availability (KEK 2023 missing + Event 1795/1803 only): downloads
+          https://raw.githubusercontent.com/microsoft/secureboot_objects/main/PostSignedObjects/KEK/kek_update_map.json
+          and reports whether a vendor-signed KEK update is available for the current
+          PK thumbprint. Network failures are logged but never break the card.
+      
+      Boot media scan (runs every execution):
+        - Enumerates removable + CD-ROM volumes and inspects EFI\boot\bootX.efi files
+          for PCA-2011 issuer signatures. Emits a card row only when outdated media
+          is detected. Deep WIM scanning is opt-in via -DeepBootMediaScan.
+        - Reference: https://support.microsoft.com/en-us/topic/updating-windows-bootable-media-to-use-the-pca2023-signed-boot-manager-d4064779-0e4e-43ac-b2ce-24f434fcfa0f
       
       UEFI variable attributes (passive, read-only):
         - Uses GetFirmwareEnvironmentVariableExA (P/Invoke) with
@@ -269,7 +402,7 @@
         - OEM manufacturer, model, firmware version/date
       
       AvailableUpdates bitmask decoding:
-        - Decodes each bit into human-readable pending update descriptions
+        - Decodes each bit into pending update descriptions
         - Reads both AvailableUpdates (volatile) and AvailableUpdatesPolicy (GPO/MDM persistent)
         - Detects HighConfidenceOptOut (auto-deployment opt-out flag)
       
@@ -290,9 +423,19 @@
     Outputs an HTML status card and a searchable plain-text summary to NinjaRMM
     custom fields (or local files via -SaveStatusLocal).
     
-    The eight possible output states are:
+    The ten possible output states are:
       1. Not Applicable         - Non-UEFI or unsupported hardware
       2. Disabled               - UEFI capable but Secure Boot is off
+      2b. Virtualized           - VMware / VirtualBox guest; Secure Boot cert rotation is
+                                  hypervisor-managed (not guest-OS controlled)
+      2c. PK Untrusted          - Platform Key is a publicly-known placeholder (PKFail /
+                                  CVE-2024-8105 AMI Test PK, or a generic "DO NOT" / "Example"
+                                  cert). Chain of trust is broken; a dedicated red "PK Security
+                                  Alert" card section surfaces a three-tier fix ladder
+                                  (OEM BIOS update -> CERT/CC PKFail script -> BitLocker
+                                  suspend-first). Overrides Compliant / Pending / Action
+                                  Required (structural cert presence is moot when any party
+                                  can sign KEK/db/dbx updates with the leaked private key).
       3. Compliant              - Secure Boot on, Event 1808 or UEFICA2023Status='Updated'
                                   confirmed (BIOS certs updated)
       4. Action Required        - 2023 certs missing and Windows cannot write to the BIOS db
@@ -307,6 +450,14 @@
                                   OS update triggered where applicable
       8. Pending (Trigger)      - OS-side update triggered; monitoring for event progression,
                                   with reboot detection if stalled
+
+    SVN sub-state overlays (can decorate any of the above when Secure Boot is Enabled):
+      - (Pending SVN Update)     amber - firmware at a prior SVN, 1-2 components missing
+                                 the next increment; reboot will absorb.
+      - (SVN Update Not Applied) red   - firmware booted after the DBX write and still
+                                 refused the SVN; OEM BIOS/firmware update may be required.
+      - (Pending SVN Reboot)     amber - all three SVN components still missing and
+                                 firmware has not booted past the DBX write yet.
 
 .PARAMETER StatusCardFieldName
     NinjaRMM WYSIWYG custom field name for the HTML status card.
@@ -371,6 +522,15 @@
 .PARAMETER IncludeDefaultHive
     Switch: Include the Default user profile template (C:\Users\Default) when applying
     per-user telemetry keys. Only effective when running as SYSTEM. Default: $false.
+
+.PARAMETER DeepBootMediaScan
+    Switch: Expands the boot-media scan (Test-BootMediaPca2023) to inspect WIM images
+    inside removable / optical recovery media, rather than the expected location
+    \EFI\boot\boot*.efi files. Useful when a USB install stick still carries a
+    2011-signed bootmgr inside sources\boot.wim or sources\install.{wim,esd,swm}.
+    Such media will fail to boot once PCA 2011 is revoked in DBX. Disabled by
+    default because WIM mounting is slow and requires DISM / Get-WindowsImage.
+    Ninja Script Variable: deepBootMediaScan (Checkbox). Default: $false.
 #>
 
 [CmdletBinding()]
@@ -393,6 +553,10 @@ param(
     # "Passive" = audit only; report current stage; wait for Microsoft's scheduled enforcement (Step 3, June 2026 - Step 4, 2027)
     [ValidateSet('Enforce SVN','Passive')]
     [string]$EnforceSvnCompliance = $(if ($env:enforceSvnCompliance) { $env:enforceSvnCompliance } else { 'Passive' }), # Optional Ninja Script Variable; Drop-down
+    
+    # Boot media deep scan: enumerate WIM images inside USB/recovery media for 2011-signed bootmgr
+    # Off by default (surface-level EFI file check is fast; WIM scanning requires DISM and is slow)
+    [switch]$DeepBootMediaScan = $(if ($env:deepBootMediaScan) { [Convert]::ToBoolean($env:deepBootMediaScan) } else { $false }),
     
     # Card customization options
     [string]$CardTitle              = "Secure Boot",        # Default title
@@ -508,6 +672,8 @@ begin {
     --muted: #6b7280;
     --border: #e5e7eb;
     --link: #447dcd;
+    --alert-bg: #FDECEA;
+    --alert-text: #272727;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -517,6 +683,8 @@ begin {
       --muted: #9ca3af;
       --border: #4a4a4a;
       --link: #447dcd;
+      --alert-bg: #3a1518;
+      --alert-text: #e5e7eb;
     }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -831,6 +999,37 @@ $($sectionsHtml.ToString())
     function Build-CertInventorySection {
         param ([string]$Format)
         $lines = @()
+        # Platform Key (root of trust) - new in 2026 rev
+        if ($pkCerts.Count -gt 0) {
+            $pkCn = if ($null -ne $pkSubject) {
+                # Extract CN=... value
+                $m = [regex]::Match($pkSubject, '(?i)CN=([^,]+)')
+                if ($m.Success) { $m.Groups[1].Value.Trim() } else { $pkSubject }
+            } else { 'Unknown' }
+            if (-not $pkIsTrusted) {
+                $pkIcon = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
+                if ($pkSubject -match '(?i)(AMI|DO NOT TRUST)') {
+                    $lines += "$pkIcon PK: $pkCn <span style='color:#D9534F;'>(AMI test PK - PKFail / CVE-2024-8105)</span>"
+                }
+                else {
+                    $lines += "$pkIcon PK: $pkCn <span style='color:#D9534F;'>(untrusted placeholder cert)</span>"
+                }
+            }
+            elseif ($pkBlockingKek) {
+                # PK is legitimate (OEM cert) but firmware refuses the KEK 2K CA 2023 write (Event 1795)
+                # The OEM PK lacks the authority chain needed to authorize the new KEK - OEM BIOS update required
+                $pkIcon = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $lines += "$pkIcon PK: $pkCn <span style='color:#D9534F;'>(does not authorize/sign KEK 2K CA 2023)</span>"
+            }
+            elseif ($null -ne $hypervisor) {
+                $pkIcon = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
+                $lines += "$pkIcon PK: $pkCn <span style='color:#888;'>($hypervisor-managed)</span>"
+            }
+            else {
+                $pkIcon = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "$pkIcon PK: $pkCn"
+            }
+        }
         foreach ($certName in $updatedDbCertNames) {
             $present = $dbCertsFound -contains $certName
             $label   = $certName
@@ -875,6 +1074,105 @@ $($sectionsHtml.ToString())
                     $rIcon = Format-CardIcon -Type 'ban' -Color '#F59E0B' -Format $Format
                     $lines += "$rIcon $rLabel <span style='color:#888;'>(revoked in dbx)</span>"
                 }
+            }
+        }
+        return Join-CardLines -Lines $lines -Format $Format
+    }
+    
+    # Helper function: Build PK Security Alert section (PKFail / CVE-2024-8105)
+    # Only rendered when $statusKey is 'PKUntrusted'. Red-tinted div with a two-<details>
+    # structure (collapsed "Why is this critical?" + expanded "How to fix?") and a
+    # References footer. Uses Format-CardIcon for the header icon so the Local (emoji)
+    # output stays 1:1 with the Html (FontAwesome) output. The body is format-agnostic
+    # HTML that renders identically in both targets.
+    function Build-PkSecurityAlertSection {
+        param ([string]$Format)
+        $cveUrl      = 'https://nvd.nist.gov/vuln/detail/CVE-2024-8105'
+        $certccUrl   = 'https://github.com/CERTCC/PKfail/'
+        $msDocsUrl   = 'https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-secure-boot-key-creation-and-management-guidance?view=windows-11'
+        $msOemPkUrl  = 'https://go.microsoft.com/fwlink/?linkid=2255361'
+        $arsRundown  = 'https://arstechnica.com/security/2024/07/secure-boot-is-completely-compromised-on-200-models-from-5-big-device-makers'
+        $oemBiosGuide = Get-OemBIOSUpdateGuide
+        $oemGuideLine = if ($oemBiosGuide) {
+            '<a href="' + $oemBiosGuide + '" target="_blank" rel="nofollow noopener noreferrer">OEM BIOS/Firmware Update Guide</a>'
+        } else { 'Check the OEM support site for the latest BIOS/firmware.' }
+        $pkSubjectSafe = [System.Net.WebUtility]::HtmlEncode($pkSubject)
+        $headerIcon = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+        
+        # Theme-aware alert colors via CSS custom properties with hard-coded fallbacks:
+        #   Local (light mode): --alert-bg = #FDECEA, --alert-text = #272727 (matches Ninja's look)
+        #   Local (dark mode):  --alert-bg = #3a1518 (desaturated dark red), --alert-text = #e5e7eb
+        #   Ninja (Html path):  neither var is defined, so the fallback after the comma applies
+        #                       and the existing light-pink look is preserved.
+        # max-width:767px caps line length on wide monitors so paragraphs wrap at a comfortable
+        # reading width (~85 chars) instead of sprawling across 1500px+ of card real estate.
+        return '<div style="border-left:3px solid #D9534F;padding:6px 10px;background:var(--alert-bg,#FDECEA);color:var(--alert-text,#272727);max-width:767px;">' +
+            $headerIcon + ' <b style="color:#D9534F;">PKFail / CVE-2024-8105</b><br />' +
+            'PK subject: <code>' + $pkSubjectSafe + '</code><br /><br />' +
+            '<details><summary style="cursor:pointer;"><b>Why is this critical?</b></summary>' +
+            '<div style="margin-top:6px;">' +
+            '<b>What the AMI Test PK is.</b> A placeholder Platform Key shipped in AMI Aptio V ' +
+            'reference firmware. The private key leaked publicly in 2024. Any party can sign ' +
+            'KEK/db/dbx updates that the firmware accepts as authoritative.<br /><br />' +
+            '<b>Why "Compliant" would be misleading.</b> Even with the 2023 certs physically present ' +
+            'in db, a threat actor could re-enroll a rogue KEK, and then add their own db ' +
+            'entries, bypassing Microsoft''s revocations. Compliance is good on paper, ' +
+            'but considered un-safe in the real world.<br /><br />' +
+            '<b>The rundown:</b> ' +
+            '<a href="' + $arsRundown + '" target="_blank" rel="nofollow noopener noreferrer">Ars Technica: Secure Boot is completely compromised on 200 models from 5 big device makers</a>.' +
+            '</div></details>' +
+            '<details open><summary style="cursor:pointer;"><b>How to fix?</b></summary>' +
+            '<div style="margin-top:6px;">' +
+            '<b>1. Permanent (strongly preferred):</b> request a BIOS/firmware update from the ' +
+            'OEM that ships a legitimate (OEM-managed) PK from factory.<br />' +
+            '&nbsp;&nbsp;' + $oemGuideLine + '<br /><br />' +
+            '<b>2. Temporary mitigation:</b> the ' +
+            '<a href="' + $certccUrl + '" target="_blank" rel="nofollow noopener noreferrer">CERT/CC PKFail script</a> ' +
+            'uses the known AMI private key to re-sign and enroll ' +
+            '<a href="' + $msOemPkUrl + '" target="_blank" rel="nofollow noopener noreferrer">Microsoft''s Windows OEM Devices PK</a>. ' +
+            'Enrollment is not persistent across firmware resets on all devices.<br /><br />' +
+            '<b>3. Before either approach:</b> suspend BitLocker on every protected volume. ' +
+            'Replacing the PK can invalidate TPM-sealed recovery keys.' +
+            '</div></details>' +
+            '<div style="margin-top:8px;font-size:0.9em;">' +
+            'References: <br />' +
+            '&nbsp;&nbsp;&bull; <a href="' + $cveUrl + '" target="_blank" rel="nofollow noopener noreferrer">CVE-2024-8105</a><br />' +
+            '&nbsp;&nbsp;&bull; <a href="' + $certccUrl + '" target="_blank" rel="nofollow noopener noreferrer">CERT/CC PKfail</a><br />' +
+            '&nbsp;&nbsp;&bull; <a href="' + $msDocsUrl + '" target="_blank" rel="nofollow noopener noreferrer">Microsoft Secure Boot key guidance</a><br />' +
+            '&nbsp;&nbsp;&bull; <a href="' + $arsRundown + '" target="_blank" rel="nofollow noopener noreferrer">Ars Technica rundown</a>' +
+            '</div>' +
+            '</div>'
+    }
+    
+    # Helper function: Build factory defaults section (shown only when defaults are missing)
+    # References garlin's README_UEFI.TXT for manual-recovery guidance.
+    function Build-FactoryDefaultsSection {
+        param ([string]$Format)
+        $lines = @()
+        $order = 'PKDefault','KEKDefault','dbDefault','dbxDefault'
+        foreach ($n in $order) {
+            if ($defaultsPresent[$n]) {
+                $ic = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "$ic ${n}: present"
+            }
+            else {
+                $ic = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $lines += "$ic ${n}: missing"
+            }
+        }
+        if ($defaultsAllMissing) {
+            $warn = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
+            $lines += "<span style='color:#D9534F;'>$warn All UEFI default databases are missing - BIOS 'Reset Secure Boot keys' option will not function.</span>"
+            # Manual resolution (adapted from garlin's README_UEFI.TXT - PK + KEK enrollment)
+            $lines += "<details><summary style='cursor:pointer;'>Manual resolution</summary><div style='margin-left:1em; font-size:0.9em;'>Shut down and enter the UEFI Secure Boot menu. Under <i>PK Options</i> (or <i>Key Management &rarr; PK Management</i>), enroll <code>\EFI\Certs\WindowsOEMDevicesPK.der</code> from the EFI partition. Under <i>KEK Options</i> (or <i>Key Management &rarr; KEK Management &rarr; Append Key</i>), enroll <code>\EFI\Updates\Microsoft Corporation KEK 2K CA 2023.der</code>. Save, exit, boot Windows, and re-run this script.<br /><br />If your OEM BIOS does not expose these menus, an OEM firmware update is required.</div></details>"
+        }
+        elseif ($defaultsSomeMissing) {
+            $missing = $order | Where-Object { -not $defaultsPresent[$_] }
+            $info = Format-CardIcon -Type 'info' -Color '#F0AD4E' -Format $Format
+            $lines += "<span style='color:#F0AD4E;'>$info Partial defaults: $($missing -join ', ') missing.</span>"
+            # KEK-only manual resolution (adapted from garlin's README_UEFI.TXT )
+            if ($missing -contains 'KEKDefault' -and $missing -notcontains 'PKDefault') {
+                $lines += "<details><summary style='cursor:pointer;'>Manual KEK resolution</summary><div style='margin-left:1em; font-size:0.9em;'>Shut down and enter the UEFI Secure Boot menu. Under <i>KEK Options</i> (or <i>Key Management &rarr; KEK Management &rarr; Append Key</i>), enroll <code>\EFI\Certs\Microsoft Corporation KEK 2K CA 2023.der</code> (fall back to <code>.crt</code> if the <code>.der</code> errors). Save, exit, boot Windows, and re-run this script.</div></details>"
             }
         }
         return Join-CardLines -Lines $lines -Format $Format
@@ -963,9 +1261,13 @@ $($sectionsHtml.ToString())
     function Build-EnforcementMitigationLines {
         param (
             [string]$Format,
-            [hashtable]$EnfResult,         # The enforcement result hashtable
-            [bool]$SvnRebootPending,       # Whether SVN reboot is pending (firmware SVN mismatch)
-            [bool]$RevocationRebootPending # Whether revocation is pending reboot (1037 fired but not yet in DBX)
+            [hashtable]$EnfResult,          # The enforcement result hashtable
+            [bool]$SvnRebootPending,        # Whether SVN reboot is pending (firmware SVN mismatch)
+            [bool]$RevocationRebootPending, # Whether revocation is pending reboot (1037 fired but not yet in DBX)
+            [bool]$SvnPendingUpdate = $false,           # Whether it's a benign component-level bump (firmware at prior SVN)
+            [string[]]$SvnPendingUpdateComponents = @(),# Which boot-components are pending (BootMgr/CdBoot/WdsMgr)
+            [bool]$SvnNotApplied = $false,              # Whether firmware refused to absorb after reboot (stuck state)
+            [string[]]$SvnNotAppliedComponents = @()    # Which boot-components were not applied (BootMgr/CdBoot/WdsMgr)
         )
         $mitigations = @(
             @{ Key = 'Mitigation1'; Label = 'Windows CA2023' }
@@ -994,14 +1296,28 @@ $($sectionsHtml.ToString())
                 'Failed'         { Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format }
                 default          { Format-CardIcon -Type 'circle' -Color '#6B7280' -Format $Format }
             }
+            # Mitigation 4 row wording has three tiers, most-specific first:
+            #   * SvnNotApplied   -> RED "Not applied (X) - firmware refused after reboot"
+            #   * SvnPendingUpdate -> BLUE "Pending SVN update (X)" (benign bump)
+            #   * else             -> BLUE "Pending SVN reboot" (generic fallback)
+            # Mitigation 3's revocation-reboot wording stays as-is (different signal).
+            $mit4NotApplied    = ($m.Key -eq 'Mitigation4' -and $SvnNotApplied -and $mit4SvnReboot)
+            $mit4PendingUpdate = ($m.Key -eq 'Mitigation4' -and $SvnPendingUpdate -and $mit4SvnReboot)
+            $svnPendingLabel = if ($mit4NotApplied -and $SvnNotAppliedComponents.Count -gt 0) {
+                "<span style='color:#D9534F;'>Not applied (" + ($SvnNotAppliedComponents -join ', ') + ') - firmware refused after reboot</span>'
+            } elseif ($mit4PendingUpdate -and $SvnPendingUpdateComponents.Count -gt 0) {
+                "<span style='color:#3B82F6;'>Pending SVN update (" + ($SvnPendingUpdateComponents -join ', ') + ')</span>'
+            } else {
+                "<span style='color:#3B82F6;'>Pending SVN reboot</span>"
+            }
             $stateLabel = switch ($state) {
                 'AlreadyApplied' {
-                    if ($mit34SvnReboot) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
+                    if ($mit34SvnReboot) { $svnPendingLabel }
                     else { 'Complete' }
                 }
                 'Applied' {
                     if ($mit12RebootPending) { "<span style='color:#3B82F6;'>Reboot pending</span>" }
-                    elseif ($mit34SvnReboot) { "<span style='color:#3B82F6;'>Pending SVN reboot</span>" }
+                    elseif ($mit34SvnReboot) { $svnPendingLabel }
                     else { 'Applied' }
                 }
                 'Blocked' {
@@ -1024,9 +1340,79 @@ $($sectionsHtml.ToString())
     function Build-SvnComplianceSection {
         param ([string]$Format)
         # Status icon and label
+        # Three-way split of "1-2 of 3 SVN components missing from DBX":
+        #
+        #   * Benign pending update (the common case): every missing component has a
+        #     PRIOR firmware SVN (FirmwareSvn populated and < RequiredSvn). The
+        #     absorb mechanism proved working last round; firmware is just waiting
+        #     for the next boot-time apply of the next increment. This is now
+        #     distinguishable reliably thanks to the raw-DBX max-SVN fix (see
+        #     Get-DbxBootMgrSVN / PowerShell#27058) - pre-fix the cmdlet's order-
+        #     dependent FirmwareSVN made "prior SVN" unreliable. Label:
+        #     "Pending SVN Update".
+        #
+        #   * True partial-commit rejection: at least one missing component has
+        #     no firmware SVN at all while others have advanced. Firmware is
+        #     selectively refusing to absorb. Reboot will not resolve - needs a
+        #     BIOS update or OEM escalation. Label: "Firmware partial-commit
+        #     rejected".
+        #
+        # "All three missing" is handled by the lower branches (RebootPending /
+        # RevocationPending) because that's the pre-reboot or pre-rollout pattern,
+        # not component-asymmetric.
+        # Read the pre-computed pending-update / not-applied classification from
+        # $svnStatus - decorated by the early DBX validation pass in the outer scope
+        # using Event 1034/1042 + lastBootTime to distinguish pre-reboot bumps from
+        # firmware-had-its-chance refusals. Partial-commit is still computed locally
+        # since it's not surfaced on $svnStatus (it's the residual asymmetric case).
+        $svnNotApplied      = ($null -ne $svnStatus.SvnNotApplied -and $svnStatus.SvnNotApplied)
+        $svnNotAppliedComps = @($svnStatus.SvnNotAppliedComponents)
+        $svnPendingUpdate   = ($null -ne $svnStatus.PendingUpdate -and $svnStatus.PendingUpdate)
+        $svnPendingNames    = @($svnStatus.PendingUpdateComponents)
+        $svnPartialCommit   = $false
+        $svnPartialNames    = @()
+        if ($null -ne $dbxValidationResult -and $dbxValidationResult.Succeeded) {
+            $svnMissing = @($dbxValidationResult.MissingComponents)
+            if ($svnMissing.Count -gt 0 -and $svnMissing.Count -lt 3) {
+                $allHavePriorSvn = $true
+                foreach ($m in $svnMissing) {
+                    if ([string]::IsNullOrWhiteSpace([string]$m.FirmwareSvn)) {
+                        $allHavePriorSvn = $false
+                        break
+                    }
+                }
+                if (-not $allHavePriorSvn) {
+                    $svnPartialCommit = $true
+                    $svnPartialNames  = @($svnMissing | ForEach-Object { $_.Component })
+                }
+            }
+        }
+        
         if ($svnStatus.IsCompliant) {
             $svnIcon  = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
             $svnLabel = $svnStatus.ComplianceStatus
+        }
+        elseif ($svnNotApplied) {
+            # Firmware had its chance and refused - reboot already happened since
+            # the scheduled task's DBX write (Event 1034/1042 predates lastBootTime).
+            # This is a firmware-level refusal. Must come before PendingUpdate/RebootPending
+            # since those would mask it.
+            $svnIcon  = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
+            $compList = $svnNotAppliedComps -join ', '
+            $svnLabel = "SVN Update Not Applied ($compList) <span style='color:#888;'>(OEM escalation may be required)</span>"
+        }
+        elseif ($svnPartialCommit) {
+            $svnIcon  = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
+            $compList = $svnPartialNames -join ', '
+            $svnLabel = "Firmware partial-commit: $compList SVN rejected <span style='color:#888;'>(reboot will not resolve - BIOS update or OEM escalation)</span>"
+        }
+        elseif ($svnPendingUpdate) {
+            # Benign bump-pending state. Must come before the generic RebootPending
+            # branch because it names the specific component(s) awaiting the apply,
+            # which is strictly more informative than "SVN update not yet applied".
+            $svnIcon  = Format-CardIcon -Type 'sync' -Color '#F59E0B' -Format $Format
+            $compList = $svnPendingNames -join ', '
+            $svnLabel = "Pending SVN Update ($compList) <span style='color:#888;'>(firmware at prior SVN, reboot should apply)</span>"
         }
         elseif ($svnStatus.RebootPending) {
             $svnIcon  = Format-CardIcon -Type 'sync' -Color '#F59E0B' -Format $Format
@@ -1097,7 +1483,7 @@ $($sectionsHtml.ToString())
         $parts += '<b>SVN Enforcement</b>'
         if ($null -ne $svnEnforcementResult) {
             # Active enforcement just ran - use its results
-            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $svnEnforcementResult -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot -SvnPendingUpdate $svnPendingUpdate -SvnPendingUpdateComponents $svnPendingNames -SvnNotApplied $svnNotApplied -SvnNotAppliedComponents $svnNotAppliedComps
         }
         else {
             # Build ground-truth status from available signals
@@ -1134,9 +1520,170 @@ $($sectionsHtml.ToString())
                 Mitigation4BlockedReason = $null
                 RebootRequired          = $rebootPending
             }
-            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $groundTruth -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot
+            $parts += Build-EnforcementMitigationLines -Format $Format -EnfResult $groundTruth -SvnRebootPending $enfSvnReboot -RevocationRebootPending $enfRevocReboot -SvnPendingUpdate $svnPendingUpdate -SvnPendingUpdateComponents $svnPendingNames -SvnNotApplied $svnNotApplied -SvnNotAppliedComponents $svnNotAppliedComps
         }
         return Join-CardLines -Lines $parts -Format $Format
+    }
+    
+    # Helper function: Build DBX validation section (firmware DBX vs staged DBX .bin files).
+    # Answers the actionable question "did the Secure-Boot-Update scheduled task commit
+    # what Windows servicing staged?" Takes the pre-computed Compare-DbxAgainstStagedBins
+    # result so the Html (Ninja) and Local paths share one source of truth.
+    function Build-DbxValidationSection {
+        param (
+            [string]$Format,
+            $Result              # The Compare-DbxAgainstStagedBins result object (must have .Succeeded)
+        )
+        if ($null -eq $Result -or -not $Result.Succeeded) { return $null }
+        
+        $fileCount = [int]$Result.FilesScanned
+        $fileWord  = if ($fileCount -eq 1) { 'file' } else { 'files' }
+        $supCount  = [int]$Result.SupersededCount
+        $supSuffix = if ($supCount -gt 0) { " <span style='color:#888;'>(+ $supCount superseded by SVN)</span>" } else { '' }
+        
+        # All-clean path: scheduled task has committed every staged signature (or live SVN
+        # supersedes the rest). Green check only; no breakdown needed.
+        if ($Result.MissingCount -eq 0) {
+            $chk = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+            return "$chk Staged DBX fully applied ($($Result.MatchedCount) matched across $fileCount $fileWord)$supSuffix"
+        }
+        
+        # Gap path: headline count + per-file breakdown so operators see which staged .bin
+        # didn't land. Per-file counts are informational - the authoritative MissingCount
+        # is already de-duplicated across files, so per-file tallies may sum higher.
+        $warn = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
+        $headline = "<span style='color:#F0AD4E;'>$warn $($Result.MissingCount) of $($Result.RequiredCount) staged DBX signatures not yet applied</span>$supSuffix"
+        
+        # SVN-component callout: when any of the three boot-component SVN entries (BootMgr /
+        # CdBoot / WdsMgr) didn't absorb, surface them directly below the headline so the
+        # staged-vs-firmware SVN pair is visible without expanding the per-file breakdown.
+        # The SVN Compliance card section classifies which state this represents:
+        #   * All 3 missing, firmware has no prior SVN      -> pre-rollout (Stage 1/2)
+        #   * All 3 missing, firmware has prior SVN entries -> pre-reboot (Stage 3/4 bump)
+        #   * 1-2 missing, every missing has prior SVN      -> benign pending SVN update
+        #   * 1-2 missing, at least one missing is absent   -> true partial-commit rejection
+        # The callout itself stays neutral ("staged X, raw firmware Y") - it's the factual
+        # pair that lets the reader reconcile with the card-level label above.
+        #
+        # Pre-rollout reassurance: on Stage 1/2 devices firmware has zero SVN entries,
+        # so every SVN-component sig (typically 3 across DBXUpdateSVN.bin +
+        # DBXUpdateSVNLegacy.bin) shows as missing even though nothing is wrong -
+        # Microsoft simply hasn't pushed the revocation yet (rollout: June 2026 - 2027).
+        # Detect this specific pattern (every missing SVN component has no firmware SVN)
+        # and swap the alarming per-component callout for a single reassuring notice so
+        # operators don't chase it. Non-SVN hash misses (if any) are independent and
+        # still surface under their own per-file row as "N/M matched, X missing" - the
+        # gate used to also require $missingComponents.Count == $MissingCount, which
+        # incorrectly dropped the pre-rollout reassurance whenever even a single
+        # unrelated hash sig was missing alongside the SVN entries.
+        $componentCallout = ''
+        $missingComponents = @($Result.MissingComponents)
+        $isPreRollout = $false
+        if ($missingComponents.Count -gt 0) {
+            $noFirmwareSvnAtAll = (@($missingComponents | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.FirmwareSvn) }).Count -eq 0)
+            $isPreRollout       = $noFirmwareSvnAtAll
+            
+            if ($isPreRollout) {
+                $infoIcon = Format-CardIcon -Type 'info' -Color '#3B82F6' -Format $Format
+                $compNames = @($missingComponents | ForEach-Object { $_.Component }) -join ' / '
+                # padding-left:24px aligns the notice text under the <details> disclosure
+                # triangle below, matching the visual layout of the component callout.
+                $componentCallout =
+                    "<div style='padding-left:24px;margin-top:4px;font-size:0.90em;color:#888;'>" +
+                    "$infoIcon These are SVN firmware revocations ($compNames). <br />" +
+                    "Firmware has not yet applied any SVN entries. Expected pre-rollout state. <br />" +
+                    "Awaiting Microsoft enforcement (June 2026 - 2027)." +
+                    '</div>'
+            }
+            else {
+                $compLines = New-Object System.Collections.Generic.List[string]
+                foreach ($mc in $missingComponents) {
+                    $comp = [System.Net.WebUtility]::HtmlEncode([string]$mc.Component)
+                    $req  = if ([string]::IsNullOrWhiteSpace([string]$mc.RequiredSvn)) { 'n/a' } else { [string]$mc.RequiredSvn }
+                    $fw   = if ([string]::IsNullOrWhiteSpace([string]$mc.FirmwareSvn)) { 'absent' } else { [string]$mc.FirmwareSvn }
+                    $compLines.Add("<b>$comp SVN</b>: staged <b>$req</b>, raw firmware <b>$fw</b>") | Out-Null
+                }
+                # padding-left matches the <details> wrapper below (also 24px) so the callout
+                # text sits directly beneath the disclosure triangle.
+                $componentCallout = "<div style='padding-left:24px;margin-top:4px;font-size:0.95em;'>" + (($compLines) -join '<br />') + '</div>'
+            }
+        }
+        
+        $perFile = @($Result.PerFile)
+        if ($perFile.Count -eq 0) {
+            $lines = @($headline)
+            if ($componentCallout) { $lines += $componentCallout }
+            return Join-CardLines -Lines $lines -Format $Format
+        }
+        
+        $rowsHtml = New-Object System.Collections.Generic.List[string]
+        foreach ($pf in $perFile) {
+            $name = [System.Net.WebUtility]::HtmlEncode([string]$pf.Name)
+            $req  = [int]$pf.Required
+            $mat  = [int]$pf.Matched
+            $mis  = [int]$pf.Missing
+            $sup  = [int]$pf.Superseded
+            $supPart = if ($sup -gt 0) { ", $sup superseded" } else { '' }
+            $rowsHtml.Add("&nbsp;&nbsp;&bull; <b>$name</b>: $mat/$req matched, $mis missing$supPart") | Out-Null
+            # Per-file sub-rows naming each missing SVN component. Skip hash-only .bin files
+            # (dbxupdate.bin etc.) - their missing entries are already tallied in the count,
+            # and hash-level detail isn't actionable at the card level.
+            $md = @($pf.MissingDetails)
+            foreach ($m in $md) {
+                if ([string]::IsNullOrWhiteSpace([string]$m.Component)) { continue }
+                # Pre-rollout: suppress the alarming "staged X, raw firmware absent" sub-rows.
+                # The reassuring callout above already explains every SVN-component miss as
+                # expected pre-enforcement state; the raw sub-rows would contradict it.
+                if ($isPreRollout) { continue }
+                $comp = [System.Net.WebUtility]::HtmlEncode([string]$m.Component)
+                $r    = if ([string]::IsNullOrWhiteSpace([string]$m.RequiredSvn)) { 'n/a' } else { [string]$m.RequiredSvn }
+                $f    = if ([string]::IsNullOrWhiteSpace([string]$m.FirmwareSvn)) { 'absent' } else { [string]$m.FirmwareSvn }
+                $rowsHtml.Add("&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- missing: <b>$comp</b> (staged $r, raw firmware $f)") | Out-Null
+            }
+        }
+        
+        $detailsInner = "<div style='margin-top:6px;'>" + (($rowsHtml) -join '<br />') + '</div>'
+        # Ninja strips inline styles on <details>/<summary> but honors them on <div>. Wrap the
+        # whole disclosure element in a padded div so the triangle + summary + expanded rows
+        # all shift together, visually nesting under the headline.
+        $details = "<div style='padding-left:24px;'><details><summary style='cursor:pointer;'>Breakdown by staged file</summary>$detailsInner</details></div>"
+        
+        $lines = @($headline)
+        if ($componentCallout) { $lines += $componentCallout }
+        $lines += $details
+        return Join-CardLines -Lines $lines -Format $Format
+    }
+    
+    # Helper function: Build boot media section (outdated PCA-2011-signed bootable USB/CD).
+    # Takes the pre-computed Test-BootMediaPca2023 result so the scan runs once per execution
+    # and the Html (Ninja) and Local paths share one rendering.
+    function Build-BootMediaSection {
+        param (
+            [string]$Format,
+            $Result              # The Test-BootMediaPca2023 result (must have .Outdated collection)
+        )
+        if ($null -eq $Result -or $Result.Outdated.Count -eq 0) { return $null }
+        $warn = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
+        $kbLink = '<a href="https://support.microsoft.com/en-us/topic/updating-windows-bootable-media-to-use-the-pca2023-signed-boot-manager-d4064779-0e4e-43ac-b2ce-24f434fcfa0f" target="_blank" rel="nofollow noopener noreferrer">MS KB: Updating bootable media</a>'
+        $mLines = @("<span style='color:#D9534F;'>$warn Outdated (PCA 2011-signed) boot media detected:</span>")
+        foreach ($item in $Result.Outdated) {
+            $mLines += "&nbsp;&nbsp;&bull; $($item.Drive)\$($item.File) - $($item.SignedBy)"
+        }
+        $mLines += "<span style='font-size:0.9em;'>$kbLink</span>"
+        return Join-CardLines -Lines $mLines -Format $Format
+    }
+    
+    # Helper function: Build KEK update availability section (vendor-signed KEK 2023 update lookup).
+    # Takes the pre-computed Get-KekUpdateAvailability result so the lookup runs once per execution.
+    function Build-KekUpdateAvailabilitySection {
+        param (
+            [string]$Format,
+            $Result              # The Get-KekUpdateAvailability result (must have .Succeeded + .Available)
+        )
+        if ($null -eq $Result -or -not $Result.Succeeded -or -not $Result.Available) { return $null }
+        $warn = Format-CardIcon -Type 'info' -Color '#F0AD4E' -Format $Format
+        $vendorLine = if ($Result.Vendors.Count -gt 0) { ': ' + ($Result.Vendors -join ', ') } else { '' }
+        return "<span style='color:#F0AD4E;'>$warn KEK 2023 update available from vendor$vendorLine</span>"
     }
     
     # Helper function: Build rollout tier / bucket section for card display
@@ -1238,7 +1785,16 @@ $($sectionsHtml.ToString())
         return Join-CardLines -Lines $lines -Format $Format
     }
     
+    # Hypervisor SignatureOwner GUIDs - PK entries signed with these owners but no cert payload
+    # identify the device as a VM guest where Secure Boot cert rotation is hypervisor-managed.
+    # Reference: garlin's Check_UEFI-CA2023.ps1 line 87 (VMware).
+    $script:HYPERVISOR_OWNER_GUIDS = @{
+        'a3d5e95b-0a8f-4753-8735-445afb708f62' = 'VMware'
+    }
+    
     # Helper function: Parse UEFI signature database (db/dbx) for X509 certificates
+    # May emit synthetic PSCustomObject entries (with .Subject and .Hypervisor) for hypervisor-owned
+    # signatures with empty certificate payload (e.g. VMware PK).
     function Parse-UefiSignatureDatabase {
         param (
             [byte[]]$Bytes
@@ -1249,7 +1805,7 @@ $($sectionsHtml.ToString())
         
         # Strip optional authenticode signature wrapper (ASN.1 SEQUENCE header)
         # Some firmware prepends a DER signature to the EFI_SIGNATURE_LIST payload.
-        # Garlin/Cjee21 reference implementations detect this at offset 40.
+        # garlin's reference implementations detect this at offset 40.
         $offset = 0
         if ($Bytes.Length -gt 44 -and $Bytes[40] -eq 0x30 -and $Bytes[41] -eq 0x82) {
             $sigLength = $Bytes[42] * 256 + $Bytes[43] + 4
@@ -1307,6 +1863,25 @@ $($sectionsHtml.ToString())
                 }
                 $ownerGuidBytes = [byte[]]$sigBytes[0..15]
                 $ownerGuid = [Guid]::new($ownerGuidBytes)
+                
+                # Hypervisor PK detection: X509 signature list with a known hypervisor owner GUID
+                # and empty cert payload - emit a synthetic entry so downstream code can route to
+                # the Virtualized state rather than treating this as a parse failure.
+                $ownerKey = $ownerGuid.ToString()
+                if ($sigBytes.Length -le 16 -and $script:HYPERVISOR_OWNER_GUIDS.ContainsKey($ownerKey)) {
+                    $hv = $script:HYPERVISOR_OWNER_GUIDS[$ownerKey]
+                    Write-Log "INFO" "Detected $hv hypervisor PK (SignatureOwner $ownerKey with no certificate payload)"
+                    $synthetic = [PSCustomObject]@{
+                        Subject    = "CN=$hv Virtual Machine Platform Key"
+                        NotBefore  = [DateTime]::MinValue
+                        NotAfter   = [DateTime]::MaxValue
+                        Hypervisor = $hv
+                        Thumbprint = $null
+                    }
+                    $certs += $synthetic
+                    continue
+                }
+                
                 $certBytes = [byte[]]$sigBytes[16..($sigBytes.Length - 1)]
                 
                 try {
@@ -1414,20 +1989,446 @@ $($sectionsHtml.ToString())
         return $sigDataList
     }
     
-    # Read BootMgr SVN from raw UEFI DBX variable bytes
+    # Read BootMgr SVN from raw UEFI DBX variable bytes.
     # Adapted from garlin's Check_UEFI-CA2023.ps1 Get-SecureBootUEFI_DBXSVN
     # Source: https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates
+    #
+    # IMPORTANT: explicit max-by-parsed-version. Microsoft's embarrassingly pushed
+    # Get-SecureBootSVN cmdlet, which has an open bug (PowerShell/PowerShell#27058).
+    # It reports whichever matching entry appears LAST in DBX order rather than
+    # the MAX, so a fleet with DBX SVN 7.0 followed by 0.0/2.0 entries silently
+    # reports 2.0. Lex-sort happens to work today because SVN bytes sit at a fixed
+    # hex offset and trailing bytes are stable, but it's one firmware quirk away
+    # from the same failure mode. Parse every candidate, keep the max.
     function Get-DbxBootMgrSVN {
         param ([byte[]]$DbxBytes)
         if ($null -eq $DbxBytes -or $DbxBytes.Length -eq 0) {
             return $null
         }
         $sigData = Get-DbxSignatureData -Bytes $DbxBytes
-        $matches = @($sigData | Where-Object { $_ -match "^$($script:EFI_BOOTMGR_DBXSVN_GUID)" } | Sort-Object)
+        $matches = @($sigData | Where-Object { $_ -match "^$($script:EFI_BOOTMGR_DBXSVN_GUID)" })
         if ($matches.Count -eq 0) {
             return $null
         }
-        return Get-SignatureDataSVN $matches[-1]
+        $maxVer = $null
+        $maxStr = $null
+        foreach ($m in $matches) {
+            $svn = Get-SignatureDataSVN $m
+            if ([string]::IsNullOrWhiteSpace($svn)) { continue }
+            try { $v = [version]$svn } catch { continue }
+            if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
+        }
+        return $maxStr
+    }
+    
+    # Strip the authenticode/ASN.1 signed-header wrapper from a DBX .bin update file so
+    # the downstream EFI_SIGNATURE_LIST parser sees the raw payload. The UEFI `dbx`
+    # variable itself is already unwrapped, but .bin files staged by Windows servicing
+    # (C:\Windows\System32\SecureBootUpdates\) carry a signed envelope. Detection logic
+    # adapted from garlin's Get-UefiDatabaseSignatures: bytes[40..41] == 0x30 0x82 signals
+    # an ASN.1 SEQUENCE with 2-byte length; the wrapper is 40 + (length-bytes + 4) bytes.
+    # If the marker is absent, the file is already stripped and passed through unchanged.
+    function Get-StrippedDbxBinBytes {
+        param ([byte[]]$Bytes)
+        if ($null -eq $Bytes -or $Bytes.Length -lt 44) { return $Bytes }
+        if ($Bytes[40] -eq 0x30 -and $Bytes[41] -eq 0x82) {
+            $sigLength = ($Bytes[42] * 256) + $Bytes[43] + 4
+            $skip = 40 + $sigLength
+            if ($skip -lt $Bytes.Length) {
+                return [byte[]]$Bytes[$skip..($Bytes.Length - 1)]
+            }
+        }
+        return $Bytes
+    }
+    
+    # Compare firmware DBX against DBX .bin update files staged by Windows servicing.
+    # Parses every dbx*.bin in C:\Windows\System32\SecureBootUpdates\ (where servicing
+    # drops payloads for the Secure-Boot-Update scheduled task to apply) and reports
+    # which staged signatures the firmware has absorbed. This answers the actionable
+    # question "did servicing apply what it staged?" rather than comparing against
+    # Microsoft's aspirational cumulative list.
+    #
+    # SVN-aware matching (adapted from garlin's Check_DBXUpdate.bin.ps1): if a staged
+    # entry prefix-matches one of the three boot-component SVN GUIDs (BootMgr, CdBoot,
+    # WdsMgr) AND firmware's live SVN for that GUID is >= the required SVN, count as
+    # SUPERSEDED. Otherwise it's a real miss - Windows staged it and the scheduled
+    # task hasn't successfully committed it to firmware yet.
+    # Reference: garlin's Check_DBXUpdate.bin.ps1 (github.com/garlin-cant-code/SecureBoot-CA-2023-Updates)
+    function Compare-DbxAgainstStagedBins {
+        param (
+            [byte[]]$DbxBytes,
+            [string]$StagedPath = "$env:SystemRoot\System32\SecureBootUpdates"
+        )
+        $result = @{
+            Succeeded         = $false
+            FilesScanned      = 0
+            FileNames         = @()
+            RequiredCount     = 0
+            MatchedCount      = 0
+            MissingCount      = 0
+            SupersededCount   = 0
+            PerFile           = @()     # @{ Name; Required; Matched; Missing; Superseded; MissingDetails }
+            MissingEntries    = @()     # @{ Hash; FromFiles; Component?; RequiredSvn?; FirmwareSvn? }
+            MissingComponents = @()     # @{ Component; RequiredSvn; FirmwareSvn } - deduped across files
+            LastChecked       = (Get-Date)
+            Error             = $null
+        }
+        if ($null -eq $DbxBytes -or $DbxBytes.Length -eq 0) {
+            $result.Error = 'DBX bytes not available'
+            return $result
+        }
+        if (-not (Test-Path -LiteralPath $StagedPath)) {
+            $result.Error = "Staged-updates folder not found: $StagedPath"
+            return $result
+        }
+        $binFiles = @(
+            Get-ChildItem -LiteralPath $StagedPath -Filter '*.bin' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '(?i)dbx' }
+        )
+        if ($binFiles.Count -eq 0) {
+            $result.Error = "No DBX .bin files in $StagedPath"
+            return $result
+        }
+        
+        # Firmware DBX hash set (uppercase hex).
+        $dbxHashes = @{}
+        foreach ($h in (Get-DbxSignatureData -Bytes $DbxBytes)) {
+            if (-not [string]::IsNullOrWhiteSpace($h)) { $dbxHashes[$h.ToUpperInvariant()] = $true }
+        }
+        
+        # GUID -> component-name map for missing-entry annotation and classification.
+        # Matches the three boot-component SVN GUIDs defined at script scope. Name
+        # choice mirrors Microsoft's naming in Get-SecureBootSVN.BootManagerSVN
+        # (BootMgr/CdBoot/WdsMgr); kept short so card rows stay readable. Declared up
+        # here (not next to the classify block) so the firmware-SVN lookup below can
+        # iterate the same three GUIDs.
+        $guidComponentMap = [ordered]@{
+            $script:EFI_BOOTMGR_DBXSVN_GUID = 'BootMgr'
+            $script:EFI_CDBOOT_DBXSVN_GUID  = 'CdBoot'
+            $script:EFI_WDSMGR_DBXSVN_GUID  = 'WdsMgr'
+        }
+        
+        # Firmware SVN levels for the three boot-component GUIDs, used to resolve
+        # "missing" SVN-encoded entries against the live SVN instead of counting them as
+        # gaps. Keyed by GUID prefix so the per-entry lookup in the match loop is O(1).
+        # On pre-Stage-3/4 devices firmware has zero SVN entries, so this map stays
+        # empty - downstream classify logic must NOT rely on iterating its keys to
+        # identify components, otherwise pre-rollout devices never attribute a component
+        # to their misses. Iterate $guidComponentMap.Keys for component identity.
+        #
+        # Uses explicit max-by-parsed-version. NO lex-sort (see Get-DbxBootMgrSVN for
+        # the rationale / https://github.com/PowerShell/PowerShell/issues/27058 reference).
+        $firmwareSvnByGuid = @{}
+        $allFirmwareSigs = @(Get-DbxSignatureData -Bytes $DbxBytes)
+        foreach ($guid in $guidComponentMap.Keys) {
+            $candidates = @($allFirmwareSigs | Where-Object { $_ -match "^$guid" })
+            if ($candidates.Count -eq 0) { continue }
+            $maxVer = $null
+            $maxStr = $null
+            foreach ($c in $candidates) {
+                $svn = Get-SignatureDataSVN $c
+                if ([string]::IsNullOrWhiteSpace($svn)) { continue }
+                try { $v = [version]$svn } catch { continue }
+                if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
+            }
+            if ($null -ne $maxStr) { $firmwareSvnByGuid[$guid] = $maxStr }
+        }
+        
+        # Per-file parse pass: parse each .bin, de-dupe within the file, store normalized
+        # upper-hex sig list keyed by filename for the tallying pass below.
+        $perFileSigs = [ordered]@{}
+        foreach ($bf in $binFiles) {
+            try {
+                $raw = [IO.File]::ReadAllBytes($bf.FullName)
+            }
+            catch {
+                Write-Log "WARNING" "Failed to read staged DBX file $($bf.Name): $($_.Exception.Message)"
+                continue
+            }
+            $clean = Get-StrippedDbxBinBytes -Bytes $raw
+            $sigs = @(Get-DbxSignatureData -Bytes $clean | ForEach-Object { $_.ToUpperInvariant() } | Select-Object -Unique)
+            $perFileSigs[$bf.Name] = $sigs
+        }
+        
+        # Shared matcher: returns a hashtable describing how one staged sig resolves
+        # against firmware state. Status is 'matched' / 'superseded' / 'missing'.
+        # For SVN-keyed sigs (those whose hash begins with one of the three boot-
+        # component GUIDs), also attaches Component / RequiredSvn / FirmwareSvn so
+        # the caller can render "missing: BootMgr (staged 8.0, raw firmware 2.0)" rows.
+        # Iterates $guidComponentMap (static list of all three GUIDs) rather than
+        # $firmwareSvnByGuid (which is empty on pre-Stage-3/4 devices) so component
+        # identity is always resolved even when firmware has no prior SVN entries.
+        $classify = {
+            param ($sig)
+            $info = @{
+                Status      = 'missing'
+                Component   = $null
+                RequiredSvn = $null
+                FirmwareSvn = $null
+            }
+            if ($dbxHashes.ContainsKey($sig)) { $info.Status = 'matched'; return $info }
+            foreach ($guid in $guidComponentMap.Keys) {
+                if ($sig -match "^$guid") {
+                    $info.Component   = $guidComponentMap[$guid]
+                    $info.RequiredSvn = Get-SignatureDataSVN $sig
+                    $info.FirmwareSvn = $firmwareSvnByGuid[$guid]   # may be null when firmware has no prior SVN for this GUID
+                    if (-not [string]::IsNullOrWhiteSpace($info.FirmwareSvn) -and -not [string]::IsNullOrWhiteSpace($info.RequiredSvn)) {
+                        try {
+                            if (([version]$info.FirmwareSvn) -ge ([version]$info.RequiredSvn)) { $info.Status = 'superseded' }
+                        }
+                        catch { }
+                    }
+                    break
+                }
+            }
+            return $info
+        }
+        
+        # Per-file tally. Alongside running counts, collect the component names of
+        # any missing SVN-keyed entries so the card can list which specific SVN
+        # component (BootMgr / CdBoot / WdsMgr) didn't absorb - this is the clue
+        # that distinguishes "pending reboot" from "firmware partial-commit failure".
+        $perFileResults = New-Object System.Collections.Generic.List[hashtable]
+        foreach ($name in $perFileSigs.Keys) {
+            $fr = 0; $fm = 0; $fx = 0; $fs = 0
+            $missingDetails = New-Object System.Collections.Generic.List[hashtable]
+            foreach ($sig in $perFileSigs[$name]) {
+                $fr++
+                $c = & $classify $sig
+                switch ($c.Status) {
+                    'matched'    { $fm++ }
+                    'superseded' { $fs++ }
+                    default      {
+                        $fx++
+                        if (-not [string]::IsNullOrWhiteSpace($c.Component)) {
+                            $missingDetails.Add(@{
+                                Component   = $c.Component
+                                RequiredSvn = $c.RequiredSvn
+                                FirmwareSvn = $c.FirmwareSvn
+                            }) | Out-Null
+                        }
+                    }
+                }
+            }
+            $perFileResults.Add(@{
+                Name           = $name
+                Required       = $fr
+                Matched        = $fm
+                Missing        = $fx
+                Superseded     = $fs
+                MissingDetails = @($missingDetails)
+            }) | Out-Null
+        }
+        
+        # Global dedup tally. This is the authoritative figure (per-file counts double-count
+        # a sig that lives in two .bin files). Track which file(s) each miss came from so
+        # operators can see "DBXUpdate2024.bin has 3 sigs that never applied".
+        $globalRequired = New-Object System.Collections.Generic.HashSet[string]
+        $sigToFiles = @{}
+        foreach ($name in $perFileSigs.Keys) {
+            foreach ($sig in $perFileSigs[$name]) {
+                [void]$globalRequired.Add($sig)
+                if (-not $sigToFiles.ContainsKey($sig)) { $sigToFiles[$sig] = New-Object System.Collections.Generic.List[string] }
+                [void]$sigToFiles[$sig].Add($name)
+            }
+        }
+        
+        $matched = 0; $missing = 0; $superseded = 0
+        $missingEntries = New-Object System.Collections.Generic.List[hashtable]
+        $missingComponents = New-Object System.Collections.Generic.List[hashtable]
+        $seenComponents = @{}
+        foreach ($sig in $globalRequired) {
+            $c = & $classify $sig
+            switch ($c.Status) {
+                'matched'    { $matched++ }
+                'superseded' { $superseded++ }
+                default      {
+                    $missing++
+                    $missingEntries.Add(@{
+                        Hash        = $sig
+                        FromFiles   = @($sigToFiles[$sig])
+                        Component   = $c.Component
+                        RequiredSvn = $c.RequiredSvn
+                        FirmwareSvn = $c.FirmwareSvn
+                    }) | Out-Null
+                    # Dedup global list of missing SVN components (across all files). A missed
+                    # BootMgr SVN shows up in both DBXUpdateSVN.bin and its Legacy twin -
+                    # operators only need to see the component once.
+                    if (-not [string]::IsNullOrWhiteSpace($c.Component) -and -not $seenComponents.ContainsKey($c.Component)) {
+                        $seenComponents[$c.Component] = $true
+                        $missingComponents.Add(@{
+                            Component   = $c.Component
+                            RequiredSvn = $c.RequiredSvn
+                            FirmwareSvn = $c.FirmwareSvn
+                        }) | Out-Null
+                    }
+                }
+            }
+        }
+        
+        $result.Succeeded         = $true
+        $result.FilesScanned      = $binFiles.Count
+        $result.FileNames         = @($binFiles | ForEach-Object { $_.Name })
+        $result.RequiredCount     = $globalRequired.Count
+        $result.MatchedCount      = $matched
+        $result.MissingCount      = $missing
+        $result.SupersededCount   = $superseded
+        $result.PerFile           = @($perFileResults)
+        $result.MissingEntries    = @($missingEntries)
+        $result.MissingComponents = @($missingComponents)
+        return $result
+    }
+    
+    # Boot media check: scan attached removable/optical volumes for PCA-2011-signed boot loaders.
+    # When DBX revokes PCA 2011 (Stage 3), booting from such media would fail - so operators need
+    # to know which drives must be refreshed. Returns structured volume list for card rendering.
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-BootManager (lines 785-924).
+    # MS guidance: https://support.microsoft.com/en-us/topic/updating-windows-bootable-media-to-use-the-pca2023-signed-boot-manager-d4064779-0e4e-43ac-b2ce-24f434fcfa0f
+    function Test-BootMediaPca2023 {
+        param (
+            [switch]$DeepScan
+        )
+        $result = @{
+            MediaScanned = 0
+            Outdated     = @()   # list of @{ Drive; File; SignedBy; Status }
+            Error        = $null
+        }
+        $volumes = @()
+        try {
+            $volumes = @(Get-Volume -ErrorAction Stop | Where-Object {
+                $_.DriveType -in 'Removable','CD-ROM' -and -not [string]::IsNullOrWhiteSpace($_.DriveLetter)
+            })
+        }
+        catch {
+            $result.Error = "Volume enumeration failed: $($_.Exception.Message)"
+            return $result
+        }
+        if ($volumes.Count -eq 0) { return $result }
+        
+        $efiFiles = 'bootx64.efi','bootia32.efi','bootx86.efi','bootaa64.efi','bootaa32.efi','bootarm.efi'
+        foreach ($vol in $volumes) {
+            $drv = "$($vol.DriveLetter):"
+            $result.MediaScanned++
+            foreach ($name in $efiFiles) {
+                $path = Join-Path $drv "EFI\boot\$name"
+                if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { continue }
+                try {
+                    $sig = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
+                    $issuer = if ($null -ne $sig.SignerCertificate) { $sig.SignerCertificate.Issuer } else { '' }
+                    $is2011 = $issuer -match '(?i)(Microsoft Windows Production PCA 2011|Microsoft Corporation UEFI CA 2011)'
+                    $is2023 = $issuer -match '(?i)(Windows UEFI CA 2023|Microsoft UEFI CA 2023|Microsoft Option ROM UEFI CA 2023)'
+                    if ($is2011 -and -not $is2023) {
+                        $result.Outdated += @{
+                            Drive    = $drv
+                            File     = "EFI\boot\$name"
+                            SignedBy = 'PCA 2011'
+                            Status   = 'Outdated'
+                        }
+                    }
+                }
+                catch {
+                    Write-Log "WARNING" "Signature check failed for $($path): $($_.Exception.Message)"
+                }
+            }
+            
+            if ($DeepScan) {
+                $wimCandidates = 'sources\boot.wim','sources\install.wim','sources\install.esd'
+                foreach ($wim in $wimCandidates) {
+                    $wimPath = Join-Path $drv $wim
+                    if (-not (Test-Path -LiteralPath $wimPath -ErrorAction SilentlyContinue)) { continue }
+                    try {
+                        # Lightweight presence report (full DISM extraction is out of scope here)
+                        $info = Get-WindowsImage -ImagePath $wimPath -Index 1 -ErrorAction Stop
+                        $result.Outdated += @{
+                            Drive    = $drv
+                            File     = $wim
+                            SignedBy = "Image: $($info.ImageName)"
+                            Status   = 'Review (WIM - manual verification recommended)'
+                        }
+                    }
+                    catch {
+                        Write-Log "INFO" "Could not inspect $($wimPath): $($_.Exception.Message)"
+                    }
+                }
+            }
+        }
+        return $result
+    }
+    
+    # Look up whether Microsoft publishes a vendor-signed KEK CA 2023 update for the current PK.
+    # Downloads kek_update_map.json from microsoft/secureboot_objects and checks whether the
+    # current PK thumbprint has an available update record. Intended to guide Action Required
+    # decisions (wait on OEM firmware vs. WU opt-in) when Event 1795 or 1803 is firing.
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-KEKUpdateMap
+    function Get-KekUpdateAvailability {
+        param (
+            [string]$PkThumbprint,
+            [int]$TimeoutSec = 10
+        )
+        $result = @{
+            Succeeded       = $false
+            Available       = $false
+            Vendors         = @()
+            MicrosoftSigned = $false
+            Error           = $null
+        }
+        if ([string]::IsNullOrWhiteSpace($PkThumbprint)) {
+            $result.Error = 'PK thumbprint unavailable'
+            return $result
+        }
+        $url = 'https://raw.githubusercontent.com/microsoft/secureboot_objects/main/PostSignedObjects/KEK/kek_update_map.json'
+        try {
+            $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+            $json = $response.Content | ConvertFrom-Json
+        }
+        catch {
+            $result.Error = "Fetch/parse failed: $($_.Exception.Message)"
+            return $result
+        }
+        
+        $tp = $PkThumbprint.ToUpperInvariant()
+        # The JSON is typically an object keyed by PK thumbprint, each value describing available
+        # vendor updates. Support both that and the array-of-records shape defensively.
+        $record = $null
+        if ($json -is [System.Collections.IEnumerable] -and -not ($json -is [string])) {
+            foreach ($entry in $json) {
+                $entryTp = $null
+                foreach ($p in 'thumbprint','PKThumbprint','pk_thumbprint','pkSha1') {
+                    if ($entry.PSObject.Properties[$p]) { $entryTp = [string]$entry.$p; break }
+                }
+                if ($null -ne $entryTp -and $entryTp.ToUpperInvariant() -eq $tp) { $record = $entry; break }
+            }
+        }
+        elseif ($json.PSObject.Properties[$tp]) {
+            $record = $json.$tp
+        }
+        elseif ($json.PSObject.Properties[$PkThumbprint]) {
+            $record = $json.$PkThumbprint
+        }
+        
+        $result.Succeeded = $true
+        if ($null -eq $record) { return $result }
+        
+        $result.Available = $true
+        $vendorList = @()
+        foreach ($p in 'vendors','Vendors','vendor_updates','updates') {
+            if ($record.PSObject.Properties[$p]) {
+                $vals = $record.$p
+                if ($vals -is [System.Collections.IEnumerable] -and -not ($vals -is [string])) {
+                    foreach ($v in $vals) {
+                        if ($v -is [string]) { $vendorList += $v }
+                        elseif ($v.PSObject.Properties['vendor']) { $vendorList += [string]$v.vendor }
+                        elseif ($v.PSObject.Properties['name'])   { $vendorList += [string]$v.name }
+                    }
+                }
+                break
+            }
+        }
+        $result.Vendors = $vendorList | Select-Object -Unique
+        foreach ($p in 'microsoftSigned','MicrosoftSigned','msSigned','ms_signed') {
+            if ($record.PSObject.Properties[$p] -and $record.$p) { $result.MicrosoftSigned = $true; break }
+        }
+        return $result
     }
     
     # Read expected SVN from Windows Update staging file (DBXUpdateSVN.bin)
@@ -1455,7 +2456,6 @@ $($sectionsHtml.ToString())
     # Get Secure Boot SVN status - always reads raw DBX bytes, enriches with cmdlet if available
     # Raw DBX parsing provides pending update detection via DBXUpdateSVN.bin comparison
     # Get-SecureBootSVN cmdlet (KB5077241+) adds FirmwareSVN, BootManagerSVN, BootManagerPath
-    # Adapted from garlin's Check_UEFI-CA2023.ps1
     # Source: https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates
     function Get-SecureBootSVNStatus {
         param ([byte[]]$DbxBytes)
@@ -1484,8 +2484,31 @@ $($sectionsHtml.ToString())
         # Build result - cmdlet provides compliance/firmware info, raw DBX provides pending update detection
         if ($null -ne $cmdletResult) {
             $isCompliant = $cmdletResult.ComplianceStatus -match '^Compliant'
+            # Cross-check cmdlet FirmwareSVN against our raw-byte max. PowerShell#27058
+            # (open as of this writing) causes Get-SecureBootSVN to return whichever
+            # BootMgr-GUID entry appears LAST in DBX order rather than the max, silently
+            # under-reporting on devices where lower-SVN entries happen to sort last.
+            # Our Get-DbxBootMgrSVN does explicit max-by-parsed-version, so prefer that
+            # value when it disagrees and log the discrepancy so operators can recognize
+            # the bug signature without chasing ghosts. Non-fatal - cmdlet is still the
+            # source for BootManagerSVN / StagedSVN / ComplianceStatus (unaffected by
+            # the bug because those come from on-disk / staging files).
+            $firmwareSvnFinal = $cmdletResult.FirmwareSVN
+            if (-not [string]::IsNullOrWhiteSpace($currentSVN) -and
+                -not [string]::IsNullOrWhiteSpace([string]$cmdletResult.FirmwareSVN)) {
+                try {
+                    $rawVer = [version]$currentSVN
+                    $cmdVer = [version]$cmdletResult.FirmwareSVN
+                    if ($rawVer -ne $cmdVer) {
+                        Write-Log "WARNING" ("Get-SecureBootSVN FirmwareSVN mismatch: cmdlet=$($cmdletResult.FirmwareSVN), raw-DBX max=$currentSVN. " +
+                            "Likely PowerShell/PowerShell#27058 bug. Cmdlet reports last-in-DBX-order instead of max. Using raw-DBX value.")
+                        $firmwareSvnFinal = $currentSVN
+                    }
+                }
+                catch { }
+            }
             return @{
-                FirmwareSVN      = $cmdletResult.FirmwareSVN
+                FirmwareSVN      = $firmwareSvnFinal
                 BootManagerSVN   = $cmdletResult.BootManagerSVN
                 StagedSVN        = $cmdletResult.StagedSVN
                 ComplianceStatus = $cmdletResult.ComplianceStatus
@@ -1529,21 +2552,42 @@ $($sectionsHtml.ToString())
         }
     }
     
-    # Helper function: Parse UEFI database using -Decoded (KB5077241+) or fallback to raw byte parsing
-    # Returns array of X509Certificate2 objects either way
+    # Helper function: Parse UEFI database and return both certs and raw bytes.
+    # Raw bytes are ALWAYS fetched (one NVRAM read per variable) because downstream
+    # features need them regardless of whether -Decoded is available:
+    #   - Raw DBX SVN extraction (Get-DbxBootMgrSVN)
+    #   - Staged-file DBX validation (Compare-DbxAgainstStagedBins)
+    #   - Binary-vs-text heuristic on dbx
+    #   - Signature-data byte parsing (Get-DbxSignatureData)
+    # -Decoded (KB5077241+, Feb 2025) is used purely as a cert-parse enrichment:
+    # on success, certs are sourced from the cmdlet's structured output; on failure
+    # or absence, certs fall back to Parse-UefiSignatureDatabase over the same raw
+    # bytes. Historical bug: the pre-fix version returned Bytes=$null on -Decoded
+    # success, silently breaking every byte-dependent feature on KB5077241+ devices.
     function Get-UefiDatabaseCerts {
         param (
-            [string]$Name   # db, KEK, dbx, dbDefault
+            [string]$Name   # db, KEK, dbx, dbDefault, PK, PKDefault, KEKDefault, dbxDefault
         )
+        # Step 1: always fetch raw bytes first. If this fails, the variable is
+        # unavailable on this device. Nothing else will work either, bail early.
+        $rawBytes = $null
+        try {
+            $uefiVar  = Get-SecureBootUEFI -Name $Name -ErrorAction Stop
+            $rawBytes = $uefiVar.Bytes
+        }
+        catch {
+            Write-Log "WARNING" "Failed to read UEFI variable '$Name': $($_.Exception.Message)"
+            return @{ Certs = @(); Bytes = $null; UsedDecoded = $false }
+        }
+        
+        # Step 2: prefer -Decoded for cert parsing when available.
         if ($script:HasDecodedParam) {
             try {
                 $decoded = Get-SecureBootUEFI -Name $Name -Decoded -ErrorAction Stop
-                # -Decoded (KB5077241+) returns flat objects with Subject, ValidFrom, ValidTo, etc.
-                # These are NOT X509Certificate2 objects. Normalize them to match the interface
-                # the downstream code expects (Subject, NotBefore, NotAfter).
+                # -Decoded returns flat objects with Subject/ValidFrom/ValidTo rather than
+                # X509Certificate2 instances. Normalize to the NotBefore/NotAfter shape the
+                # downstream code expects, and filter out SHA256 hash-only entries (no Subject).
                 $entries = @($decoded)
-                # -Decoded returns ALL signature entries: X509 certs (have Subject) AND
-                # SHA256 hashes (no Subject). Filter to only entries with a Subject.
                 $certs = @()
                 foreach ($entry in $entries) {
                     if (-not [string]::IsNullOrWhiteSpace($entry.Subject)) {
@@ -1558,7 +2602,7 @@ $($sectionsHtml.ToString())
                 if ($certs.Count -gt 0) {
                     $skipped = $entries.Count - $certs.Count
                     if ($skipped -gt 0) { Write-Log "INFO" "$Name -Decoded: $($certs.Count) certs, $skipped hash entries skipped" }
-                    return @{ Certs = $certs; Bytes = $null; UsedDecoded = $true }
+                    return @{ Certs = $certs; Bytes = $rawBytes; UsedDecoded = $true }
                 }
                 Write-Log "INFO" "-Decoded returned no certificate entries for $Name ($($entries.Count) hash-only entries), falling back to raw parse"
             }
@@ -1566,16 +2610,52 @@ $($sectionsHtml.ToString())
                 Write-Log "WARNING" "-Decoded failed for $Name ($($_.Exception.Message)), falling back to raw parse"
             }
         }
-        # Fallback: raw byte parsing
-        try {
-            $uefiVar = Get-SecureBootUEFI -Name $Name -ErrorAction Stop
-            $bytes = $uefiVar.Bytes
-            $certs = Parse-UefiSignatureDatabase -Bytes $bytes
-            return @{ Certs = $certs; Bytes = $bytes; UsedDecoded = $false }
+        
+        # Step 3: raw-byte cert parse. Either -Decoded is unavailable, it failed,
+        # or it returned hash-only entries. Parse-UefiSignatureDatabase handles both
+        # cases (returns @() when no certs are present).
+        $certs = Parse-UefiSignatureDatabase -Bytes $rawBytes
+        return @{ Certs = $certs; Bytes = $rawBytes; UsedDecoded = $false }
+    }
+    
+    # Consolidated accessor that wraps Get-UefiDatabaseCerts with common post-processing:
+    #   - Extracts Common Name (CN) from each Subject
+    #   - Flags hypervisor-managed platforms (VMware owner GUID / VirtualBox subject)
+    #   - Flags untrusted placeholder PKs
+    #   - Optional -MicrosoftOnly filter
+    # Returns @{ Subjects; CommonNames; Hypervisor; Trusted; Raw } - caller picks what it needs.
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Get-UEFICert (lines 292-330).
+    function Get-UefiCertSubjects {
+        param(
+            [ValidateSet('PK','KEK','db','dbx','PKDefault','KEKDefault','dbDefault','dbxDefault')]
+            [string]$Name,
+            [switch]$MicrosoftOnly
+        )
+        $raw = Get-UefiDatabaseCerts -Name $Name
+        $subjects   = @()
+        $commonName = @()
+        $hypervisor = $null
+        $trusted    = $true
+        foreach ($cert in $raw.Certs) {
+            if ([string]::IsNullOrWhiteSpace($cert.Subject)) { continue }
+            if ($cert.PSObject.Properties['Hypervisor'] -and $null -ne $cert.Hypervisor) {
+                $hypervisor = $cert.Hypervisor
+            }
+            elseif ($cert.Subject -match '(?i)VirtualBox') {
+                $hypervisor = 'VirtualBox'
+            }
+            if ($cert.Subject -match '(?i)(DO NOT|Example)') { $trusted = $false }
+            if ($MicrosoftOnly -and $cert.Subject -notmatch '(?i)(Microsoft|Mosby)') { continue }
+            $subjects += $cert.Subject
+            $cn = [regex]::Match($cert.Subject, '(?i)CN=([^,]+)')
+            if ($cn.Success) { $commonName += $cn.Groups[1].Value.Trim() }
         }
-        catch {
-            Write-Log "WARNING" "Failed to read UEFI variable '$Name': $($_.Exception.Message)"
-            return @{ Certs = @(); Bytes = $null; UsedDecoded = $false }
+        return @{
+            Subjects    = $subjects
+            CommonNames = $commonName
+            Hypervisor  = $hypervisor
+            Trusted     = $trusted
+            Raw         = $raw
         }
     }
     
@@ -1835,7 +2915,7 @@ $($sectionsHtml.ToString())
     #   1803 = PK-signed KEK not found for this device (OEM hasn't provided signed KEK)
     # -----------------------------------------------
     
-    # Human-readable descriptions for each event ID
+    # Descriptions for each event ID
     $script:SecureBootEventDescriptions = @{
         # State events
         1801 = 'Certs available but not applied'
@@ -1873,7 +2953,7 @@ $($sectionsHtml.ToString())
     #   Status       - Compliant / ActionRequired / Pending (based on most recent state event)
     #   EventId      - Most recent state event ID
     #   EventTime    - Timestamp of most recent state event
-    #   EventMessage - Human-readable description
+    #   EventMessage - Event description
     #   AllEvents    - Full list of parsed events (for summary)
     #   EventSummary - Aggregated list: @{ Id; Description; Count; FirstSeen; LastSeen }
     function Get-CertUpdateEventStatus {
@@ -1964,12 +3044,13 @@ $($sectionsHtml.ToString())
         # Determine state from the most recent STATE event
         # These are the events that indicate overall deployment status:
         #   1801 = certs available but not applied (action required)
+        #   1803 = PK-signed KEK not found - OEM blocker (action required)
         #   1800 = reboot required to continue
         #   1799 = 2023 boot manager installed
         #   1037 = PCA 2011 revoked in DBX (Stage 3 complete)
         #   1042 = SVN applied to DBX (Stage 4 complete)
         #   1808 = fully compliant
-        $stateEventIds = @(1037, 1042, 1799, 1800, 1801, 1808)
+        $stateEventIds = @(1037, 1042, 1799, 1800, 1801, 1803, 1808)
         $stateEvents = @($parsedEvents | Where-Object { $stateEventIds -contains $_.Id } | Sort-Object Time -Descending)
         
         if ($stateEvents.Count -eq 0 -and $parsedEvents.Count -eq 0) {
@@ -2027,6 +3108,10 @@ $($sectionsHtml.ToString())
             1801 {
                 $status = 'ActionRequired'
                 $msg    = 'Certs available but not applied (Event 1801)'
+            }
+            1803 {
+                $status = 'ActionRequired'
+                $msg    = 'PK-signed KEK 2023 not available via WU - awaiting OEM publication (Event 1803)'
             }
             1799 {
                 $status = 'Pending'
@@ -2243,7 +3328,7 @@ $($sectionsHtml.ToString())
         }
     }
     
-    # Helper function: Convert a Win32 or HRESULT error code to a human-readable message
+    # Helper function: Convert a Win32 or HRESULT error code to a message
     # Returns: string with the error message, or the hex code if unknown
     function Get-Win32ErrorMessage {
         param ([uint32]$ErrorCode)
@@ -2345,7 +3430,7 @@ $($sectionsHtml.ToString())
         return $result
     }
     
-    # Helper function: Decode AvailableUpdates bitmask into human-readable meanings
+    # Helper function: Decode AvailableUpdates bitmask into meanings
     # Source: Get-SecureBootCertInfo.ps1 (HorizonSecured) and MS KB5084567
     # Returns: array of strings describing each set bit
     function Get-AvailableUpdatesMeaning {
@@ -2366,7 +3451,7 @@ $($sectionsHtml.ToString())
         if ($Value -band 0x0200)               { $meaning += 'Apply SVN to DBX firmware (Mitigation 4)' }
         if ($Value -band 0x0800)               { $meaning += 'Apply Microsoft Option ROM UEFI CA 2023' }
         if ($Value -band 0x1000)               { $meaning += 'Apply Microsoft UEFI CA 2023' }
-        # 0x4000 = conditional qualifier (apply only if UEFI CA 2011 trusted) - always present, not displayed
+        # 0x4000 = conditional qualifier (apply only if UEFI CA 2011 trusted). This is always present (not displayed)
         
         # Detect undocumented bits
         $knownBits = 0x0004 -bor 0x0040 -bor 0x0080 -bor 0x0100 -bor 0x0200 -bor 0x0800 -bor 0x1000 -bor 0x4000 -bor 0x4004
@@ -2820,7 +3905,7 @@ $($sectionsHtml.ToString())
     #   - Ground truth: Event 1799 (boot manager installed) or 1808 (compliant)
     #   - Manifest:     0x100 bit must be consumed (no longer in AvailableUpdates)
     #   - BOTH must pass: event confirmed AND OS finished processing
-    #   - "Applied" status alone is NOT sufficient - only means triggered, not done
+    #   - "Applied" status alone is NOT sufficient as it only means triggered
     #
     # Reboot check:
     #   - Event 1800 = cert deployment still in progress, reboot needed
@@ -2884,7 +3969,7 @@ $($sectionsHtml.ToString())
         $stage3Applied = $has1037
         $stage4Applied = $has1042
         
-        # When stages 1+2 are done, a pending reboot is for stage 3+4 progression - not a blocker.
+        # When stages 1+2 are done, a pending reboot is for stage 3+4 progression (not a blocker).
         # Only treat reboot as blocking when stages 1 or 2 are still incomplete.
         $rebootBlocks = $rebootPending -and (-not $stage1Done -or -not $stage2Done)
         
@@ -3535,8 +4620,52 @@ process {
     $dbCertsFound       = @()   # Which 2023 db certs are present
     $scheduledTaskPresent = $false
     $dbIsOsWritable     = $false
+    $pkCerts            = @()
+    $pkSubject          = $null
+    $pkIsTrusted        = $true
+    $hypervisor         = $null    # 'VMware' | 'VirtualBox' | $null
+    $defaultsPresent    = @{ PKDefault = $false; KEKDefault = $false; dbDefault = $false; dbxDefault = $false }
     
     if ($secureBoot -eq 'Enabled') {
+        # --- Parse PK (Platform Key - root of Secure Boot trust) ---
+        # PK authorizes updates to KEK. Typically a vendor/OEM cert on physical hardware,
+        # or an empty-signature VMware/VirtualBox marker on hypervisors.
+        Write-Log "INFO" "Parsing PK certificate$(if ($script:HasDecodedParam) { ' (using -Decoded)' })"
+        $pkResult = Get-UefiDatabaseCerts -Name PK
+        $pkCerts  = $pkResult.Certs
+        if ($pkCerts.Count -eq 0) {
+            Write-Log "INFO" "No certificates found in PK (device may be in setup mode)"
+        }
+        else {
+            foreach ($cert in $pkCerts) {
+                $shortSubject = (($cert.Subject -split ',') | Select-Object -First 2 | ForEach-Object { $_.Trim() }) -join ', '
+                Write-Log "INFO" "PK Cert: $shortSubject"
+                if ($null -eq $pkSubject) { $pkSubject = $cert.Subject }
+                # Hypervisor detection (Part 2F)
+                if ($cert.PSObject.Properties['Hypervisor'] -and $null -ne $cert.Hypervisor) {
+                    $hypervisor = $cert.Hypervisor
+                }
+                elseif ($cert.Subject -match '(?i)VirtualBox') {
+                    $hypervisor = 'VirtualBox'
+                }
+                # Trust check: placeholder/example PKs are untrusted
+                if ($cert.Subject -match '(?i)(DO NOT|Example)') {
+                    $pkIsTrusted = $false
+                }
+            }
+            if ($null -ne $hypervisor) {
+                Write-Log "INFO" "Hypervisor-managed Secure Boot detected: $hypervisor"
+            }
+            if (-not $pkIsTrusted) {
+                if ($pkSubject -match '(?i)(AMI|DO NOT)') {
+                    Write-Log "ERROR" "PK is the publicly-leaked AMI Test PK (PKFail / CVE-2024-8105) - Secure Boot chain of trust is broken. BIOS update required."
+                }
+                else {
+                    Write-Log "WARNING" "PK is a placeholder/example certificate (untrusted) - Secure Boot chain is effectively open"
+                }
+            }
+        }
+        
         # --- Parse db (allowed signatures) ---
         Write-Log "INFO" "Parsing db certificates$(if ($script:HasDecodedParam) { ' (using -Decoded)' })"
         $dbResult = Get-UefiDatabaseCerts -Name db
@@ -3722,6 +4851,35 @@ process {
             }
         }
         
+        # --- Parse factory default databases (PKDefault / KEKDefault / dbDefault / dbxDefault) ---
+        # Presence of all four is required for the BIOS "Reset Secure Boot keys" recovery option
+        # to work. Devices missing all four cannot recover from a broken cert chain without an
+        # OEM firmware update.
+        foreach ($defName in @('PKDefault','KEKDefault','dbDefault','dbxDefault')) {
+            try {
+                $res = Get-UefiDatabaseCerts -Name $defName
+                if ($res.Certs.Count -gt 0 -or ($null -ne $res.Bytes -and $res.Bytes.Length -gt 0)) {
+                    $defaultsPresent[$defName] = $true
+                    Write-Log "INFO" "$defName is present ($($res.Certs.Count) cert(s))"
+                }
+                else {
+                    Write-Log "WARNING" "$defName is MISSING - BIOS 'Reset Secure Boot keys' recovery will not restore this variable"
+                }
+            }
+            catch {
+                Write-Log "WARNING" "Failed to read ${defName}: $($_.Exception.Message)"
+            }
+        }
+        $defaultsAllMissing  = -not ($defaultsPresent.PKDefault -or $defaultsPresent.KEKDefault -or $defaultsPresent.dbDefault -or $defaultsPresent.dbxDefault)
+        $defaultsSomeMissing = -not ($defaultsPresent.PKDefault -and $defaultsPresent.KEKDefault -and $defaultsPresent.dbDefault -and $defaultsPresent.dbxDefault)
+        if ($defaultsAllMissing) {
+            Write-Log "WARNING" "All UEFI default databases are missing - 'Reset Secure Boot keys' BIOS option will not function"
+        }
+        elseif ($defaultsSomeMissing) {
+            $missingDefaults = $defaultsPresent.Keys | Where-Object { -not $defaultsPresent[$_] }
+            Write-Log "INFO" "Some UEFI default databases are missing: $($missingDefaults -join ', ')"
+        }
+        
         # --- Check Secure-Boot-Update scheduled task existence ---
         Write-Host "`n === Secure Boot Update Task Check ==="
         if (Get-ScheduledTask -TaskPath "\Microsoft\Windows\PI\*" -TaskName "Secure-Boot-Update" -ErrorAction SilentlyContinue) {
@@ -3774,7 +4932,7 @@ process {
     else {
         Write-Log "INFO" "Skipping event log check (Secure Boot is $secureBoot)"
     }
-
+    
     # --- Augment dbCertsFound with event 1044/1045 for devices where raw byte parsing missed optional certs ---
     if ($null -ne $certStatus -and -not $allDbCertsPresent) {
         $eventAugmented = $false
@@ -3793,7 +4951,7 @@ process {
             Write-Log "INFO" "Updated db cert inventory via events: $($dbCertsFound -join ', ')$(if ($allDbCertsPresent) { ' (all present)' })"
         }
     }
-
+    
     # -----------------------------------------------
     # Step 2.1: Read Secure Boot servicing registry (only when Secure Boot is Enabled)
     # -----------------------------------------------
@@ -3982,12 +5140,98 @@ process {
             if ($svnStatus.SvnUpdatePending) {
                 Write-Log "INFO" "SVN update pending - DBXUpdateSVN.bin ($($svnStatus.WindowsUpdateSVN)) not yet applied to DBX"
             }
-            if ($svnStatus.RebootPending) {
-                Write-Log "WARNING" "SVN reboot pending - firmware SVN has not yet absorbed the staged update (reboot required)"
-            }
             if ($svnStatus.RevocationAppliedPendingReboot) {
                 Write-Log "WARNING" "2011 CA revocation applied (Event 1037) but not yet visible in DBX bytes (reboot required)"
             }
+        }
+    }
+    
+    # Early DBX staged-vs-firmware validation pass.
+    # Purpose: the top-level state machine below (title + plaintext) needs to
+    # distinguish three states beyond the existing generic "Pending SVN Reboot":
+    #   * PendingUpdate    - 1-2 missing, every missing component has a prior
+    #                        firmware SVN, AND firmware has not had a chance to
+    #                        absorb since the last DBX write (pre-reboot state).
+    #                        Benign: next boot will apply.
+    #   * SvnNotApplied    - same miss pattern, BUT firmware HAS booted since
+    #                        the last DBX-writing event and still refused to
+    #                        absorb. Not "pending a reboot" - the reboot already
+    #                        happened. This is a firmware-level refusal that
+    #                        operators need to escalate (OEM BIOS update / support).
+    #                        Diagnosed via lastBootTime > latest(1034, 1042).
+    #   * (all 3 missing or asymmetric absent FirmwareSvn) - handled by the
+    #                        generic RebootPending / PartialCommit paths.
+    # All three are only reliably distinguishable thanks to the raw-DBX max-SVN
+    # fix (see Get-DbxBootMgrSVN / PowerShell#27058). Compute once here; the
+    # gating site further down reuses the cached result.
+    $dbxValidationResult = $null
+    if ($secureBoot -eq 'Enabled' -and $null -ne $dbxBytes) {
+        $dbxValidationResult = Compare-DbxAgainstStagedBins -DbxBytes $dbxBytes
+    }
+    if ($null -ne $svnStatus) {
+        $svnStatus.PendingUpdate                = $false
+        $svnStatus.PendingUpdateComponents      = @()
+        $svnStatus.SvnNotApplied                = $false
+        $svnStatus.SvnNotAppliedComponents      = @()
+        $svnStatus.LastDbxWriteAfterBoot        = $false
+        if ($null -ne $dbxValidationResult -and $dbxValidationResult.Succeeded) {
+            $svnMissEarly = @($dbxValidationResult.MissingComponents)
+            if ($svnMissEarly.Count -gt 0 -and $svnMissEarly.Count -lt 3) {
+                $everyPrior = $true
+                foreach ($m in $svnMissEarly) {
+                    if ([string]::IsNullOrWhiteSpace([string]$m.FirmwareSvn)) { $everyPrior = $false; break }
+                }
+                if ($everyPrior) {
+                    # Firmware-had-a-chance cross-reference:
+                    #   latest DBX-modification event time  <  last boot time
+                    # means the firmware booted AFTER the scheduled task wrote the
+                    # update to NVRAM. If firmware still hasn't absorbed, it's a
+                    # refusal. Uses 1034 (DBX variable applied, fires on every scheduled-task
+                    # DBX commit) and 1042 (Mitigation-4 SVN applied, one-shot).
+                    $lastDbxWrite = $null
+                    foreach ($evtId in @(1034, 1042)) {
+                        $evt = Get-LatestSecureBootEvent -CertStatus $certStatus -EventId $evtId
+                        if ($null -ne $evt -and $null -ne $evt.Time) {
+                            if ($null -eq $lastDbxWrite -or $evt.Time -gt $lastDbxWrite) {
+                                $lastDbxWrite = $evt.Time
+                            }
+                        }
+                    }
+                    $firmwareHadChance = $false
+                    if ($null -ne $lastBootTime -and $null -ne $lastDbxWrite -and $lastBootTime -gt $lastDbxWrite) {
+                        $firmwareHadChance = $true
+                    }
+                    $comps = @($svnMissEarly | ForEach-Object { $_.Component })
+                    if ($firmwareHadChance) {
+                        $svnStatus.SvnNotApplied           = $true
+                        $svnStatus.SvnNotAppliedComponents = $comps
+                    }
+                    else {
+                        $svnStatus.PendingUpdate           = $true
+                        $svnStatus.PendingUpdateComponents = $comps
+                    }
+                }
+            }
+        }
+        
+        # Reboot-awareness aware "SVN update state" log. Emitted here (after the
+        # DBX early pass) rather than inside the $svnStatus decoration block so
+        # the wording can reflect the component-level + lastBootTime analysis.
+        # Suppresses the older generic "SVN reboot pending - reboot required"
+        # WARNING which was misleading after a reboot had already happened.
+        if ($svnStatus.SvnNotApplied) {
+            $comps = @($svnStatus.SvnNotAppliedComponents) -join ', '
+            Write-Log "WARNING" "SVN update NOT applied after reboot for component(s): $comps. Firmware booted since the last DBX write (Event 1034/1042) and still refused to absorb. Investigate OEM BIOS/firmware update or support escalation - rebooting again will not resolve."
+        }
+        elseif ($svnStatus.PendingUpdate) {
+            $comps = @($svnStatus.PendingUpdateComponents) -join ', '
+            Write-Log "INFO" "Pending SVN update for component(s): $comps. Firmware at prior SVN; scheduled task wrote the next increment to DBX and firmware will attempt to absorb on next boot."
+        }
+        elseif ($svnStatus.RebootPending) {
+            # Generic fallback - 3-of-3 missing, or cmdlet-path RebootPending without
+            # component-level detail. Preserves the original WARNING semantics for
+            # any reboot-pending state that isn't a narrower PendingUpdate / NotApplied.
+            Write-Log "WARNING" "SVN reboot pending - firmware SVN has not yet absorbed the staged update (reboot required)"
         }
     }
     
@@ -4253,6 +5497,18 @@ process {
         Write-Host "`n === Opt-In Status Check ==="
         $optInStatus = Check-OptInStatus
         
+        # Re-evaluate $enforceMissingOptIn with fresh opt-in status.
+        # The earlier computation at the Enforcement block captured state BEFORE Step 2 actions ran;
+        # if 'Enable opt-in for SecureBoot management' was invoked this run, opt-in is now set
+        # and the stale warning must not appear in the card or SecureBootStatus field.
+        if ($EnforceSvnCompliance -eq 'Enforce SVN') {
+            $certsPendingOrPresent = ($has2023InDb -or ($null -ne $certStatus -and $certStatus.EventId -in @(1800, 1799, 1808)))
+            $enforceMissingOptIn = ((-not $optInStatus.IsOptedIn) -and -not $certsPendingOrPresent)
+        }
+        else {
+            $enforceMissingOptIn = $false
+        }
+        
         $telemetryLabel = if ($null -eq $optInStatus.AllowTelemetry) { 'Not set (OS default)' }
                           else { switch ($optInStatus.AllowTelemetry) { 0 { '0 (Off)' } 1 { '1 (Required)' } 2 { '2 (Enhanced)' } 3 { '3 (Full)' } default { $optInStatus.AllowTelemetry } } }
         Write-Log "INFO" "AllowTelemetry: $telemetryLabel"
@@ -4423,6 +5679,57 @@ end {
             break
         }
         
+        # State 2b: Virtualized (VMware / VirtualBox guest - hypervisor-managed Secure Boot)
+        # Cert rotation is not the guest OS's responsibility; skip the Action Required / Pending
+        # routing that would otherwise misreport a VM as broken.
+        ($secureBoot -eq 'Enabled' -and $null -ne $hypervisor) {
+            $statusKey     = 'Virtualized'
+            $cardIconColor = '#5BC0DE'
+            $statusRowHtml = "<i class='fas fa-cube' style='color:#5BC0DE;'></i> Virtualized ($hypervisor)"
+            $hvGuide = switch ($hypervisor) {
+                'VMware'     { '<a href="https://kb.vmware.com/s/article/2146528" target="_blank" rel="nofollow noopener noreferrer">VMware Secure Boot guidance</a>' }
+                'VirtualBox' { '<a href="https://www.virtualbox.org/manual/UserManual.html#efi-secure-boot" target="_blank" rel="nofollow noopener noreferrer">VirtualBox Secure Boot guidance</a>' }
+                default      { $null }
+            }
+            $detailRowHtml = "Secure Boot is managed by the <b>$hypervisor</b> hypervisor. " +
+                             "Certificate rotation (CA 2023) is not applied from within the guest OS; " +
+                             "update the VM configuration or hypervisor template to enroll 2023 keys."
+            if ($null -ne $hvGuide) { $detailRowHtml += "<br />$hvGuide" }
+            $plainText     = "[VM] $hypervisor guest - Secure Boot cert rotation is hypervisor-managed."
+            $statusEmoji   = '[VM]'
+            break
+        }
+        
+        # State 2c: PK Untrusted (PKFail / CVE-2024-8105)
+        # The Platform Key in the firmware is a publicly-known placeholder (AMI Test PK or
+        # similar "DO NOT TRUST" cert). The private key is public, so the root of
+        # Secure Boot's chain of trust is broken: anyone can sign KEK/db/dbx updates.
+        # This overrides Compliant/Pending below because structural presence of 2023
+        # certs is moot when an attacker can re-enroll arbitrary KEKs at will.
+        # $null -eq $hypervisor guard is belt-and-braces against future clause reorders.
+        ($secureBoot -eq 'Enabled' -and -not $pkIsTrusted -and $null -eq $hypervisor) {
+            $statusKey     = 'PKUntrusted'
+            $cardIconColor = '#D9534F'
+            $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required <span style="color:#D9534F;">(PK Untrusted)</span>'
+            
+            $oemBiosGuide = Get-OemBIOSUpdateGuide
+            $biosGuideHtml = if ($oemBiosGuide) {
+                '<br /><a href="' + $oemBiosGuide + '" target="_blank" rel="nofollow noopener noreferrer">OEM BIOS/Firmware Update Guide</a>'
+            }
+            else { '' }
+            
+            $detailRowHtml =
+                'The Platform Key (PK) in the BIOS is a publicly-known placeholder<br />' +
+                '(<b>PKFail / CVE-2024-8105</b>). The private key is public, so Secure<br />' +
+                'Boot''s chain of trust is effectively broken. Even with 2023 certs in<br />' +
+                'db, an attacker can sign and enroll rogue KEK/db/dbx entries and<br />' +
+                'persist a bootkit. A BIOS/firmware update from the OEM is required.' + $biosGuideHtml
+            
+            $plainText   = '❌ Secure Boot Enabled but PK is a AMI test key (PKFail / CVE-2024-8105). Chain of trust broken. BIOS update required.'
+            $statusEmoji = '❌'
+            break
+        }
+        
         # State 3: Compliant (Secure Boot enabled + Event 1808 found OR UEFICA2023Status == Updated)
         ($secureBoot -eq 'Enabled' -and ($certStatus.Status -eq 'Compliant' -or ($null -ne $servicingStatus -and $servicingStatus.UEFICA2023Status -eq 'Updated'))) {
             $statusKey     = 'Compliant'
@@ -4450,8 +5757,8 @@ end {
             else {
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
                 $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.'
-                # Compliant via servicing registry (UEFICA2023Status=Updated) without Event 1808 in log
-                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Servicing status: Updated'
+                # Compliant via servicing registry (UEFICA2023Status=Updated) without any SecureBoot events
+                $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> No events found. Status confirms compliant.'
                 $plainText     = '✅ Secure Boot Enabled. Certificates up to date (UEFICA2023Status=Updated). Compliant.'
             }
             $statusEmoji = '✅'
@@ -4459,13 +5766,14 @@ end {
         }
         
         # State 4: Pending (Secure Boot enabled + Event 1801 found)
-        # 1801 indicates certs available but not yet applied - usually resolves on its own via WU
+        # 1801/1803 indicate certs available but not yet applied - may resolve via WU, or signal OEM blocker
         ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'ActionRequired') {
             $statusKey     = 'Pending'
             $cardIconColor = '#F0AD4E'
             $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
             $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
-            $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
+            $latestEventId = if ($certStatus.EventId) { $certStatus.EventId } else { 1801 }
+            $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event ' + $latestEventId + ' detected at ' + $eventTime
             
             $oemKeyGuide = Get-OemKeyResetGuide
             $bitlockerNote = '<br /><br />Suspend BitLocker or have recovery keys handy for <br />each enabled volume before resetting keys.'
@@ -4478,18 +5786,53 @@ end {
             }
             
             if ($has2023InDb) {
-                # Check if firmware is actively rejecting a write (1795) alongside a missing KEK
+                # Check if firmware is actively rejecting a write (1795) or signaling OEM blocker (1803) alongside a missing KEK
                 $has1795 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
+                $has1803 = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1803)
                 if ($has1795 -and -not $has2023InKek) {
-                    # Firmware is rejecting the KEK write - OEM BIOS update likely needed
+                    # Firmware is rejecting the KEK write - the OEM PK lacks authority to sign/validate
+                    # the new Microsoft KEK 2K CA 2023. Without a BIOS update that extends PK trust,
+                    # future db additions and dbx revocations will break after KEK 2011 expiration (June).
                     $statusKey     = 'ActionRequired'
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Event 1795 detected at ' + $eventTime
                     $oemBiosGuide = Get-OemBIOSUpdateGuide
                     $biosGuideHtml = if ($oemBiosGuide) { '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>' } else { '' }
-                    $detailRowHtml = '2023 db certs are present, but the firmware is rejecting<br />the KEK 2K CA 2023 write (Event 1795).<br />A BIOS/firmware update from the OEM is likely required<br />to support the new KEK signing authority.' + $biosGuideHtml
-                    $plainText     = "❌ Secure Boot Enabled. Firmware rejecting KEK write (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
+                    $dbxRevocationUrl = 'https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/DBX/dbx_info_msft_latest.json'
+                    $detailRowHtml = '2023 db certs are present, but the firmware is rejecting<br />' +
+                                     'the KEK 2K CA 2023 update (Event 1795).<br /><br />' +
+                                     'A BIOS/firmware update from the OEM is required to update<br />' +
+                                     'the PK, which signs and validates the KEK 2K CA.<br />' +
+                                     'Without it, future updates to both the db (safe list) and the dbx<br />' +
+                                     '(<a href="' + $dbxRevocationUrl + '" target="_blank">revocations</a>) ' +
+                                     'will break after KEK 2011 expiration (June 2026).' + $biosGuideHtml
+                    $plainText     = "❌ Secure Boot Enabled. OEM PK does not authorize/sign KEK 2K CA 2023 (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
+                    $statusEmoji = '❌'
+                }
+                elseif ($has1803 -and -not $has2023InKek) {
+                    # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
+                    # The PK itself is valid; the OEM has simply not yet published a PK-signed
+                    # KEK 2023 update to Microsoft for Windows Update to serve. This is a
+                    # distribution gap, not a firmware authority issue, so a user BIOS update
+                    # will only help if the OEM bundles the new KEK into that firmware image.
+                    # The primary resolution path is OEM publication through WU.
+                    $statusKey     = 'ActionRequired'
+                    $cardIconColor = '#D9534F'
+                    $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
+                    $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Event 1803 detected at ' + $eventTime
+                    $dbxRevocationUrl = 'https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/DBX/dbx_info_msft_latest.json'
+                    $detailRowHtml = '2023 db certs are present, but KEK 2K CA 2023 is missing<br />' +
+                                     'and no PK-signed KEK 2023 update was found via Windows<br />' +
+                                     'Update (Event 1803).<br /><br />' +
+                                     'This is a service gap rathern than a firmware or PK issue:<br />' +
+                                     'the OEM has not yet published a PK-signed KEK 2023 update<br />' +
+                                     'to Microsoft for WU to serve. Resolution requires the OEM<br />' +
+                                     'to ship that KEK update (via WU or bundled in firmware).<br /><br />' +
+                                     'Without KEK 2023, future updates to both the db (safe list)<br />' +
+                                     'and the dbx (<a href="' + $dbxRevocationUrl + '" target="_blank">revocations</a>) ' +
+                                     'will break after<br />KEK 2011 expiration (June 2026).'
+                    $plainText     = '❌ Secure Boot Enabled. No PK-signed KEK 2023 available via WU (Event 1803). Awaiting OEM publication through Microsoft.'
                     $statusEmoji = '❌'
                 }
                 else {
@@ -4513,13 +5856,15 @@ end {
                     $statusEmoji = '⚠️'
                 }
                 elseif ($has1803) {
-                    # Event 1803 confirms OEM has NOT provided a PK-signed KEK
-                    # This is a genuine blocker - key reset or OEM firmware update required
+                    # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
+                    # The OEM has not yet published a PK-signed KEK update to Microsoft for WU
+                    # to serve. 2023 certs are in dbDefault, so a BIOS key reset pulls them in
+                    # immediately; otherwise wait on OEM publication.
                     $statusKey     = 'ActionRequired'
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
-                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1801 detected at ' + $eventTime
-                    $detailRowHtml = "KEK 2K CA 2023 not available - OEM has not provided a<br />PK-signed KEK update (Event 1803).<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Wait for OEM firmware update that includes KEK 2023<br />• Reset Secure Boot keys in BIOS to apply from defaults" + $bitlockerNote + $guideHtml
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1803 detected at ' + $eventTime
+                    $detailRowHtml = "KEK 2K CA 2023 is missing and no PK-signed KEK 2023 update<br />was found via Windows Update (Event 1803).<br />This is a distribution gap: the OEM has not yet published<br />a PK-signed KEK 2023 update to Microsoft for WU to serve.<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Reset Secure Boot keys in BIOS to apply from defaults<br />• Wait on OEM to publish PK-signed KEK 2023 via WU" + $bitlockerNote + $guideHtml
                     $plainText     = '❌ Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required.'
                     $statusEmoji = '❌'
                 }
@@ -4563,13 +5908,18 @@ end {
                     $statusEmoji = '⚠️'
                 }
                 elseif ($has1803) {
-                    # Event 1803 confirms OEM blocker - KEK not available, cert not in defaults
+                    # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
+                    # With no 2023 cert anywhere (db or dbDefault) AND no PK-signed KEK update
+                    # available via WU, resolution requires the OEM to publish a PK-signed KEK
+                    # update to Microsoft. A bundled firmware update that ships the new KEK
+                    # would also resolve it, but the primary path is WU delivery once the OEM
+                    # has published.
                     $statusKey     = 'ActionRequired'
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
-                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1801 detected at ' + $eventTime
-                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />OEM has not provided a PK-signed KEK update (Event 1803).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support. Update before June 2026.' + $biosGuideHtml
-                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing, OEM KEK not available (1803). BIOS update required.'
+                    $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1803 detected at ' + $eventTime
+                    $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />No PK-signed KEK 2023 update was found via Windows<br />Update (Event 1803).<br /><br />This is a distribution gap: the OEM has not yet published<br />a PK-signed KEK 2023 update to Microsoft for WU to serve.<br />Resolution requires OEM publication (via WU or firmware).<br />Expected before June 2026.' + $biosGuideHtml
+                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing; no PK-signed KEK 2023 via WU (Event 1803). Awaiting OEM publication.'
                     $statusEmoji = '❌'
                 }
                 else {
@@ -4635,7 +5985,7 @@ end {
         # State 5b: Pending (Secure Boot enabled, no state events or only non-state events)
         # Sub-branches based on whether 2023 cert exists in db or dbDefault
         ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Pending' -and -not $postTriggerState) {
-            # Check if we have meaningful deployment events (1799/1800/1037/1042) vs truly no events
+            # Check if there are meaningful deployment events (1799/1800/1037/1042) vs truly no events
             $hasDeploymentEvents = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1799) -or
                                    (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1800) -or
                                    (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1037) -or
@@ -4807,16 +6157,48 @@ end {
     # Append SVN context to detail text when SVN data is available
     # This gives a quick rundown of SVN status alongside the cert-focused detail
     if ($null -ne $svnStatus) {
-        $svnRebootNeeded = ($svnStatus.RebootPending -or $svnStatus.RevocationAppliedPendingReboot)
-        # Append "Pending SVN Reboot" to card title when reboot is needed
-        if ($svnRebootNeeded) {
+        $svnPendingUpdate = ($null -ne $svnStatus.PendingUpdate -and $svnStatus.PendingUpdate)
+        $svnNotApplied    = ($null -ne $svnStatus.SvnNotApplied -and $svnStatus.SvnNotApplied)
+        $svnRebootNeeded = ($svnStatus.RebootPending -or $svnStatus.RevocationAppliedPendingReboot -or $svnPendingUpdate -or $svnNotApplied)
+        # Title suffix precedence, most-specific first:
+        #   1. SvnNotApplied  -> firmware already booted since the last DBX write
+        #      (Event 1034/1042 predates lastBootTime) and still refused to absorb.
+        #      RED suffix "(SVN Update Not Applied: X)" - surfaces the OEM/BIOS
+        #      escalation signal at the top of the card so operators don't keep
+        #      rebooting a stuck device.
+        #   2. PendingUpdate  -> firmware at prior SVN, reboot hasn't happened yet
+        #      since the DBX write. AMBER suffix "(Pending SVN Update: X)". Benign.
+        #   3. Generic RebootNeeded -> fallback for 3-of-3 missing or revocation-
+        #      reboot or cmdlet-path RebootPending without component detail.
+        # All three are reliably distinguishable thanks to the raw-DBX max-SVN fix
+        # (see Get-DbxBootMgrSVN / https://github.com/PowerShell/PowerShell/issues/27058).
+        if ($svnNotApplied) {
+            $compList = @($svnStatus.SvnNotAppliedComponents) -join ', '
+            $compSafe = [System.Net.WebUtility]::HtmlEncode($compList)
+            $statusRowHtml += ' <span style="color:#D9534F; font-size:0.85em;">(SVN Update Not Applied: ' + $compSafe + ')</span>'
+            if ($plainText -notmatch 'SVN') {
+                $plainText += " SVN update not applied ($compList), firmware did not absorb after reboot."
+            }
+        }
+        elseif ($svnPendingUpdate) {
+            $compList = @($svnStatus.PendingUpdateComponents) -join ', '
+            $compSafe = [System.Net.WebUtility]::HtmlEncode($compList)
+            $statusRowHtml += ' <span style="color:#F59E0B; font-size:0.85em;">(Pending SVN Update: ' + $compSafe + ')</span>'
+            if ($plainText -notmatch 'SVN') {
+                $plainText += " Pending SVN update ($compList)."
+            }
+        }
+        elseif ($svnRebootNeeded) {
             $statusRowHtml += ' <span style="color:#F59E0B; font-size:0.85em;">(Pending SVN Reboot)</span>'
             if ($plainText -notmatch 'SVN') {
                 $plainText += ' Pending SVN reboot.'
             }
         }
         # Append SVN summary, so the SVN line is the single source of action status for both certs and SVN
-        $svnSummary = if ($svnRebootNeeded) {
+        $svnSummary = if ($svnNotApplied) {
+            'Firmware refused to apply SVN update after reboot.<br />OEM BIOS/firmware update or escalation may be required <br />if this does not resolve on it''s own.'
+        }
+        elseif ($svnRebootNeeded) {
             'Reboot required to complete SVN updates.'
         }
         elseif ($svnStatus.IsCompliant) {
@@ -4834,6 +6216,27 @@ end {
         }
         if ($svnSummary) { $detailRowHtml += "<br />$svnSummary" }
         # Keep $statusEmoji unchanged. Cert compliance is still valid, SVN info is supplemental
+    }
+    
+    # Append the current SVN stage to the plaintext SecureBootStatus field so operators
+    # reading the single-line field can see "Stage N" without opening the card.
+    # Suppress only when:
+    #   (a) Secure Boot is Disabled / NotApplicable / Unknown / Virtualized (stage is meaningless)
+    #   (b) Device is truly done: $statusKey = 'Compliant' AND no SVN reboot pending AND
+    #       $svnStatus.IsCompliant (firmware SVN == staged SVN). The "Compliant (Pending SVN Reboot)"
+    #       variant leaves $statusKey = 'Compliant' while the device still has work - stage is still
+    #       relevant there, so the old $statusKey-only check was over-suppressing.
+    # Also skip when the line already references a stage.
+    $trulyDone = ($statusKey -eq 'Compliant') -and
+                 (-not $svnRebootNeeded) -and
+                 ($null -ne $svnStatus -and $svnStatus.IsCompliant)
+    $suppressStage = $trulyDone -or
+                     ($statusKey -in @('Disabled', 'NotApplicable', 'Unknown', 'Virtualized', 'PKUntrusted')) -or
+                     ($secureBoot -ne 'Enabled')
+    if (-not $suppressStage -and $null -ne $svnStatus -and -not [string]::IsNullOrWhiteSpace($svnStatus.Stage)) {
+        if ($plainText -notmatch '(?i)\bstage\b') {
+            $plainText = "$plainText | $($svnStatus.Stage)"
+        }
     }
     
     # Update "Last Event" if a newer event exists beyond the cert-state event (e.g. 1037, 1042)
@@ -4890,9 +6293,36 @@ end {
         if ($preAvVal -band 0x0004)  { $certsUnconfirmed += 'KEK 2K CA 2023' }
     }
     
+    # PK is the blocker when: Event 1795 (firmware rejected write) is firing AND the KEK 2K CA 2023
+    # is still missing from the firmware KEK database. The PK itself is a legitimate OEM cert, but
+    # it does not carry the authority chain needed to authorize the new Microsoft KEK 2K CA 2023 -
+    # an OEM BIOS/firmware update is required to extend PK trust. Used by Build-CertInventorySection
+    # to flip the PK row from green check to red X and by the plaintext summary downstream.
+    # NOTE: Event 1803 is deliberately NOT a PK-blocker. 1803 means the OS could not locate a
+    # PK-signed KEK 2023 update to install - the PK itself is valid, the OEM simply has not
+    # published a PK-signed KEK update to Microsoft for Windows Update to serve. That is a
+    # distribution gap, not a PK authority problem, so the PK row stays green.
+    $pkBlockingKek = $false
+    if ($secureBoot -eq 'Enabled' -and $pkCerts.Count -gt 0 -and $pkIsTrusted -and $null -eq $hypervisor) {
+        $has1795ForPk = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
+        if ($has1795ForPk -and -not $has2023InKek) {
+            $pkBlockingKek = $true
+        }
+    }
+    
     # Certificate inventory (all four 2023 certs - only when Secure Boot is Enabled)
     if ($secureBoot -eq 'Enabled') {
         $cardProperties['Certificates'] = Build-CertInventorySection -Format 'Html'
+    }
+    # PK Security Alert (PKFail / CVE-2024-8105) - detailed remediation narrative when PK is untrusted.
+    # Placed right after Certificates so the red PK inventory row and the alert section sit together.
+    # Delegated to Build-PkSecurityAlertSection so the Html (Ninja) and Local outputs share one source of truth.
+    if ($statusKey -eq 'PKUntrusted') {
+        $cardProperties['PK Security Alert'] = Build-PkSecurityAlertSection -Format 'Html'
+    }
+    # Factory defaults - only surface when something is missing (healthy devices get no row)
+    if ($secureBoot -eq 'Enabled' -and ($defaultsAllMissing -or $defaultsSomeMissing)) {
+        $cardProperties['Factory Defaults'] = Build-FactoryDefaultsSection -Format 'Html'
     }
     # Servicing status (only when Secure Boot is Enabled and servicing data exists)
     if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
@@ -4978,6 +6408,129 @@ end {
     if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
         $cardProperties[$svnSectionTitle] = Build-SvnComplianceSection -Format 'Html'
     }
+    
+    # Boot media check: runs regardless of state to catch outdated 2011-signed bootable USB/CD
+    # attached to the device. Only emits a card section when outdated media is detected.
+    # Result cached in $bootMediaResult so the Html + Local paths share one scan + rendering.
+    $bootMediaResult = $null
+    try {
+        $bootMediaResult = Test-BootMediaPca2023 -DeepScan:$DeepBootMediaScan
+        if ($null -ne $bootMediaResult -and $bootMediaResult.Outdated.Count -gt 0) {
+            # Surface on plaintext SecureBootStatus field + activity log (must run exactly once)
+            $outdatedCount = $bootMediaResult.Outdated.Count
+            $plainText += " [!] $outdatedCount outdated boot file(s) on attached media."
+            Write-Log "WARNING" "Outdated boot media detected on $($bootMediaResult.MediaScanned) volume(s): $outdatedCount file(s) PCA-2011-signed"
+        }
+    }
+    catch {
+        Write-Log "INFO" "Boot media scan failed: $($_.Exception.Message)"
+    }
+    if ($null -ne $bootMediaResult -and $bootMediaResult.Outdated.Count -gt 0) {
+        $cardProperties['Boot Media'] = Build-BootMediaSection -Format 'Html' -Result $bootMediaResult
+    }
+    
+    # KEK Update Availability: when KEK 2023 is missing AND the firmware is actively rejecting
+    # writes (Event 1795) or missing PK-signed KEK (Event 1803), check if Microsoft publishes
+    # a vendor-signed KEK update for this PK. This guides the Action Required messaging.
+    # Result cached in $kekLookupResult so the Html + Local paths share one lookup + rendering.
+    $kekLookupResult = $null
+    $kekNeedsLookup = ($secureBoot -eq 'Enabled' -and -not $has2023InKek -and
+                       ((Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795) -or
+                        (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1803)))
+    if ($kekNeedsLookup -and $pkCerts.Count -gt 0) {
+        $pkThumbprint = $null
+        foreach ($pkc in $pkCerts) {
+            if ($pkc.PSObject.Properties['Thumbprint'] -and -not [string]::IsNullOrWhiteSpace([string]$pkc.Thumbprint)) {
+                $pkThumbprint = [string]$pkc.Thumbprint
+                break
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($pkThumbprint)) {
+            Write-Log "INFO" "Looking up KEK 2023 update availability for PK thumbprint $pkThumbprint"
+            $kekLookupResult = Get-KekUpdateAvailability -PkThumbprint $pkThumbprint
+            if ($kekLookupResult.Succeeded -and $kekLookupResult.Available) {
+                Write-Log "INFO" "KEK 2023 vendor update available ($($kekLookupResult.Vendors -join ', '))"
+            }
+            elseif (-not $kekLookupResult.Succeeded) {
+                Write-Log "INFO" "KEK update lookup skipped: $($kekLookupResult.Error)"
+            }
+        }
+    }
+    if ($null -ne $kekLookupResult -and $kekLookupResult.Succeeded -and $kekLookupResult.Available) {
+        $cardProperties['KEK Update Available'] = Build-KekUpdateAvailabilitySection -Format 'Html' -Result $kekLookupResult
+    }
+    
+    # DBX Validation: cross-reference firmware DBX against DBX .bin update files staged by
+    # Windows servicing (C:\Windows\System32\SecureBootUpdates\). Answers the actionable
+    # question "did the Secure-Boot-Update scheduled task successfully commit what servicing
+    # staged?" - no network call, no aspirational compare. Runs whenever Secure Boot is
+    # Enabled and DBX bytes are available; staged .bin presence is what determines if the
+    # check produces output (absent files -> Succeeded=$false, silently skipped).
+    # Result cached in $dbxValidationResult so Html + Local share one comparison + rendering.
+    # The early pass (near $svnStatus decoration) may have already populated this to
+    # feed the top-level "Pending SVN Update" classification - reuse it when present.
+    if ($null -eq $dbxValidationResult -and $secureBoot -eq 'Enabled' -and $null -ne $dbxBytes) {
+        $dbxValidationResult = Compare-DbxAgainstStagedBins -DbxBytes $dbxBytes
+    }
+    if ($null -ne $dbxValidationResult) {
+        Write-Log "INFO" "Running DBX validation against staged updates in C:\Windows\System32\SecureBootUpdates"
+        if ($dbxValidationResult.Succeeded) {
+            Write-Log "INFO" "DBX validation: $($dbxValidationResult.MatchedCount) matched, $($dbxValidationResult.MissingCount) missing, $($dbxValidationResult.SupersededCount) superseded of $($dbxValidationResult.RequiredCount) staged (across $($dbxValidationResult.FilesScanned) file(s))"
+            $mc = @($dbxValidationResult.MissingComponents)
+            if ($mc.Count -gt 0) {
+                # Classify the miss pattern for log severity and wording. Five cases,
+                # mirroring Build-SvnComplianceSection's card-side branch logic:
+                #   1. All 3 missing + every firmware SVN null  -> pre-rollout (Stage 1/2),
+                #      Microsoft hasn't pushed the revocation yet. INFO, reassuring.
+                #   2. All 3 missing + at least one firmware SVN populated -> pre-reboot
+                #      (Stage 3/4 with fresh staged cumulative). INFO, pending reboot.
+                #   3. 1-2 missing + every missing has prior SVN + firmware had NO chance
+                #      (lastBootTime < latest(1034,1042)) -> benign pending SVN update,
+                #      reboot will apply. INFO.
+                #   4. 1-2 missing + every missing has prior SVN + firmware HAD a chance
+                #      (lastBootTime > latest(1034,1042)) -> firmware refused to absorb
+                #      after reboot. WARNING - operators need to know reboot won't fix it.
+                #      Uses $svnStatus.SvnNotApplied as the authoritative signal.
+                #   5. 1-2 missing + at least one has NO firmware SVN -> true partial
+                #      firmware commit, component-asymmetric rejection. WARNING.
+                $descLines = foreach ($m in $mc) {
+                    $r = if ([string]::IsNullOrWhiteSpace([string]$m.RequiredSvn)) { 'n/a' } else { [string]$m.RequiredSvn }
+                    $f = if ([string]::IsNullOrWhiteSpace([string]$m.FirmwareSvn)) { 'absent' } else { [string]$m.FirmwareSvn }
+                    "$($m.Component)(staged=$r, raw firmware=$f)"
+                }
+                $firmwareHasAnySvn       = (@($mc | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.FirmwareSvn) }).Count -gt 0)
+                $everyMissingHasPriorSvn = (@($mc | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.FirmwareSvn) }).Count -eq 0)
+                $svnStuckAfterBoot       = ($null -ne $svnStatus -and $null -ne $svnStatus.SvnNotApplied -and $svnStatus.SvnNotApplied)
+                if ($mc.Count -lt 3 -and $svnStuckAfterBoot) {
+                    $severity  = 'WARNING'
+                    $qualifier = 'SVN update not applied after reboot - firmware refused to absorb, reboot will not resolve'
+                }
+                elseif ($mc.Count -lt 3 -and $everyMissingHasPriorSvn) {
+                    $severity  = 'INFO'
+                    $qualifier = 'pending SVN update - firmware at prior SVN for missing component(s), reboot will apply'
+                }
+                elseif ($mc.Count -lt 3) {
+                    $severity  = 'WARNING'
+                    $qualifier = 'partial firmware commit - component-asymmetric, reboot will not resolve'
+                }
+                elseif ($firmwareHasAnySvn) {
+                    $severity  = 'INFO'
+                    $qualifier = 'all three missing, firmware has prior SVN entries - consistent with pre-reboot state'
+                }
+                else {
+                    $severity  = 'INFO'
+                    $qualifier = 'all three missing, firmware has no prior SVN entries - pre-rollout state (Stage 1/2, awaiting Microsoft enforcement June 2026 - 2027)'
+                }
+                Write-Log $severity "SVN components not absorbed by firmware ($qualifier): $($descLines -join ', ')"
+            }
+        }
+        else {
+            Write-Log "INFO" "DBX validation skipped: $($dbxValidationResult.Error)"
+        }
+    }
+    if ($null -ne $dbxValidationResult -and $dbxValidationResult.Succeeded) {
+        $cardProperties['DBX Validation'] = Build-DbxValidationSection -Format 'Html' -Result $dbxValidationResult
+    }
     # Bucket / confidence (from event message metadata)
     if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
         $cardProperties['Rollout Tier'] = Build-RolloutTierSection -Format 'Html'
@@ -5021,6 +6574,16 @@ end {
         if ($secureBoot -eq 'Enabled') {
             $localCardProperties['Certificates'] = Convert-FaIconsToEmoji (Build-CertInventorySection -Format 'Html')
         }
+        # PK Security Alert - parity with Ninja card. Built with 'Local' Format so the header icon renders
+        # as an emoji (Format-CardIcon -> '❌') instead of FontAwesome. Rest of the body is format-agnostic
+        # HTML (details/links/code) that renders identically in both targets.
+        if ($statusKey -eq 'PKUntrusted') {
+            $localCardProperties['PK Security Alert'] = Build-PkSecurityAlertSection -Format 'Local'
+        }
+        # Factory defaults - parity with Ninja card. Only surfaced when something is missing.
+        if ($secureBoot -eq 'Enabled' -and ($defaultsAllMissing -or $defaultsSomeMissing)) {
+            $localCardProperties['Factory Defaults'] = Convert-FaIconsToEmoji (Build-FactoryDefaultsSection -Format 'Html')
+        }
         if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
             $servContent = Build-ServicingSection -Format 'Html'
             if ($null -ne $servContent) { $localCardProperties['Servicing'] = Convert-FaIconsToEmoji $servContent }
@@ -5034,6 +6597,20 @@ end {
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
             $localCardProperties[(Convert-FaIconsToEmoji $svnSectionTitle)] = Convert-FaIconsToEmoji (Build-SvnComplianceSection -Format 'Html')
+        }
+        # Boot Media - parity with Ninja card. Reuses the cached $bootMediaResult from Step 4.
+        if ($null -ne $bootMediaResult -and $bootMediaResult.Outdated.Count -gt 0) {
+            $localCardProperties['Boot Media'] = Convert-FaIconsToEmoji (Build-BootMediaSection -Format 'Html' -Result $bootMediaResult)
+        }
+        # KEK Update Available - parity with Ninja card. Reuses the cached $kekLookupResult from Step 4.
+        if ($null -ne $kekLookupResult -and $kekLookupResult.Succeeded -and $kekLookupResult.Available) {
+            $localCardProperties['KEK Update Available'] = Convert-FaIconsToEmoji (Build-KekUpdateAvailabilitySection -Format 'Html' -Result $kekLookupResult)
+        }
+        # DBX Validation - parity with Ninja card. Reuses the cached $dbxValidationResult from Step 4 so the
+        # staged-file comparison runs only once per execution. 'Html' Format + Convert-FaIconsToEmoji for
+        # consistency with the other Build-* calls in this block.
+        if ($null -ne $dbxValidationResult -and $dbxValidationResult.Succeeded) {
+            $localCardProperties['DBX Validation'] = Convert-FaIconsToEmoji (Build-DbxValidationSection -Format 'Html' -Result $dbxValidationResult)
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus -and $null -ne $certStatus.Confidence) {
             $localCardProperties['Rollout Tier'] = Convert-FaIconsToEmoji (Build-RolloutTierSection -Format 'Html')
@@ -5160,8 +6737,22 @@ end {
             }
         }
         if ($null -ne $svnStatus) {
+            # Mirror Build-SvnComplianceSection's partial-commit detection so console output
+            # doesn't diverge from the card label for operators reading both.
+            $consolePartialCommit = $false
+            $consolePartialNames  = @()
+            if ($null -ne $dbxValidationResult -and $dbxValidationResult.Succeeded) {
+                $cm = @($dbxValidationResult.MissingComponents)
+                if ($cm.Count -gt 0 -and $cm.Count -lt 3) {
+                    $consolePartialCommit = $true
+                    $consolePartialNames  = @($cm | ForEach-Object { $_.Component })
+                }
+            }
             if ($svnStatus.IsCompliant) {
                 Write-Host "SVN Status  : Compliant"
+            }
+            elseif ($consolePartialCommit) {
+                Write-Host "SVN Status  : Firmware partial-commit: $($consolePartialNames -join ', ') SVN rejected (reboot will not resolve)"
             }
             elseif ($svnStatus.RebootPending) {
                 Write-Host "SVN Status  : Pending SVN reboot - firmware SVN update not yet applied"
