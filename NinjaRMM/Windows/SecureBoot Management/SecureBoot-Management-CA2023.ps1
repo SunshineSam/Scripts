@@ -1,9 +1,81 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 04-24-2026
+    Last Edit: 04-29-2026
     
     Note:
+    04-29-2026: SVN section now surfaces all five SVNs explicitly:
+                  the cmdlet-conventional trio (Firmware / Boot Manager / Staged) and
+                  the always-raw additional components (CdBoot / WdsMgr). Result hash
+                  exposes CdBootSVN and WdsMgrSVN sourced from the same Get-DbxComponentSVNs
+                  pass that feeds FirmwareSVN, so the values are guaranteed consistent
+                  with the per-component log line.
+                  Previously CdBoot/WdsMgr were only visible in the per-component log
+                  line; now they sit alongside Firmware/BootMgr/Staged on the card so
+                  operators can verify all three boot components at a glance (especially
+                  useful when only BootMgr moves and the others lag).
+                - SvnUpdatePending and RebootPending now floor-gated so a higher-numbered
+                  staged SVN does not generate "Pending SVN Reboot" overlays or
+                  "SVN update pending" callouts when firmware is already at or above
+                  the documented compliance floor. Previously a Stage-4-complete device
+                  (firmware 7.0, staged 8.0) reported "Compliant (Pending SVN Reboot)"
+                  with "SVN update pending (DBXUpdateSVN.bin 8.0 not yet in DBX)" at the
+                  same time the DBX validation summary said "Staged DBX fully applied"
+                  because the SVN entry was correctly marked superseded by floor but
+                  the pending-reboot signals were still firing on raw firmware<staged.
+                  Two gates applied: $svnUpdatePending in Get-SecureBootSVNStatus (now
+                  $false when floorMet) and the $svnRebootPending check in the post-DBX
+                  classification block (now skips entirely when $svnStatus.IsCompliant).
+                  A higher staged SVN is a future version Microsoft has shipped ahead of
+                  any actual enforcement. Bump the floor when live to report compliance.
+                - SVN compliance is now authoritative from $script:SVN_COMPLIANCE_FLOORS,
+                  not the Get-SecureBootSVN cmdlet's ComplianceStatus string. The cmdlet
+                  computes its narrative from its own FirmwareSVN reading, which the
+                  PowerShell#27058 bug silently under-reports - on a Stage-4-complete
+                  device (raw firmware SVN 7.0) the cmdlet returns FirmwareSVN=2.0 and
+                  ComplianceStatus="Not compliant - Firmware does not match boot manager".
+                  Trusting that string flipped the card to "Not compliant" on a clearly
+                  compliant device. Now: floor met -> Compliant ("Firmware SVN $X >=
+                  floor $Y") regardless of cmdlet narrative; floor missed -> fall back
+                  to the cmdlet's wording (still useful color in the actual non-compliant
+                  case). Same authoritative rule applies on raw-only devices.
+                - Get-WindowsUpdateSVN now strips the ASN.1 authenticode wrapper
+                  (bytes 40..41 == 0x30 0x82) from DBXUpdateSVN.bin before parsing.
+                  Without the strip the EFI_SIGNATURE_LIST walker silently returned
+                  nothing and the card showed "Staged SVN: N/A" on devices that
+                  clearly had a staged update file. Compare-DbxAgainstStagedBins
+                  was already stripping correctly via Get-StrippedDbxBinBytes;
+                  Get-WindowsUpdateSVN is now consistent. Also picks max-by-version
+                  across all BootMgr-prefixed entries.
+                - Added per-component SVN compliance floor ($script:SVN_COMPLIANCE_FLOORS,
+                  default 7.0 for BootMgr / CdBoot / WdsMgr) consulted by the staged-vs-
+                  firmware classifier in Compare-DbxAgainstStagedBins. A SVN-keyed entry
+                  is now marked 'superseded' (compliant) when firmware SVN >= floor,
+                  even if the staged DBXUpdateSVN.bin contains a newer SVN value. Fixes
+                  the false "SVN Update Not Applied (BootMgr)" callout that fired on
+                  Stage 4-compliant devices the moment Microsoft bumped the staged
+                  file's SVN past the active enforcement target (e.g. 7.0 -> 8.0).
+                  Distinguishes DBXUpdate2024.bin (BootMgr SVN 2.0 + 2011 CA revocation)
+                  from DBXUpdateSVN.bin (BootMgr SVN -> rollout-target). Bump the floor
+                  per documented Microsoft milestones.
+                - Consolidated raw-DBX SVN parsing behind a single Get-DbxComponentSVNs
+                  helper so Get-DbxBootMgrSVN, Compare-DbxAgainstStagedBins, and
+                  Get-SecureBootSVNStatus all route through one canonical max-by-version
+                  parser. Values diff cleanly against raw SVNswhen verifying the
+                  PowerShell#27058 workaround on a device.
+                - Get-SecureBootSVNStatus now logs all three boot-component SVNs
+                  (BootMgr / CdBoot / WdsMgr) on every invocation regardless of
+                  cmdlet availability or DBX state ('absent' on pre-rollout devices).
+                - Unified the SVN status contract: same hash shape (FirmwareSVN /
+                  BootManagerSVN / StagedSVN / ComplianceStatus / etc.) returns on
+                  every stage. FirmwareSVN and StagedSVN are now always sourced from
+                  raw DBX bytes (canonical, bug-free) - the cmdlet is consulted only
+                  for the on-disk-only fields BootManagerSVN and BootManagerPath plus
+                  the authoritative ComplianceStatus string, with N/A fallbacks when
+                  KB5077241 is not present. Card / log / console output dropped their
+                  Source-based forks in favor of one identical Firmware / Boot Manager
+                  / Staged presentation, and the Stage 3+ reboot-pending check no
+                  longer gates on Source since both operands are always available.
     04-24-2026: Event 1803 (PK-signed KEK 2023 not available via WU) is now recognized
                   as a state event and routed to Action Required. Previously 1803 was
                   not in $stateEventIds, so a device with 1803 as its most recent
@@ -52,8 +124,7 @@
                     Action Required / Pending ladder.
                   - Added PKDefault / KEKDefault / dbxDefault parsing alongside existing
                     dbDefault. When defaults are missing, a "Factory Defaults" section
-                    surfaces with short-paragraph manual-resolution guidance adapted from
-                    garlin's README_UEFI.TXT (PK+KEK enrollment, KEK-only).
+                    (PK+KEK enrollment, KEK-only).
                   - Added Compare-DbxAgainstStagedBins: parses every dbx*.bin file
                     staged by Windows servicing under
                     C:\Windows\System32\SecureBootUpdates\ and reports which
@@ -204,6 +275,7 @@
                 richer cert parsing without raw byte fallback.
                 SVN Compliance card section now appears after Pending Updates.
                 Sources: garlin's SecureBoot-CA-2023-Updates scripts,
+                    (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates)
                   microsoft/secureboot_objects (GitHub)
     03-24-2026: Manifest cross-referencing has been added, now checks each manifest bit
                 against actual cert presence:
@@ -1145,7 +1217,6 @@ $($sectionsHtml.ToString())
     }
     
     # Helper function: Build factory defaults section (shown only when defaults are missing)
-    # References garlin's README_UEFI.TXT for manual-recovery guidance.
     function Build-FactoryDefaultsSection {
         param ([string]$Format)
         $lines = @()
@@ -1163,14 +1234,14 @@ $($sectionsHtml.ToString())
         if ($defaultsAllMissing) {
             $warn = Format-CardIcon -Type 'warning' -Color '#D9534F' -Format $Format
             $lines += "<span style='color:#D9534F;'>$warn All UEFI default databases are missing - BIOS 'Reset Secure Boot keys' option will not function.</span>"
-            # Manual resolution (adapted from garlin's README_UEFI.TXT - PK + KEK enrollment)
+            # Manual resolution
             $lines += "<details><summary style='cursor:pointer;'>Manual resolution</summary><div style='margin-left:1em; font-size:0.9em;'>Shut down and enter the UEFI Secure Boot menu. Under <i>PK Options</i> (or <i>Key Management &rarr; PK Management</i>), enroll <code>\EFI\Certs\WindowsOEMDevicesPK.der</code> from the EFI partition. Under <i>KEK Options</i> (or <i>Key Management &rarr; KEK Management &rarr; Append Key</i>), enroll <code>\EFI\Updates\Microsoft Corporation KEK 2K CA 2023.der</code>. Save, exit, boot Windows, and re-run this script.<br /><br />If your OEM BIOS does not expose these menus, an OEM firmware update is required.</div></details>"
         }
         elseif ($defaultsSomeMissing) {
             $missing = $order | Where-Object { -not $defaultsPresent[$_] }
             $info = Format-CardIcon -Type 'info' -Color '#F0AD4E' -Format $Format
             $lines += "<span style='color:#F0AD4E;'>$info Partial defaults: $($missing -join ', ') missing.</span>"
-            # KEK-only manual resolution (adapted from garlin's README_UEFI.TXT )
+            # KEK-only manual resolution
             if ($missing -contains 'KEKDefault' -and $missing -notcontains 'PKDefault') {
                 $lines += "<details><summary style='cursor:pointer;'>Manual KEK resolution</summary><div style='margin-left:1em; font-size:0.9em;'>Shut down and enter the UEFI Secure Boot menu. Under <i>KEK Options</i> (or <i>Key Management &rarr; KEK Management &rarr; Append Key</i>), enroll <code>\EFI\Certs\Microsoft Corporation KEK 2K CA 2023.der</code> (fall back to <code>.crt</code> if the <code>.der</code> errors). Save, exit, boot Windows, and re-run this script.</div></details>"
             }
@@ -1431,18 +1502,20 @@ $($sectionsHtml.ToString())
             $svnLabel = $svnStatus.ComplianceStatus
         }
         $parts = @("$svnIcon $svnLabel")
-        # SVN version details
-        if ($svnStatus.Source -eq 'Raw DBX') {
-            $parts += "DBX SVN: $(if ($svnStatus.DbxSVN) { $svnStatus.DbxSVN } else { 'Not present' })"
-            if ($null -ne $svnStatus.WindowsUpdateSVN) {
-                $parts += "Windows Update SVN: $($svnStatus.WindowsUpdateSVN)"
-            }
-        }
-        else {
-            $parts += "Firmware SVN: $($svnStatus.FirmwareSVN)"
-            $parts += "Boot Manager SVN: $($svnStatus.BootManagerSVN)"
-            $parts += "Staged SVN: $($svnStatus.StagedSVN)"
-        }
+        # SVN version details - identical shape on every stage.
+        #   Cmdlet-conventional trio (Firmware / Boot Manager / Staged):
+        #     Firmware SVN     - raw-DBX BootMgr max (canonical, bug-free vs PS#27058)
+        #     Boot Manager SVN - cmdlet-only (on-disk boot manager binary; 'N/A' if KB5077241 absent)
+        #     Staged SVN       - raw-DBX of DBXUpdateSVN.bin BootMgr (canonical)
+        #   Always-raw additional components (CdBoot / WdsMgr): the two other SVN-keyed
+        #   entries that live in the DBX alongside BootMgr but aren't surfaced by the
+        #   cmdlet. Useful as a parity readout when only the BootMgr value moves, and
+        #   for verifying SVN Order cross-checks at a glance.
+        $parts += "Firmware SVN: $($svnStatus.FirmwareSVN)"
+        $parts += "Boot Manager SVN: $($svnStatus.BootManagerSVN)"
+        $parts += "Staged SVN: $($svnStatus.StagedSVN)"
+        $parts += "CdBoot SVN: $($svnStatus.CdBootSVN)"
+        $parts += "WdsMgr SVN: $($svnStatus.WdsMgrSVN)"
         # SVN update pending
         if ($svnStatus.SvnUpdatePending) {
             $pendIcon = Format-CardIcon -Type 'clock' -Color '#F59E0B' -Format $Format
@@ -1787,7 +1860,7 @@ $($sectionsHtml.ToString())
     
     # Hypervisor SignatureOwner GUIDs - PK entries signed with these owners but no cert payload
     # identify the device as a VM guest where Secure Boot cert rotation is hypervisor-managed.
-    # Reference: garlin's Check_UEFI-CA2023.ps1 line 87 (VMware).
+    # Reference: garlin's Check_UEFI-CA2023.ps1 (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates).
     $script:HYPERVISOR_OWNER_GUIDS = @{
         'a3d5e95b-0a8f-4753-8735-445afb708f62' = 'VMware'
     }
@@ -1929,6 +2002,29 @@ $($sectionsHtml.ToString())
     # SHA256 signature type GUID for raw byte parsing
     $script:EFI_CERT_SHA256_GUID = [Guid]::new("c1c41626-504c-4092-aca9-41f936934328")
     
+    # Per-component SVN compliance floor for the current Microsoft rollout phase.
+    # A device whose firmware SVN for a given component is >= the floor below is
+    # considered compliant for the active enforcement window, regardless of what
+    # SVN the staged DBXUpdateSVN.bin happens to contain. Microsoft sometimes
+    # bumps the staged file's SVN ahead of any actual enforcement change (e.g.,
+    # the staged file ships 8.0 while Stage 4 enforcement still targets 7.0), and
+    # a device at the prior level is not "behind" - it is at the enforcement target.
+    #
+    # Distinguishes the two staged .bin sources:
+    #   DBXUpdate2024.bin    - bumps BootMgr SVN to 2.0 + revokes Production CA 2011
+    #   DBXUpdateSVN.bin     - bumps BootMgr SVN to the current rollout target (7.0)
+    # Without this floor the classifier would compare staged-vs-firmware byte SVNs
+    # directly, which produces a false "SVN Update Not Applied" callout the moment
+    # Microsoft pushes a newer-than-enforcement-target SVN into the staged file.
+    #
+    # Bump these values as their SVNs increase.
+    # Last SVN iteration check: April 29th 2026
+    $script:SVN_COMPLIANCE_FLOORS = @{
+        BootMgr = '7.0'
+        CdBoot  = '3.0'
+        WdsMgr  = '3.0'
+    }
+    
     # Extract SVN version from a hex signature data string
     # Source: https://github.com/microsoft/secureboot_objects/blob/main/scripts/utility_functions.py
     function Get-SignatureDataSVN {
@@ -1989,36 +2085,56 @@ $($sectionsHtml.ToString())
         return $sigDataList
     }
     
-    # Read BootMgr SVN from raw UEFI DBX variable bytes.
-    # Adapted from garlin's Check_UEFI-CA2023.ps1 Get-SecureBootUEFI_DBXSVN
-    # Source: https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates
+    # Single canonical raw-DBX SVN parser. Returns an ordered map of the three SVN-keyed
+    # boot components (BootMgr / CdBoot / WdsMgr) -> max SVN string ("X.Y") or $null when
+    # absent. Single source of truth for raw-byte SVN extraction across the script;
+    # consumed by Get-DbxBootMgrSVN, Compare-DbxAgainstStagedBins, and Get-SecureBootSVNStatus
+    # so the parsing path is identical wherever an SVN value originates.
     #
-    # IMPORTANT: explicit max-by-parsed-version. Microsoft's embarrassingly pushed
-    # Get-SecureBootSVN cmdlet, which has an open bug (PowerShell/PowerShell#27058).
-    # It reports whichever matching entry appears LAST in DBX order rather than
-    # the MAX, so a fleet with DBX SVN 7.0 followed by 0.0/2.0 entries silently
-    # reports 2.0. Lex-sort happens to work today because SVN bytes sit at a fixed
-    # hex offset and trailing bytes are stable, but it's one firmware quirk away
-    # from the same failure mode. Parse every candidate, keep the max.
+    # IMPORTANT: explicit max-by-parsed-version. Microsoft's pushed Get-SecureBootSVN
+    # cmdlet has an open bug (PowerShell/PowerShell#27058). It reports whichever matching
+    # entry appears LAST in DBX order rather than the MAX, so a fleet with DBX SVN 7.0
+    # followed by 0.0/2.0 entries silently reports 2.0. Lex-sort happens to work today
+    # because SVN bytes sit at a fixed hex offset and trailing bytes are stable, but it
+    # is one firmware quirk away from the same failure mode. Parse every candidate,
+    # keep the max.
+    function Get-DbxComponentSVNs {
+        param ([byte[]]$DbxBytes)
+        $result = [ordered]@{
+            BootMgr = $null
+            CdBoot  = $null
+            WdsMgr  = $null
+        }
+        if ($null -eq $DbxBytes -or $DbxBytes.Length -eq 0) { return $result }
+        $guidMap = [ordered]@{
+            BootMgr = $script:EFI_BOOTMGR_DBXSVN_GUID
+            CdBoot  = $script:EFI_CDBOOT_DBXSVN_GUID
+            WdsMgr  = $script:EFI_WDSMGR_DBXSVN_GUID
+        }
+        $sigData = @(Get-DbxSignatureData -Bytes $DbxBytes)
+        foreach ($name in $guidMap.Keys) {
+            $guid = $guidMap[$name]
+            $candidates = @($sigData | Where-Object { $_ -match "^$guid" })
+            if ($candidates.Count -eq 0) { continue }
+            $maxVer = $null
+            $maxStr = $null
+            foreach ($c in $candidates) {
+                $svn = Get-SignatureDataSVN $c
+                if ([string]::IsNullOrWhiteSpace($svn)) { continue }
+                try { $v = [version]$svn } catch { continue }
+                if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
+            }
+            if ($null -ne $maxStr) { $result[$name] = $maxStr }
+        }
+        return $result
+    }
+    
+    # Thin convenience wrapper: BootMgr-only. Kept for call-site readability where only
+    # the boot-manager component is needed (the historical primary signal the cmdlet
+    # exposes via FirmwareSVN). Single source of truth lives in Get-DbxComponentSVNs.
     function Get-DbxBootMgrSVN {
         param ([byte[]]$DbxBytes)
-        if ($null -eq $DbxBytes -or $DbxBytes.Length -eq 0) {
-            return $null
-        }
-        $sigData = Get-DbxSignatureData -Bytes $DbxBytes
-        $matches = @($sigData | Where-Object { $_ -match "^$($script:EFI_BOOTMGR_DBXSVN_GUID)" })
-        if ($matches.Count -eq 0) {
-            return $null
-        }
-        $maxVer = $null
-        $maxStr = $null
-        foreach ($m in $matches) {
-            $svn = Get-SignatureDataSVN $m
-            if ([string]::IsNullOrWhiteSpace($svn)) { continue }
-            try { $v = [version]$svn } catch { continue }
-            if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
-        }
-        return $maxStr
+        return (Get-DbxComponentSVNs -DbxBytes $DbxBytes).BootMgr
     }
     
     # Strip the authenticode/ASN.1 signed-header wrapper from a DBX .bin update file so
@@ -2028,6 +2144,8 @@ $($sectionsHtml.ToString())
     # adapted from garlin's Get-UefiDatabaseSignatures: bytes[40..41] == 0x30 0x82 signals
     # an ASN.1 SEQUENCE with 2-byte length; the wrapper is 40 + (length-bytes + 4) bytes.
     # If the marker is absent, the file is already stripped and passed through unchanged.
+    #
+    # Source: https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates
     function Get-StrippedDbxBinBytes {
         param ([byte[]]$Bytes)
         if ($null -eq $Bytes -or $Bytes.Length -lt 44) { return $Bytes }
@@ -2053,7 +2171,7 @@ $($sectionsHtml.ToString())
     # WdsMgr) AND firmware's live SVN for that GUID is >= the required SVN, count as
     # SUPERSEDED. Otherwise it's a real miss - Windows staged it and the scheduled
     # task hasn't successfully committed it to firmware yet.
-    # Reference: garlin's Check_DBXUpdate.bin.ps1 (github.com/garlin-cant-code/SecureBoot-CA-2023-Updates)
+    # Reference: garlin's Check_DBXUpdate.bin.ps1 (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates)
     function Compare-DbxAgainstStagedBins {
         param (
             [byte[]]$DbxBytes,
@@ -2116,22 +2234,18 @@ $($sectionsHtml.ToString())
         # identify components, otherwise pre-rollout devices never attribute a component
         # to their misses. Iterate $guidComponentMap.Keys for component identity.
         #
-        # Uses explicit max-by-parsed-version. NO lex-sort (see Get-DbxBootMgrSVN for
-        # the rationale / https://github.com/PowerShell/PowerShell/issues/27058 reference).
+        # Sourced from the canonical Get-DbxComponentSVNs helper so the parsing path
+        # matches Get-SecureBootSVNStatus / Get-DbxBootMgrSVN exactly.
+        $componentSvnMap   = Get-DbxComponentSVNs -DbxBytes $DbxBytes
+        $componentToGuid   = @{
+            BootMgr = $script:EFI_BOOTMGR_DBXSVN_GUID
+            CdBoot  = $script:EFI_CDBOOT_DBXSVN_GUID
+            WdsMgr  = $script:EFI_WDSMGR_DBXSVN_GUID
+        }
         $firmwareSvnByGuid = @{}
-        $allFirmwareSigs = @(Get-DbxSignatureData -Bytes $DbxBytes)
-        foreach ($guid in $guidComponentMap.Keys) {
-            $candidates = @($allFirmwareSigs | Where-Object { $_ -match "^$guid" })
-            if ($candidates.Count -eq 0) { continue }
-            $maxVer = $null
-            $maxStr = $null
-            foreach ($c in $candidates) {
-                $svn = Get-SignatureDataSVN $c
-                if ([string]::IsNullOrWhiteSpace($svn)) { continue }
-                try { $v = [version]$svn } catch { continue }
-                if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
-            }
-            if ($null -ne $maxStr) { $firmwareSvnByGuid[$guid] = $maxStr }
+        foreach ($name in $componentSvnMap.Keys) {
+            $svn = $componentSvnMap[$name]
+            if ($null -ne $svn) { $firmwareSvnByGuid[$componentToGuid[$name]] = $svn }
         }
         
         # Per-file parse pass: parse each .bin, de-dupe within the file, store normalized
@@ -2158,6 +2272,18 @@ $($sectionsHtml.ToString())
         # Iterates $guidComponentMap (static list of all three GUIDs) rather than
         # $firmwareSvnByGuid (which is empty on pre-Stage-3/4 devices) so component
         # identity is always resolved even when firmware has no prior SVN entries.
+        #
+        # Two distinct routes to 'superseded' for SVN-keyed entries:
+        #   1) Firmware SVN >= staged SVN for this entry. Direct supersede - the
+        #      staged sig is by definition obsolete because firmware already holds
+        #      a newer revocation level for that component.
+        #   2) Firmware SVN >= documented compliance floor for this rollout phase
+        #      ($script:SVN_COMPLIANCE_FLOORS). Floor supersede - Microsoft has
+        #      bumped the staged file's SVN ahead of the active enforcement target
+        #      (e.g., staged 8.0 while Stage 4 enforces 7.0). A device at the prior
+        #      level is at the enforcement target and must not be flagged as
+        #      "SVN Update Not Applied". Without the floor check the
+        #      classifier would generate a false partial-commit signal here.
         $classify = {
             param ($sig)
             $info = @{
@@ -2172,9 +2298,25 @@ $($sectionsHtml.ToString())
                     $info.Component   = $guidComponentMap[$guid]
                     $info.RequiredSvn = Get-SignatureDataSVN $sig
                     $info.FirmwareSvn = $firmwareSvnByGuid[$guid]   # may be null when firmware has no prior SVN for this GUID
-                    if (-not [string]::IsNullOrWhiteSpace($info.FirmwareSvn) -and -not [string]::IsNullOrWhiteSpace($info.RequiredSvn)) {
+                    if (-not [string]::IsNullOrWhiteSpace($info.FirmwareSvn)) {
                         try {
-                            if (([version]$info.FirmwareSvn) -ge ([version]$info.RequiredSvn)) { $info.Status = 'superseded' }
+                            $fwVer = [version]$info.FirmwareSvn
+                            if (-not [string]::IsNullOrWhiteSpace($info.RequiredSvn)) {
+                                if ($fwVer -ge ([version]$info.RequiredSvn)) {
+                                    $info.Status = 'superseded'
+                                }
+                            }
+                            # Floor check (route 2). Only consult when route 1 did not
+                            # already mark superseded. Compares firmware against the
+                            # Enforcement target, SVN compliance version.
+                            if ($info.Status -ne 'superseded') {
+                                $floor = $script:SVN_COMPLIANCE_FLOORS[$info.Component]
+                                if (-not [string]::IsNullOrWhiteSpace($floor)) {
+                                    if ($fwVer -ge ([version]$floor)) {
+                                        $info.Status = 'superseded'
+                                    }
+                                }
+                            }
                         }
                         catch { }
                     }
@@ -2282,7 +2424,7 @@ $($sectionsHtml.ToString())
     # Boot media check: scan attached removable/optical volumes for PCA-2011-signed boot loaders.
     # When DBX revokes PCA 2011 (Stage 3), booting from such media would fail - so operators need
     # to know which drives must be refreshed. Returns structured volume list for card rendering.
-    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-BootManager (lines 785-924).
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-BootManager (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates).
     # MS guidance: https://support.microsoft.com/en-us/topic/updating-windows-bootable-media-to-use-the-pca2023-signed-boot-manager-d4064779-0e4e-43ac-b2ce-24f434fcfa0f
     function Test-BootMediaPca2023 {
         param (
@@ -2359,7 +2501,7 @@ $($sectionsHtml.ToString())
     # Downloads kek_update_map.json from microsoft/secureboot_objects and checks whether the
     # current PK thumbprint has an available update record. Intended to guide Action Required
     # decisions (wait on OEM firmware vs. WU opt-in) when Event 1795 or 1803 is firing.
-    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-KEKUpdateMap
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Check-KEKUpdateMap (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates)
     function Get-KekUpdateAvailability {
         param (
             [string]$PkThumbprint,
@@ -2431,8 +2573,20 @@ $($sectionsHtml.ToString())
         return $result
     }
     
-    # Read expected SVN from Windows Update staging file (DBXUpdateSVN.bin)
+    # Read expected SVN from Windows Update staging file (DBXUpdateSVN.bin).
     # Source: https://github.com/microsoft/secureboot_objects
+    #
+    # The .bin file ships with an ASN.1 SEQUENCE authenticode wrapper (bytes 40..41 ==
+    # 0x30 0x82) that the firmware UEFI variable does NOT carry. Strip it before
+    # handing bytes to Get-DbxSignatureData; otherwise the EFI_SIGNATURE_LIST parser
+    # walks the wrapper as if it were a sig list and silently returns nothing - the
+    # symptom is a "Staged SVN: N/A" card row on devices that clearly have a staged
+    # update file. Use the same Get-StrippedDbxBinBytes helper Compare-DbxAgainstStagedBins
+    # already relies on so both code paths see identical content.
+    #
+    # Picks the max-by-version across all BootMgr-prefixed entries to match the
+    # canonical proper selection (in case a future staged file ships
+    # multiple SVN candidates for the same component).
     function Get-WindowsUpdateSVN {
         $svnFile = "$env:SystemRoot\System32\SecureBootUpdates\DBXUpdateSVN.bin"
         if (-not (Test-Path $svnFile)) {
@@ -2440,12 +2594,21 @@ $($sectionsHtml.ToString())
         }
         try {
             $fileBytes = [System.IO.File]::ReadAllBytes($svnFile)
-            $sigData = Get-DbxSignatureData -Bytes $fileBytes
-            $matches = @($sigData | Where-Object { $_ -match "^$($script:EFI_BOOTMGR_DBXSVN_GUID)" })
+            $clean     = Get-StrippedDbxBinBytes -Bytes $fileBytes
+            $sigData   = Get-DbxSignatureData -Bytes $clean
+            $matches   = @($sigData | Where-Object { $_ -match "^$($script:EFI_BOOTMGR_DBXSVN_GUID)" })
             if ($matches.Count -eq 0) {
                 return $null
             }
-            return Get-SignatureDataSVN $matches[0]
+            $maxVer = $null
+            $maxStr = $null
+            foreach ($m in $matches) {
+                $svn = Get-SignatureDataSVN $m
+                if ([string]::IsNullOrWhiteSpace($svn)) { continue }
+                try { $v = [version]$svn } catch { continue }
+                if ($null -eq $maxVer -or $v -gt $maxVer) { $maxVer = $v; $maxStr = $svn }
+            }
+            return $maxStr
         }
         catch {
             Write-Log "WARNING" "Failed to read DBXUpdateSVN.bin: $($_.Exception.Message)"
@@ -2453,99 +2616,154 @@ $($sectionsHtml.ToString())
         }
     }
     
-    # Get Secure Boot SVN status - always reads raw DBX bytes, enriches with cmdlet if available
-    # Raw DBX parsing provides pending update detection via DBXUpdateSVN.bin comparison
-    # Get-SecureBootSVN cmdlet (KB5077241+) adds FirmwareSVN, BootManagerSVN, BootManagerPath
+    # Get Secure Boot SVN status. Single canonical contract: always returns the same
+    # field shape regardless of whether the Get-SecureBootSVN cmdlet is available
+    # (KB5077241+, Stage 2 onwards). Now that Get-DbxComponentSVNs replicates the
+    # cmdlet's BootMgr / CdBoot / WdsMgr extraction without the PowerShell#27058
+    # bug, the per-DBX values (FirmwareSVN, StagedSVN, DbxSVN, WindowsUpdateSVN)
+    # come from raw bytes on every device - cmdlet or not. The cmdlet is still
+    # consulted only for fields that have no raw equivalent (BootManagerSVN and
+    # BootManagerPath, which read the on-disk boot manager binary), and as a
+    # cross-check signal so PowerShell#27058 disagreements are logged.
+    #
     # Source: https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates
     function Get-SecureBootSVNStatus {
         param ([byte[]]$DbxBytes)
-        # Always read raw DBX for DBX SVN + pending update detection
-        $currentSVN = if ($null -ne $DbxBytes -and $DbxBytes.Length -gt 0) {
-            Get-DbxBootMgrSVN -DbxBytes $DbxBytes
+        # Step 1 - Resolve all three boot-component SVNs from raw DBX bytes (canonical
+        # logic via Get-DbxComponentSVNs). One parser invocation feeds both the
+        # FirmwareSVN value used downstream and the parity log line below.
+        $componentSvnMap = if ($null -ne $DbxBytes -and $DbxBytes.Length -gt 0) {
+            Get-DbxComponentSVNs -DbxBytes $DbxBytes
         }
-        else { $null }
-        $windowsUpdateSVN = Get-WindowsUpdateSVN
+        else { [ordered]@{ BootMgr = $null; CdBoot = $null; WdsMgr = $null } }
+        $currentSVN = $componentSvnMap.BootMgr
         $svnPresent = ($null -ne $currentSVN)
-        # Determine pending SVN update (Windows Update has higher SVN than current DBX)
-        $svnUpdatePending = if ($null -ne $windowsUpdateSVN) {
-            ($null -eq $currentSVN) -or ([version]$currentSVN -lt [version]$windowsUpdateSVN)
+        # Always log per-component SVN regardless of cmdlet availability or DBX state.
+        $bmLog = if ($null -ne $componentSvnMap.BootMgr) { $componentSvnMap.BootMgr } else { 'absent' }
+        $cdLog = if ($null -ne $componentSvnMap.CdBoot)  { $componentSvnMap.CdBoot }  else { 'absent' }
+        $wdLog = if ($null -ne $componentSvnMap.WdsMgr)  { $componentSvnMap.WdsMgr }  else { 'absent' }
+        Write-Log "INFO" "Raw DBX SVN per component (max-by-version): BootMgr=$bmLog | CdBoot=$cdLog | WdsMgr=$wdLog"
+        
+        # Step 2 - Resolve Windows Update staged SVN from DBXUpdateSVN.bin (raw-byte
+        # parser, identical on all stages). The "pending" signal is gated on the
+        # documented compliance floor: if firmware SVN is already at or above the
+        # active enforcement target, a higher-numbered staged SVN is "future work"
+        # (Microsoft can ship a newer .bin ahead of any actual enforcement bump),
+        # not a pending update the operator needs to act on. Treating staged > firmware
+        # as pending here would cascade into a "Pending SVN Reboot" overlay and an
+        # "SVN update pending" callout on devices that are already compliant per floor.
+        $windowsUpdateSVN = Get-WindowsUpdateSVN
+        $floorBootMgr     = $script:SVN_COMPLIANCE_FLOORS.BootMgr
+        $floorMet         = $false
+        if (-not [string]::IsNullOrWhiteSpace($currentSVN) -and -not [string]::IsNullOrWhiteSpace($floorBootMgr)) {
+            try { $floorMet = ([version]$currentSVN) -ge ([version]$floorBootMgr) } catch { }
         }
-        else { $false }
-        # Try Get-SecureBootSVN cmdlet for richer info (KB5077241+)
+        $svnUpdatePending = $false
+        if (-not $floorMet -and $null -ne $windowsUpdateSVN) {
+            $svnUpdatePending = ($null -eq $currentSVN) -or ([version]$currentSVN -lt [version]$windowsUpdateSVN)
+        }
+        
+        # Step 3 - Try the cmdlet for the two fields we cannot derive from raw bytes
+        # (BootManagerSVN, BootManagerPath) plus the authoritative ComplianceStatus
+        # string. FirmwareSVN/StagedSVN are NEVER read from the cmdlet output - we
+        # already have them, bug-free, from raw bytes.
         $cmdletResult = $null
         if ($script:HasSVNCmdlet) {
+            try { $cmdletResult = Get-SecureBootSVN -ErrorAction Stop }
+            catch { Write-Log "WARNING" "Get-SecureBootSVN failed: $($_.Exception.Message)" }
+        }
+        
+        # Step 4 - Cross-check: when the cmdlet IS available, log whenever its FirmwareSVN
+        # disagrees with our raw-DBX max. That is the PowerShell#27058 signature: the
+        # cmdlet returns whichever BootMgr-GUID entry appears LAST in DBX order rather
+        # than the max. Diagnostic-only; the result hash always uses the raw value so
+        # the bug never affects downstream logic.
+        if ($null -ne $cmdletResult -and -not [string]::IsNullOrWhiteSpace($currentSVN) -and
+            -not [string]::IsNullOrWhiteSpace([string]$cmdletResult.FirmwareSVN)) {
             try {
-                $cmdletResult = Get-SecureBootSVN -ErrorAction Stop
+                $rawVer = [version]$currentSVN
+                $cmdVer = [version]$cmdletResult.FirmwareSVN
+                if ($rawVer -ne $cmdVer) {
+                    Write-Log "WARNING" ("Get-SecureBootSVN FirmwareSVN mismatch: cmdlet=$($cmdletResult.FirmwareSVN), raw-DBX max=$currentSVN. " +
+                        "Likely PowerShell/PowerShell#27058 bug. Cmdlet reports last-in-DBX-order instead of max. Using raw-DBX value.")
+                }
             }
             catch {
-                Write-Log "WARNING" "Get-SecureBootSVN failed: $($_.Exception.Message)"
+                # Swallow
             }
         }
-        # Build result - cmdlet provides compliance/firmware info, raw DBX provides pending update detection
+        
+        # Step 5 - Resolve compliance and the cmdlet-only fields. Same hash shape
+        # returns on every device.
+        #
+        # Compliance is authoritative from the documented floor ($script:SVN_COMPLIANCE_FLOORS):
+        # firmware BootMgr SVN >= floor -> Compliant. The cmdlet's own ComplianceStatus
+        # ("Not compliant - Firmware does not match boot manager", etc.) is computed
+        # from the cmdlet's FirmwareSVN reading, which #27058 silently under-reports
+        # (e.g. cmdlet=2.0 vs raw-DBX max=7.0 on a Stage-4-complete device). Trusting
+        # that string flips the card to "Not compliant" on a perfectly compliant
+        # device. Use the floor as the authoritative signal regardless of cmdlet path,
+        # and only fall back to the cmdlet's narrative when the floor check fails -
+        # at that point the cmdlet's failure-mode wording is still useful color.
+        # ($floorMet was computed in Step 2 alongside $svnUpdatePending.)
         if ($null -ne $cmdletResult) {
-            $isCompliant = $cmdletResult.ComplianceStatus -match '^Compliant'
-            # Cross-check cmdlet FirmwareSVN against our raw-byte max. PowerShell#27058
-            # (open as of this writing) causes Get-SecureBootSVN to return whichever
-            # BootMgr-GUID entry appears LAST in DBX order rather than the max, silently
-            # under-reporting on devices where lower-SVN entries happen to sort last.
-            # Our Get-DbxBootMgrSVN does explicit max-by-parsed-version, so prefer that
-            # value when it disagrees and log the discrepancy so operators can recognize
-            # the bug signature without chasing ghosts. Non-fatal - cmdlet is still the
-            # source for BootManagerSVN / StagedSVN / ComplianceStatus (unaffected by
-            # the bug because those come from on-disk / staging files).
-            $firmwareSvnFinal = $cmdletResult.FirmwareSVN
-            if (-not [string]::IsNullOrWhiteSpace($currentSVN) -and
-                -not [string]::IsNullOrWhiteSpace([string]$cmdletResult.FirmwareSVN)) {
-                try {
-                    $rawVer = [version]$currentSVN
-                    $cmdVer = [version]$cmdletResult.FirmwareSVN
-                    if ($rawVer -ne $cmdVer) {
-                        Write-Log "WARNING" ("Get-SecureBootSVN FirmwareSVN mismatch: cmdlet=$($cmdletResult.FirmwareSVN), raw-DBX max=$currentSVN. " +
-                            "Likely PowerShell/PowerShell#27058 bug. Cmdlet reports last-in-DBX-order instead of max. Using raw-DBX value.")
-                        $firmwareSvnFinal = $currentSVN
-                    }
-                }
-                catch { }
+            $bootManagerSvn  = if ($cmdletResult.BootManagerSVN) { $cmdletResult.BootManagerSVN } else { 'N/A' }
+            $bootManagerPath = $cmdletResult.BootManagerPath
+            $source          = 'Raw DBX (FirmwareSVN/StagedSVN) + Get-SecureBootSVN (BootManagerSVN/Compliance)'
+            if ($floorMet) {
+                $isCompliant      = $true
+                $complianceStatus = "Compliant (Firmware SVN $currentSVN >= floor $floorBootMgr)"
             }
-            return @{
-                FirmwareSVN      = $firmwareSvnFinal
-                BootManagerSVN   = $cmdletResult.BootManagerSVN
-                StagedSVN        = $cmdletResult.StagedSVN
-                ComplianceStatus = $cmdletResult.ComplianceStatus
-                BootManagerPath  = $cmdletResult.BootManagerPath
-                IsCompliant      = $isCompliant
-                Source           = 'Get-SecureBootSVN'
-                DbxSVN           = $currentSVN
-                WindowsUpdateSVN = $windowsUpdateSVN
-                SvnUpdatePending = $svnUpdatePending
+            else {
+                $isCompliant      = $cmdletResult.ComplianceStatus -match '^Compliant'
+                $complianceStatus = $cmdletResult.ComplianceStatus
             }
-        }
-        # Raw DBX only - no cmdlet available
-        # Note: SVN may not appear in DBX bytes until after reboot even if Event 1042 confirms (it does seem to show even with a pending SVN reboot in my testing)
-        # the scheduled task processed the 0x200 bit - UEFI NVRAM writes can be deferred.
-        $isCompliant = $svnPresent -and ($null -ne $windowsUpdateSVN) -and ([version]$currentSVN -ge [version]$windowsUpdateSVN)
-        # Also treat as compliant if SVN is in DBX and there's no staging file to compare against
-        if ($svnPresent -and $null -eq $windowsUpdateSVN) { $isCompliant = $true }
-        $complianceStatus = if ($isCompliant) {
-            'Compliant'
-        }
-        elseif (-not $svnPresent -and $null -eq $windowsUpdateSVN) {
-            'SVN not yet in DBX (pending SVN reboot or not yet applied)'
-        }
-        elseif (-not $svnPresent) {
-            'SVN not present in DBX'
         }
         else {
-            "DBX SVN $currentSVN < staged $windowsUpdateSVN"
+            $bootManagerSvn  = 'N/A'
+            $bootManagerPath = $null
+            $source          = 'Raw DBX'
+            if ($floorMet) {
+                $isCompliant      = $true
+                $complianceStatus = "Compliant (Firmware SVN $currentSVN >= floor $floorBootMgr)"
+            }
+            else {
+                $isCompliant = $svnPresent -and ($null -ne $windowsUpdateSVN) -and ([version]$currentSVN -ge [version]$windowsUpdateSVN)
+                # Treat as compliant if SVN is in DBX and there's no staging file to compare against
+                if ($svnPresent -and $null -eq $windowsUpdateSVN) { $isCompliant = $true }
+                $complianceStatus = if ($isCompliant) {
+                    'Compliant'
+                }
+                elseif (-not $svnPresent -and $null -eq $windowsUpdateSVN) {
+                    'SVN not yet in DBX (pending SVN reboot or not yet applied)'
+                }
+                elseif (-not $svnPresent) {
+                    'SVN not present in DBX'
+                }
+                else {
+                    "DBX SVN $currentSVN < staged $windowsUpdateSVN"
+                }
+            }
         }
+        
+        # Always-raw component fields (CdBoot / WdsMgr). The cmdlet conventionally
+        # only surfaces FirmwareSVN / BootManagerSVN / StagedSVN; the two non-bootmgr
+        # SVN-keyed components live alongside in DBX and are useful as a parity
+        # readout (especially when the BootMgr value is the only one moving). Sourced
+        # from the same Get-DbxComponentSVNs pass that fed FirmwareSVN above so the
+        # values are guaranteed consistent with the per-component log line.
+        $cdBootSvn = if ($null -ne $componentSvnMap.CdBoot) { $componentSvnMap.CdBoot } else { 'N/A' }
+        $wdsMgrSvn = if ($null -ne $componentSvnMap.WdsMgr) { $componentSvnMap.WdsMgr } else { 'N/A' }
         return @{
             FirmwareSVN      = if ($svnPresent) { $currentSVN } else { 'N/A' }
-            BootManagerSVN   = 'N/A'
+            BootManagerSVN   = $bootManagerSvn
             StagedSVN        = if ($null -ne $windowsUpdateSVN) { $windowsUpdateSVN } else { 'N/A' }
+            CdBootSVN        = $cdBootSvn
+            WdsMgrSVN        = $wdsMgrSvn
             ComplianceStatus = $complianceStatus
-            BootManagerPath  = $null
+            BootManagerPath  = $bootManagerPath
             IsCompliant      = $isCompliant
-            Source           = 'Raw DBX'
+            Source           = $source
             DbxSVN           = $currentSVN
             WindowsUpdateSVN = $windowsUpdateSVN
             SvnUpdatePending = $svnUpdatePending
@@ -2623,8 +2841,8 @@ $($sectionsHtml.ToString())
     #   - Flags hypervisor-managed platforms (VMware owner GUID / VirtualBox subject)
     #   - Flags untrusted placeholder PKs
     #   - Optional -MicrosoftOnly filter
-    # Returns @{ Subjects; CommonNames; Hypervisor; Trusted; Raw } - caller picks what it needs.
-    # Reference: garlin's Check_UEFI-CA2023.ps1 Get-UEFICert (lines 292-330).
+    # Returns @{ Subjects; CommonNames; Hypervisor; Trusted; Raw }. Caller picks what it needs.
+    # Reference: garlin's Check_UEFI-CA2023.ps1 Get-UEFICert (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates).
     function Get-UefiCertSubjects {
         param(
             [ValidateSet('PK','KEK','db','dbx','PKDefault','KEKDefault','dbDefault','dbxDefault')]
@@ -5076,10 +5294,17 @@ process {
             $lastBootTime = $null
             try { $lastBootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
             
-            # Cmdlet path: FirmwareSVN < StagedSVN is a direct firmware-level indicator
-            # Only meaningful at Stage 3+ (after mitigations triggered). At Stage 2 the mismatch
-            # is expected: boot manager writes StagedSVN but firmware won't absorb until revocations happen.
-            if ($svnStatus.Source -eq 'Get-SecureBootSVN' -and ($mit3Triggered -or $mit4Triggered -or $has1037 -or $has1042)) {
+            # FirmwareSVN < StagedSVN is a direct firmware-level reboot-pending indicator.
+            # Only meaningful at Stage 3+ (after mitigations triggered). At Stage 2 the
+            # mismatch is expected: boot manager writes StagedSVN but firmware won't absorb
+            # until revocations happen. Both values now always come from raw-DBX (canonical),
+            # so the comparison no longer needs a cmdlet-availability gate. The try/catch
+            # absorbs 'N/A' string casts on pre-rollout devices.
+            #
+            # Floor gate: skip the comparison entirely when firmware is already at or above
+            # the documented compliance floor. A higher staged SVN in that case is "future
+            # work" Microsoft has shipped ahead of any actual enforcement bump.
+            if (-not $svnStatus.IsCompliant -and ($mit3Triggered -or $mit4Triggered -or $has1037 -or $has1042)) {
                 try {
                     $fwVer = [version]$svnStatus.FirmwareSVN
                     $stagedVer = [version]$svnStatus.StagedSVN
@@ -5087,9 +5312,7 @@ process {
                         $svnRebootPending = $true
                     }
                 }
-                catch {
-                  
-                }
+                catch { }
             }
             
             # Boot time cross-reference: if mitigation events fired since last boot, reboot is needed
@@ -5125,15 +5348,11 @@ process {
             }
             
             Write-Log "INFO" "SVN Compliance: $($svnStatus.ComplianceStatus) (source: $($svnStatus.Source)) | $($svnStatus.Stage): $($svnStatus.StageDetail)"
-            if ($svnStatus.Source -eq 'Raw DBX') {
-                Write-Log "INFO" "DBX SVN: $(if ($svnStatus.DbxSVN) { $svnStatus.DbxSVN } else { 'not present' }) | Windows Update SVN: $(if ($svnStatus.WindowsUpdateSVN) { $svnStatus.WindowsUpdateSVN } else { 'not staged' })"
-            }
-            else {
-                Write-Log "INFO" "Firmware SVN: $($svnStatus.FirmwareSVN) | Boot Manager SVN: $($svnStatus.BootManagerSVN) | Staged SVN: $($svnStatus.StagedSVN)"
-                if ($null -ne $svnStatus.WindowsUpdateSVN) {
-                    Write-Log "INFO" "Windows Update staged SVN: $($svnStatus.WindowsUpdateSVN) | DBX SVN: $(if ($svnStatus.DbxSVN) { $svnStatus.DbxSVN } else { 'not present' })"
-                }
-            }
+            # Identical SVN log shape across every stage. Firmware/Staged are raw-DBX
+            # canonical values; Boot Manager comes from the cmdlet when present, 'N/A'
+            # otherwise. CdBoot/WdsMgr are always raw-DBX (cmdlet doesn't expose them).
+            # Same fields, same order, regardless of KB5077241 availability.
+            Write-Log "INFO" "Firmware SVN: $($svnStatus.FirmwareSVN) | Boot Manager SVN: $($svnStatus.BootManagerSVN) | Staged SVN: $($svnStatus.StagedSVN) | CdBoot SVN: $($svnStatus.CdBootSVN) | WdsMgr SVN: $($svnStatus.WdsMgrSVN)"
             if ($svnStatus.RevocationPending) {
                 Write-Log "INFO" "SVN non-compliance expected - PCA 2011 not yet revoked in DBX (pre-Stage 3)"
             }
@@ -5814,9 +6033,9 @@ end {
                     # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
                     # The PK itself is valid; the OEM has simply not yet published a PK-signed
                     # KEK 2023 update to Microsoft for Windows Update to serve. This is a
-                    # distribution gap, not a firmware authority issue, so a user BIOS update
-                    # will only help if the OEM bundles the new KEK into that firmware image.
-                    # The primary resolution path is OEM publication through WU.
+                    # distribution gap. A user BIOS update will only help if the OEM
+                    # bundles the new KEK into that firmware image. The primary
+                    # resolution path is OEM publication through WU.
                     $statusKey     = 'ActionRequired'
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
@@ -6300,8 +6519,7 @@ end {
     # to flip the PK row from green check to red X and by the plaintext summary downstream.
     # NOTE: Event 1803 is deliberately NOT a PK-blocker. 1803 means the OS could not locate a
     # PK-signed KEK 2023 update to install - the PK itself is valid, the OEM simply has not
-    # published a PK-signed KEK update to Microsoft for Windows Update to serve. That is a
-    # distribution gap, not a PK authority problem, so the PK row stays green.
+    # published a PK-signed KEK update to Microsoft for Windows Update to serve.
     $pkBlockingKek = $false
     if ($secureBoot -eq 'Enabled' -and $pkCerts.Count -gt 0 -and $pkIsTrusted -and $null -eq $hypervisor) {
         $has1795ForPk = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
@@ -6766,17 +6984,14 @@ end {
             else {
                 Write-Host "SVN Status  : $($svnStatus.ComplianceStatus)"
             }
-            if ($svnStatus.Source -eq 'Raw DBX') {
-                Write-Host "DBX SVN     : $(if ($svnStatus.DbxSVN) { $svnStatus.DbxSVN } else { 'Not present' })"
-                if ($null -ne $svnStatus.WindowsUpdateSVN) {
-                    Write-Host "WU SVN      : $($svnStatus.WindowsUpdateSVN)"
-                }
-            }
-            else {
-                Write-Host "Firmware SVN: $($svnStatus.FirmwareSVN)"
-                Write-Host "BootMgr SVN : $($svnStatus.BootManagerSVN)"
-                Write-Host "Staged SVN  : $($svnStatus.StagedSVN)"
-            }
+            # Identical SVN console shape across every stage. Firmware/Staged are raw-DBX
+            # canonical values; BootMgr comes from the cmdlet when present, 'N/A' otherwise.
+            # CdBoot/WdsMgr are always raw-DBX (cmdlet doesn't expose them).
+            Write-Host "Firmware SVN: $($svnStatus.FirmwareSVN)"
+            Write-Host "BootMgr SVN : $($svnStatus.BootManagerSVN)"
+            Write-Host "Staged SVN  : $($svnStatus.StagedSVN)"
+            Write-Host "CdBoot SVN  : $($svnStatus.CdBootSVN)"
+            Write-Host "WdsMgr SVN  : $($svnStatus.WdsMgrSVN)"
             if ($svnStatus.SvnUpdatePending) {
                 Write-Host "SVN Pending : DBXUpdateSVN.bin $($svnStatus.WindowsUpdateSVN) not yet in DBX"
             }
