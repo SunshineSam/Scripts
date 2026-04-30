@@ -4,7 +4,16 @@
     Last Edit: 04-29-2026
     
     Note:
-    04-29-2026: SVN section now surfaces all five SVNs explicitly:
+    04-29-2026: Get-SignatureDataSVN now reads the major/minor uint16 fields as
+                  little-endian, matching garlin's April 2026 SVN_Order.ps1 update.
+                  Previous big-endian read happened to produce correct values on
+                  every SVN currently shipped (major < 256, minor == 0) because the
+                  high byte of major sat at hex 40-41 == 0x00 and hex 36-37 (real
+                  minor low byte) was also 0x00. The fix lands before Microsoft
+                  pushes any SVN with a non-zero minor or a major >= 256, where the
+                  bug would otherwise silently mis-render the value.
+                  (https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates/commit/d356e1645d14440f1113dbd31a78ff374c19e1ef)
+                - SVN section now surfaces all five SVNs explicitly:
                   the cmdlet-conventional trio (Firmware / Boot Manager / Staged) and
                   the always-raw additional components (CdBoot / WdsMgr). Result hash
                   exposes CdBootSVN and WdsMgrSVN sourced from the same Get-DbxComponentSVNs
@@ -2025,13 +2034,33 @@ $($sectionsHtml.ToString())
         WdsMgr  = '3.0'
     }
     
-    # Extract SVN version from a hex signature data string
-    # Source: https://github.com/microsoft/secureboot_objects/blob/main/scripts/utility_functions.py
+    # Extract SVN version (major.minor) from a hex signature data string.
+    # Sources:
+    #   - https://github.com/microsoft/secureboot_objects/blob/main/scripts/utility_functions.py
+    #   - https://github.com/garlin-cant-code/SecureBoot-CA-2023-Updates/commit/d356e1645d14440f1113dbd31a78ff374c19e1ef
+    #
+    # The two SVN uint16 fields are stored LITTLE-ENDIAN in the signature data, NOT
+    # big-endian as garlin's original SVN_Order.ps1 (and earlier revisions of this
+    # script) assumed. Byte layout in the post-owner hex string:
+    #   hex 32-33 : signature type byte (0x01)
+    #   hex 34-35 : minor low byte
+    #   hex 36-37 : minor high byte
+    #   hex 38-39 : major low byte
+    #   hex 40-41 : major high byte
+    # To rebuild each uint16 we concatenate <high><low> in that order before passing
+    # to ToUInt16(.., 16), which parses big-endian. The result is the actual little-
+    # endian value the firmware wrote.
+    #
+    # The bug was dormant on every SVN currently shipped (major < 256, minor == 0):
+    # the high byte of major sat at hex 40-41 == 0x00 and the original big-endian
+    # read of hex 36-39 happened to produce the right number because hex 36-37
+    # (real minor low byte) was also 0x00. The fix lands BEFORE Microsoft pushes
+    # any SVN with a non-zero minor or a major >= 256.
     function Get-SignatureDataSVN {
         param ([string]$SignatureData)
         try {
-            $major = [int]::Parse($SignatureData.Substring(36, 4), [System.Globalization.NumberStyles]::HexNumber)
-            $minor = [int]::Parse($SignatureData.Substring(40, 4), [System.Globalization.NumberStyles]::HexNumber)
+            $major = [System.Convert]::ToUInt16($SignatureData.Substring(40,2) + $SignatureData.Substring(38,2), 16)
+            $minor = [System.Convert]::ToUInt16($SignatureData.Substring(36,2) + $SignatureData.Substring(34,2), 16)
             return '{0}.{1}' -f $major, $minor
         }
         catch { return $null }
