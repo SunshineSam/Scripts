@@ -109,27 +109,6 @@ When `$saveStatusLocal` or `$saveLogToDevice` is enabled, files are written to `
 
 ---
 
-## ⚠️ Running Local?
-
-PowerShell 5.1 is ANSI BOM (Byte Order Mark) by default, only Powershell 7+ will run clean.
-The result of running locally will be: `Unexpected token` parse errors.
-
-**PS 5.1 One-line fix** (PowerShell, after `cd` into the script's directory):
-
-```powershell
-$f='.\SecureBoot-Management-CA2023.ps1'; $b=[IO.File]::ReadAllBytes((Resolve-Path $f)); if($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF){[IO.File]::WriteAllBytes((Resolve-Path $f), [byte[]](0xEF,0xBB,0xBF)+$b); "BOM restored: $f"} else {"BOM already present: $f"}
-```
-
-Running this again on a fixed file just reports `BOM already present`.
-Reads as raw bytes so the PS 5.1 ANSI misinterpretation doesn't corrupt
-the rewrite.
-
-Or skip 5.1 entirely:
-
-```powershell
-pwsh -File .\SecureBoot-Management-CA2023.ps1
-```
-
 ## 📜 Script Details
 
 - **Audit (always)**
