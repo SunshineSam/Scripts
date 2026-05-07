@@ -1,9 +1,29 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 04-29-2026
+    Last Edit: 05-07-2026
     
     Note:
+    05-07-2026: Addressed parsing errors for emojies in some environments. Now fully
+                supports the Windows Powershell 5.1 without any catches.
+    04-30-2026: PK-blocks-KEK now overrides the "all mitigations applied -> Compliant
+                  (pending 1808)" path. State 5b-pre-blocker case added at the top of
+                  the resolution switch: when has2023InDb + 1799 + 1037 + 1042 all
+                  fire AND $pkBlockingKek is true (Event 1795 firing + KEK 2K CA
+                  2023 missing on a legitimate OEM PK), the device routes to Action
+                  Required with the existing 1795 OEM-BIOS narrative instead of
+                  green-checking. Previously the AllMitigationsApplied path treated
+                  mitigation events as sufficient and never consulted $pkBlockingKek,
+                  producing a misleading "Compliant (pending 1808)" headline on
+                  Lenovo / OEM devices where the PK actively rejects KEK 2023 writes
+                  79+ times. $pkBlockingKek computation hoisted to before the state-
+                  resolution switch so the case can consult it.
+                - $svnRebootPending boot-time-vs-1042 check now also floor-gated
+                  (was previously unconditional). On a device that just had 1042
+                  fire but already meets the documented compliance floor, the
+                  "Pending SVN Reboot" overlay was firing for an absorption that
+                  doesn't move the floor. Now suppressed when $svnStatus.IsCompliant.
+                  Same gate applied to the mit4-triggered-without-1042 fallback.
     04-29-2026: Get-SignatureDataSVN now reads the major/minor uint16 fields as
                   little-endian, matching garlin's April 2026 SVN_Order.ps1 update.
                   Previous big-endian read happened to produce correct values on
@@ -660,6 +680,33 @@ begin {
     Write-Host "`nRunning as Administrator"
     
     #######################
+    # Emoji table
+    #######################
+    # Build emoji glyphs from Unicode code points so the script source stays pure ASCII (BOM-free).
+    # Avoids emojis with the default ANSI codepage in PS 5.1.
+    # [char]::ConvertFromUtf32 handles BMP and supplementary (surrogate-pair) code points alike.
+    $script:Emoji = @{
+        Check            = [char]::ConvertFromUtf32(0x2705)                                         # check mark button
+        Times            = [char]::ConvertFromUtf32(0x274C)                                         # cross mark
+        Warning          = [char]::ConvertFromUtf32(0x26A0)  + [char]::ConvertFromUtf32(0xFE0F)     # warning sign + VS16
+        Info             = [char]::ConvertFromUtf32(0x2139)  + [char]::ConvertFromUtf32(0xFE0F)     # information + VS16
+        Sync             = [char]::ConvertFromUtf32(0x1F504)                                        # counterclockwise arrows
+        Ban              = [char]::ConvertFromUtf32(0x1F6AB)                                        # prohibited
+        Clock            = [char]::ConvertFromUtf32(0x23F3)                                         # hourglass with flowing sand
+        Eye              = [char]::ConvertFromUtf32(0x1F441) + [char]::ConvertFromUtf32(0xFE0F)     # eye + VS16
+        Building         = [char]::ConvertFromUtf32(0x1F3E2)                                        # office building
+        Question         = [char]::ConvertFromUtf32(0x2753)                                         # red question mark
+        QuestionWhite    = [char]::ConvertFromUtf32(0x2754)                                         # white question mark
+        QuestionSmall    = [char]::ConvertFromUtf32(0xFE56)                                         # small question mark
+        ExclamationWhite = [char]::ConvertFromUtf32(0x2755)                                         # white exclamation mark
+        Circle           = [char]::ConvertFromUtf32(0x26AA)                                         # white circle
+        Cog              = [char]::ConvertFromUtf32(0x2699)  + [char]::ConvertFromUtf32(0xFE0F)     # gear + VS16
+        Calendar         = [char]::ConvertFromUtf32(0x1F4C5)                                        # calendar
+        Search           = [char]::ConvertFromUtf32(0x1F50D)                                        # magnifying glass
+        Link             = [char]::ConvertFromUtf32(0x1F517)                                        # link
+    }
+    
+    #######################
     # Helper Functions
     #######################
     
@@ -1013,19 +1060,19 @@ $($sectionsHtml.ToString())
         }
         else {
             $emoji = switch ($Type) {
-                'check'    { '✅' }
-                'times'    { '❌' }
-                'warning'  { '⚠️' }
-                'info'     { 'ℹ️' }
-                'sync'     { '🔄' }
-                'ban'      { '🚫' }
-                'clock'    { '⏳' }
-                'eye'      { '👁️' }
-                'building' { '🏢' }
-                'question' { '❓' }
-                'circle'   { '⚪' }
-                'cog'      { '⚙️' }
-                default    { '❔' }
+                'check'    { $script:Emoji.Check }
+                'times'    { $script:Emoji.Times }
+                'warning'  { $script:Emoji.Warning }
+                'info'     { $script:Emoji.Info }
+                'sync'     { $script:Emoji.Sync }
+                'ban'      { $script:Emoji.Ban }
+                'clock'    { $script:Emoji.Clock }
+                'eye'      { $script:Emoji.Eye }
+                'building' { $script:Emoji.Building }
+                'question' { $script:Emoji.Question }
+                'circle'   { $script:Emoji.Circle }
+                'cog'      { $script:Emoji.Cog }
+                default    { $script:Emoji.QuestionWhite }
             }
             return $emoji
         }
@@ -1038,24 +1085,24 @@ $($sectionsHtml.ToString())
         param ([string]$Html)
         if ([string]::IsNullOrEmpty($Html)) { return $Html }
         $faEmojiMap = @{
-            'fa-check-circle'          = '✅'
-            'fa-times-circle'          = '❌'
-            'fa-exclamation-triangle'  = '⚠️'
-            'fa-exclamation-circle'    = '❕'
-            'fa-info-circle'           = 'ℹ️'
-            'fa-sync-alt'              = '🔄'
-            'fa-ban'                   = '🚫'
-            'fa-clock'                 = '⏳'
-            'fa-eye'                   = '👁️'
-            'fa-building'              = '🏢'
-            'fa-question-circle'       = '﹖'
-            'fa-circle'                = '⚪'
-            'fa-cog'                   = '⚙️'
-            'fa-calendar-check'        = '📅'
-            'fa-calendar-times'        = '📅'
-            'fa-redo'                  = '🔄'
-            'fa-search'                = '🔍'
-            'fa-arrow-up-right-from-square' = '🔗'
+            'fa-check-circle'          = $script:Emoji.Check
+            'fa-times-circle'          = $script:Emoji.Times
+            'fa-exclamation-triangle'  = $script:Emoji.Warning
+            'fa-exclamation-circle'    = $script:Emoji.ExclamationWhite
+            'fa-info-circle'           = $script:Emoji.Info
+            'fa-sync-alt'              = $script:Emoji.Sync
+            'fa-ban'                   = $script:Emoji.Ban
+            'fa-clock'                 = $script:Emoji.Clock
+            'fa-eye'                   = $script:Emoji.Eye
+            'fa-building'              = $script:Emoji.Building
+            'fa-question-circle'       = $script:Emoji.QuestionSmall
+            'fa-circle'                = $script:Emoji.Circle
+            'fa-cog'                   = $script:Emoji.Cog
+            'fa-calendar-check'        = $script:Emoji.Calendar
+            'fa-calendar-times'        = $script:Emoji.Calendar
+            'fa-redo'                  = $script:Emoji.Sync
+            'fa-search'                = $script:Emoji.Search
+            'fa-arrow-up-right-from-square' = $script:Emoji.Link
         }
         # Match <i class="fas fa-xxx" style="..."></i> or <i class='fas fa-xxx' style='...'></i>
         # The \s* after </i> consumes the trailing space, add one back after the emoji
@@ -5345,8 +5392,12 @@ process {
             }
             
             # Boot time cross-reference: if mitigation events fired since last boot, reboot is needed
-            # This catches the raw DBX path where NVRAM data appears immediately but isn't enforced yet
-            if (-not $svnRebootPending -and $null -ne $lastBootTime) {
+            # to enforce. Catches the raw DBX path where NVRAM data appears immediately but isn't
+            # enforced yet. Floor-gated on $svnStatus.IsCompliant: when firmware already meets the
+            # documented compliance floor, a 1042 that fired this boot session is just absorbing
+            # an already-superseded SVN bump - flagging it as "Pending SVN Reboot" produces a
+            # misleading overlay on a device that's already at the enforcement target.
+            if (-not $svnRebootPending -and -not $svnStatus.IsCompliant -and $null -ne $lastBootTime) {
                 if ($has1042) {
                     $ev1042 = Get-LatestSecureBootEvent -CertStatus $certStatus -EventId 1042
                     if ($null -ne $ev1042 -and $ev1042.Time -gt $lastBootTime) {
@@ -5354,9 +5405,11 @@ process {
                     }
                 }
             }
-            
-            # Fallback: mitigation 4 triggered (0x200) but no event 1042 yet and no DBX SVN
-            if (-not $svnRebootPending -and $mit4Triggered -and $null -eq $svnStatus.DbxSVN -and -not $has1042) {
+
+            # Fallback: mitigation 4 triggered (0x200) but no event 1042 yet and no DBX SVN.
+            # Same floor gate - a device at floor doesn't need a reboot-pending warning even
+            # if the staged-task scaffolding looks mid-flight.
+            if (-not $svnRebootPending -and -not $svnStatus.IsCompliant -and $mit4Triggered -and $null -eq $svnStatus.DbxSVN -and -not $has1042) {
                 $svnRebootPending = $true
             }
             $svnStatus.RebootPending = $svnRebootPending
@@ -5509,7 +5562,7 @@ process {
             $enforceMissingOptIn = $true
             Write-Log "WARNING" "SVN Enforcement is enabled but WU Secure Boot management is NOT opted in and 2023 certs are not in db. Set securebootAction to 'Enable opt-in' for full deployment."
         }
-        Write-Host "`n==================================================================="
+        Write-Host "`n ==================================================================="
         Write-Host " ===    SVN Enforcement Mode - Applying KB5025885 Mitigations    ==="
         Write-Host " ==================================================================="
         $svnEnforcementResult = Invoke-SvnEnforcement `
@@ -5903,6 +5956,25 @@ end {
     $cardIcon        = "fas fa-shield-alt"  # Same icon for all states; color differentiates them
     $eventRowHtml    = $null                # Omitted unless Secure Boot is Enabled
     
+    # PK is the blocker when: Event 1795 (firmware rejected write) is firing AND the KEK 2K CA 2023
+    # is still missing from the firmware KEK database. The PK itself is a legitimate OEM cert, but
+    # it does not carry the authority chain needed to authorize the new Microsoft KEK 2K CA 2023 -
+    # an OEM BIOS/firmware update is required to extend PK trust. Computed here (before the state-
+    # resolution switch) so the State 5b-pre-blocker case can short-circuit the "all mitigations
+    # applied -> Compliant (pending 1808)" path on devices where the PK is actively blocking the
+    # next KEK push. Also consumed downstream by Build-CertInventorySection to flip the PK row
+    # from green check to red X and by the plaintext summary.
+    # NOTE: Event 1803 is deliberately NOT a PK-blocker. 1803 means the OS could not locate a
+    # PK-signed KEK 2023 update to install - the PK itself is valid, the OEM simply has not
+    # published a PK-signed KEK update to Microsoft for Windows Update to serve.
+    $pkBlockingKek = $false
+    if ($secureBoot -eq 'Enabled' -and $pkCerts.Count -gt 0 -and $pkIsTrusted -and $null -eq $hypervisor) {
+        $has1795ForPk = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
+        if ($has1795ForPk -and -not $has2023InKek) {
+            $pkBlockingKek = $true
+        }
+    }
+    
     switch ($true) {
       
         # State 1: Not Applicable (non-UEFI / unsupported hardware)
@@ -5912,7 +5984,7 @@ end {
             $statusRowHtml = '<i class="fas fa-ban" style="color:#6C757D;"></i> Not Applicable'
             $detailRowHtml = 'This machine does not support UEFI Secure Boot<br />(Legacy BIOS or unsupported environment).<br />Certificate update compliance is not applicable.'
             $plainText     = '[N/A] Secure Boot not supported (non-UEFI). Certificate check skipped.'
-            $statusEmoji = '❔'
+            $statusEmoji = "$($script:Emoji.QuestionWhite)"
             break
         }
         
@@ -5922,8 +5994,8 @@ end {
             $cardIconColor = '#F0AD4E'
             $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Disabled'
             $detailRowHtml = 'UEFI Secure Boot is supported but currently disabled.<br />Certificate rotation compliance is not applicable<br />until Secure Boot is enabled.'
-            $plainText     = '⚠️ Secure Boot disabled. Certificate update check not applicable until Secure Boot is enabled.'
-            $statusEmoji = '⚠️'
+            $plainText     = "$($script:Emoji.Warning) Secure Boot disabled. Certificate update check not applicable until Secure Boot is enabled."
+            $statusEmoji = "$($script:Emoji.Warning)"
             break
         }
         
@@ -5973,8 +6045,8 @@ end {
                 'db, an attacker can sign and enroll rogue KEK/db/dbx entries and<br />' +
                 'persist a bootkit. A BIOS/firmware update from the OEM is required.' + $biosGuideHtml
             
-            $plainText   = '❌ Secure Boot Enabled but PK is a AMI test key (PKFail / CVE-2024-8105). Chain of trust broken. BIOS update required.'
-            $statusEmoji = '❌'
+            $plainText   = "$($script:Emoji.Times) Secure Boot Enabled but PK is a AMI test key (PKFail / CVE-2024-8105). Chain of trust broken. BIOS update required."
+            $statusEmoji = "$($script:Emoji.Times)"
             break
         }
         
@@ -5993,23 +6065,23 @@ end {
                 $missingShort  = ($missingDbCerts | ForEach-Object { $_ -replace 'Microsoft ', '' -replace 'Windows ', '' }) -join ', '
                 $detailRowHtml = "2023 Secure Boot update confirmed by servicing registry.<br />Reboot to apply remaining certs:<br />    $missingShort"
                 $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Servicing: Updated <span style="color:#F0AD4E;">| Latest event: 1800 (reboot required)</span>'
-                $plainText     = "✅ Secure Boot Enabled. Compliant (UEFICA2023Status=Updated). Reboot pending for $($missingDbCerts.Count) cert(s)."
+                $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. Compliant (UEFICA2023Status=Updated). Reboot pending for $($missingDbCerts.Count) cert(s)."
             }
             elseif ($certStatus.Status -eq 'Compliant') {
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
                 $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.'
                 $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
                 $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Event 1808 detected at ' + $eventTime
-                $plainText     = '✅ Secure Boot Enabled. Certificates up to date in BIOS (Event 1808). Compliant.'
+                $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. Certificates up to date in BIOS (Event 1808). Compliant."
             }
             else {
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
                 $detailRowHtml = '2023 Secure Boot certificates have been successfully<br />applied to the BIOS firmware.'
                 # Compliant via servicing registry (UEFICA2023Status=Updated) without any SecureBoot events
                 $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> No events found. Status confirms compliant.'
-                $plainText     = '✅ Secure Boot Enabled. Certificates up to date (UEFICA2023Status=Updated). Compliant.'
+                $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. Certificates up to date (UEFICA2023Status=Updated). Compliant."
             }
-            $statusEmoji = '✅'
+            $statusEmoji = "$($script:Emoji.Check)"
             break
         }
         
@@ -6055,8 +6127,8 @@ end {
                                      'Without it, future updates to both the db (safe list) and the dbx<br />' +
                                      '(<a href="' + $dbxRevocationUrl + '" target="_blank">revocations</a>) ' +
                                      'will break after KEK 2011 expiration (June 2026).' + $biosGuideHtml
-                    $plainText     = "❌ Secure Boot Enabled. OEM PK does not authorize/sign KEK 2K CA 2023 (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
-                    $statusEmoji = '❌'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. OEM PK does not authorize/sign KEK 2K CA 2023 (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
                 elseif ($has1803 -and -not $has2023InKek) {
                     # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
@@ -6080,13 +6152,13 @@ end {
                                      'Without KEK 2023, future updates to both the db (safe list)<br />' +
                                      'and the dbx (<a href="' + $dbxRevocationUrl + '" target="_blank">revocations</a>) ' +
                                      'will break after<br />KEK 2011 expiration (June 2026).'
-                    $plainText     = '❌ Secure Boot Enabled. No PK-signed KEK 2023 available via WU (Event 1803). Awaiting OEM publication through Microsoft.'
-                    $statusEmoji = '❌'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. No PK-signed KEK 2023 available via WU (Event 1803). Awaiting OEM publication through Microsoft."
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
                 else {
                     $detailRowHtml = '2023 Secure Boot certificates are present in the active<br />database (db), but the OS-side validation is stuck on 1801.<br />Windows Update should* resolve this automatically<br />before the June 2026 enforcement deadline.'
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 certs in db but OS stuck on 1801. Pending Windows Update validation.'
-                    $statusEmoji = '⚠️'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. 2023 certs in db but OS stuck on 1801. Pending Windows Update validation."
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
             }
             elseif ($has2023InDbDefault) {
@@ -6100,8 +6172,8 @@ end {
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
                     $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />but not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately." + $bitlockerNote + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. Pending. Windows Update will apply certs automatically.'
-                    $statusEmoji = '⚠️'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Pending. Windows Update will apply certs automatically."
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
                 elseif ($has1803) {
                     # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
@@ -6113,8 +6185,8 @@ end {
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1803 detected at ' + $eventTime
                     $detailRowHtml = "KEK 2K CA 2023 is missing and no PK-signed KEK 2023 update<br />was found via Windows Update (Event 1803).<br />This is a distribution gap: the OEM has not yet published<br />a PK-signed KEK 2023 update to Microsoft for WU to serve.<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Reset Secure Boot keys in BIOS to apply from defaults<br />• Wait on OEM to publish PK-signed KEK 2023 via WU" + $bitlockerNote + $guideHtml
-                    $plainText     = '❌ Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required.'
-                    $statusEmoji = '❌'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required."
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
                 else {
                     # KEK missing but no 1803 - Windows Update may be able to push the KEK
@@ -6126,13 +6198,13 @@ end {
                     $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />KEK 2K CA 2023 is not yet installed.<br />Windows Update can deliver the PK-signed KEK via opt-in (0x4004 bit)."
                     if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
                         $detailRowHtml += '<br /><br /><b>Not opted in.</b> Windows will not update CA2023 without opt-in.<br />Set SecureBootAction to &quot;Enable opt-in&quot; to trigger KEK + cert deployment.'
-                        $plainText     = '⚠️ Secure Boot Enabled. Not opted in. Pending Opt-In.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Not opted in. Pending Opt-In."
                     }
                     else {
                         $detailRowHtml += '<br /><br />Opt-in is enabled. Windows Update will push the KEK<br />and then apply certs. This may take time.'
-                        $plainText     = '⚠️ Secure Boot Enabled. Opted in. Pending Windows Update.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Opted in. Pending Windows Update."
                     }
-                    $statusEmoji = '⚠️'
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
             }
             else {
@@ -6152,8 +6224,8 @@ end {
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update will eventually push the cert automatically,<br />or a manual BIOS update can be applied.' + $biosGuideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if available.'
-                    $statusEmoji = '⚠️'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. 2023 cert missing; Windows will eventually update the BIOS db directly, or push a BIOS update if available."
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
                 elseif ($has1803) {
                     # Event 1803 = OS could not locate a PK-signed KEK 2023 update to install.
@@ -6167,8 +6239,8 @@ end {
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#D9534F;"></i> Event 1803 detected at ' + $eventTime
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />No PK-signed KEK 2023 update was found via Windows<br />Update (Event 1803).<br /><br />This is a distribution gap: the OEM has not yet published<br />a PK-signed KEK 2023 update to Microsoft for WU to serve.<br />Resolution requires OEM publication (via WU or firmware).<br />Expected before June 2026.' + $biosGuideHtml
-                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing; no PK-signed KEK 2023 via WU (Event 1803). Awaiting OEM publication.'
-                    $statusEmoji = '❌'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. 2023 cert missing; no PK-signed KEK 2023 via WU (Event 1803). Awaiting OEM publication."
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
                 else {
                     # No cert in db/dbDefault but no 1803 either - opt-in may resolve via Windows Update
@@ -6178,13 +6250,13 @@ end {
                     $eventRowHtml  = '<i class="fas fa-calendar-times" style="color:#F0AD4E;"></i> Event 1801 detected at ' + $eventTime
                     if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
                         $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />KEK 2023 is also missing, but no Event 1803 (OEM blocker).<br /><br /><b>Not opted in.</b> Windows will not update CA2023 without opt-in.<br />Set SecureBootAction to &quot;Enable opt-in&quot; to allow WU deployment.' + $biosGuideHtml
-                        $plainText     = '⚠️ Secure Boot Enabled. Not opted in. Pending Opt-In.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Not opted in. Pending Opt-In."
                     }
                     else {
                         $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />KEK 2023 is also missing, but no Event 1803 (OEM blocker).<br />Opt-in is enabled - Windows Update may deliver KEK + certs.<br />If no progress, a BIOS update may be needed.' + $biosGuideHtml
-                        $plainText     = '⚠️ Secure Boot Enabled. Opted in. Pending Windows Update.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Opted in. Pending Windows Update."
                     }
-                    $statusEmoji = '⚠️'
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
             }
             break
@@ -6198,8 +6270,8 @@ end {
             $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
             $eventRowHtml  = '<i class="fas fa-redo" style="color:#F0AD4E;"></i> Event 1800 detected at ' + $eventTime
             $detailRowHtml = 'Secure Boot certificate update is in progress.<br />A system reboot is required to continue the update.<br />Reboot the machine to allow the update to proceed.'
-            $plainText     = '⚠️ Secure Boot Enabled. Reboot required to continue certificate update (Event 1800).'
-            $statusEmoji   = '⚠️'
+            $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Reboot required to continue certificate update (Event 1800)."
+            $statusEmoji   = "$($script:Emoji.Warning)"
             $rebootStatus  = Get-PendingRebootStatus
             if ($rebootStatus.Pending) {
                 $sourceList = $rebootStatus.Sources -join ', '
@@ -6207,8 +6279,46 @@ end {
             }
             if ($enforceMissingOptIn) {
                 $detailRowHtml += '<br /><br /><span style="color:#F59E0B;"><i class="fas fa-exclamation-triangle" style="color:#F59E0B;"></i> SVN Enforcement is active but WU opt-in is not enabled.<br />Set securebootAction to &quot;Enable opt-in&quot; for full deployment.</span>'
-                $plainText     += ' ⚠️ SVN Enforcement active but WU opt-in not enabled.'
+                $plainText     += " $($script:Emoji.Warning) SVN Enforcement active but WU opt-in not enabled."
             }
+            break
+        }
+        
+        # State 5b-pre-blocker: All mitigations applied AND a PK-blocks-KEK signal is firing
+        # ($pkBlockingKek is set when Event 1795 is firing and KEK 2K CA 2023 is missing on a
+        # legitimate OEM PK). This must come BEFORE the "All mitigations applied -> Compliant
+        # (pending 1808)" path below: that path treats 1799+1037+1042+has2023InDb as
+        # sufficient for green, but on a PK-blocked device those mitigation events firing
+        # doesn't change the fact that the OEM PK can't authorize the next KEK and Windows
+        # Update is actively bouncing 1795 errors. After KEK 2011 expires (June 2026) no
+        # further db/dbx updates will land - this is genuinely Action Required, not Compliant.
+        # Renders the same OEM-BIOS narrative used by the State 5 1795 branch so operators
+        # see one consistent story regardless of which event happens to be the "most recent".
+        ($secureBoot -eq 'Enabled' -and $certStatus.Status -eq 'Pending' -and -not $postTriggerState -and
+         $has2023InDb -and $pkBlockingKek -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1799) -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1037) -and
+         (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1042)) {
+            $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+            $statusKey     = 'ActionRequired'
+            $cardIconColor = '#D9534F'
+            $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
+            $eventRowHtml  = '<i class="fas fa-exclamation-triangle" style="color:#D9534F;"></i> Event 1795 detected (firmware rejecting KEK 2023 write)'
+            $oemBiosGuide  = Get-OemBIOSUpdateGuide
+            $biosGuideHtml = if ($oemBiosGuide) { '<br /><a href="' + $oemBiosGuide + '" target="_blank">OEM BIOS/Firmware Update Guide</a>' } else { '' }
+            $dbxRevocationUrl = 'https://github.com/microsoft/secureboot_objects/blob/main/PreSignedObjects/DBX/dbx_info_msft_latest.json'
+            $detailRowHtml = 'All four mitigations have applied (db cert, 2023 boot mgr,<br />' +
+                             '2011 CA revocation, SVN bump), but the firmware is<br />' +
+                             'rejecting the KEK 2K CA 2023 update (Event 1795).<br /><br />' +
+                             'The OEM PK does not carry the authority chain to sign or<br />' +
+                             'validate the new Microsoft KEK 2K CA 2023, so Windows<br />' +
+                             'Update cannot push the KEK. A BIOS/firmware update from<br />' +
+                             'the OEM is required to extend PK trust.<br /><br />' +
+                             'Without it, future updates to both the db (safe list)<br />' +
+                             'and the dbx (<a href="' + $dbxRevocationUrl + '" target="_blank">revocations</a>) ' +
+                             'will break after<br />KEK 2011 expiration (June 2026).' + $biosGuideHtml
+            $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. Mitigations applied but OEM PK does not authorize KEK 2K CA 2023 (Event 1795). BIOS update required.$(if ($oemBiosGuide) { " Guide: $oemBiosGuide" })"
+            $statusEmoji   = "$($script:Emoji.Times)"
             break
         }
         
@@ -6225,8 +6335,8 @@ end {
             $cardIconColor = '#26A644'
             $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant <span style="color:#F0AD4E;">(pending 1808)</span>'
             $detailRowHtml = 'All mitigations have been applied:<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 cert in db (Stage 1)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> 2023 boot manager installed (Event 1799)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> PCA 2011 revoked in DBX (Event 1037)<br /><i class="fas fa-check-circle" style="color:#26A644;"></i> SVN applied to DBX (Event 1042)<br /><br />Awaiting Event 1808 confirmation from OS'
-            $plainText     = '✅ Secure Boot Enabled. All mitigations applied. Awaiting 1808 confirmation.'
-            $statusEmoji   = '✅'
+            $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. All mitigations applied. Awaiting 1808 confirmation."
+            $statusEmoji   = "$($script:Emoji.Check)"
             break
         }
         
@@ -6254,7 +6364,7 @@ end {
                     $cardIconColor = '#F0AD4E'
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                     $detailRowHtml = 'Secure Boot certificate update is in progress.<br />2023 cert is present in db. Deployment events logged.<br />Awaiting remaining mitigations to complete.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Update in progress. Awaiting remaining mitigations.'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Update in progress. Awaiting remaining mitigations."
                 }
                 else {
                     # Has cert but no deployment events at all - possibly pre-installed by firmware
@@ -6262,7 +6372,7 @@ end {
                     $cardIconColor = '#F0AD4E'
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                     $detailRowHtml = '2023 Secure Boot certificate is present in the active db<br />but no completion events (1808/1801) were logged.<br />Cert may have been pre-installed by firmware.<br />Awaiting Windows Update to finalize validation.'
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize.'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. 2023 cert in db but no events logged. Waiting for Windows Update to finalize."
                 }
             }
             elseif ($has2023InDbDefault) {
@@ -6283,7 +6393,7 @@ end {
                     $statusKey     = 'ActionOptional'
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Not yet in the active database (db).<br />Windows is capable of updating the BIOS cert db directly<br />and will eventually push the cert automatically.<br />Optionally, reset Secure Boot keys in BIOS to apply immediately." + $bitlockerNote + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. Pending. Windows Update will apply certs automatically.'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Pending. Windows Update will apply certs automatically."
                     $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - Windows capable of updating BIOS db'
                 }
                 elseif ($has1803) {
@@ -6291,9 +6401,9 @@ end {
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $detailRowHtml = "KEK 2K CA 2023 not available - OEM has not provided a<br />PK-signed KEK update (Event 1803).<br />In firmware defaults (dbDefault): $dbDefaultCertLabel<br />Options:<br />• Wait for OEM firmware update that includes KEK 2023<br />• Reset Secure Boot keys in BIOS to apply from defaults" + $bitlockerNote + $guideHtml
-                    $plainText     = '❌ Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required.'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. OEM KEK 2023 not available (Event 1803). BIOS update or key reset required."
                     $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> Event 1803 - OEM KEK blocker'
-                    $statusEmoji = '❌'
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
                 else {
                     # KEK missing but no 1803 - opt-in can push KEK
@@ -6302,11 +6412,11 @@ end {
                     $detailRowHtml = "In firmware defaults (dbDefault): $dbDefaultCertLabel<br />KEK 2K CA 2023 is not yet installed.<br />Windows Update can deliver the PK-signed KEK via opt-in."
                     if ($null -ne $optInStatus -and -not $optInStatus.IsOptedIn) {
                         $detailRowHtml += '<br /><br /><b>Not opted in.</b> Windows will not update CA2023 without opt-in.<br />Set SecureBootAction to &quot;Enable opt-in&quot; to trigger KEK + cert deployment.'
-                        $plainText     = '⚠️ Secure Boot Enabled. Not opted in. Pending Opt-In.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Not opted in. Pending Opt-In."
                     }
                     else {
                         $detailRowHtml += '<br /><br />Opt-in is enabled. Windows Update will push the KEK<br />and then apply certs. This may take time.'
-                        $plainText     = '⚠️ Secure Boot Enabled. Opted in. Pending Windows Update.'
+                        $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Opted in. Pending Windows Update."
                     }
                     $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - KEK pending via Windows Update'
                 }
@@ -6325,18 +6435,18 @@ end {
                     $cardIconColor = '#F0AD4E'
                     $statusRowHtml = '<i class="fas fa-exclamation-triangle" style="color:#F0AD4E;"></i> Action Optional'
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />However, Windows is capable of updating the BIOS cert db directly.<br />Windows Update may push the cert automatically,<br />or a manual BIOS update can be applied.' + $guideHtml
-                    $plainText     = '⚠️ Secure Boot Enabled. 2023 cert missing; Windows can update BIOS db directly, or push BIOS update.'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. 2023 cert missing; Windows can update BIOS db directly, or push BIOS update."
                     $eventRowHtml  = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> No events - Windows capable of updating BIOS db'
-                    $statusEmoji = '⚠️'
+                    $statusEmoji = "$($script:Emoji.Warning)"
                 }
                 else {
                     $statusKey     = 'ActionRequired'
                     $cardIconColor = '#D9534F'
                     $statusRowHtml = '<i class="fas fa-times-circle" style="color:#D9534F;"></i> Action Required'
                     $detailRowHtml = '2023 Secure Boot certificate is NOT present in the active<br />database (db) or firmware defaults (dbDefault).<br />A BIOS/firmware update from the OEM is required<br />to add 2023 certificate support before Windows Update<br />can complete the rotation. Update before June 2026.' + $guideHtml
-                    $plainText     = '❌ Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required.'
+                    $plainText     = "$($script:Emoji.Times) Secure Boot Enabled. 2023 cert missing from db and dbDefault. OEM BIOS/firmware update required."
                     $eventRowHtml  = '<i class="fas fa-exclamation-circle" style="color:#D9534F;"></i> No events - BIOS lacks 2023 certificate support'
-                    $statusEmoji = '❌'
+                    $statusEmoji = "$($script:Emoji.Times)"
                 }
             }
             break
@@ -6348,8 +6458,8 @@ end {
             $cardIconColor = '#6C757D'
             $statusRowHtml = '<i class="fas fa-question-circle" style="color:#6C757D;"></i> Unknown'
             $detailRowHtml = 'An unexpected state was encountered. Review script output for details.'
-            $plainText     = '❔ Secure Boot certificate status could not be determined.'
-            $statusEmoji = '❔'
+            $plainText     = "$($script:Emoji.QuestionWhite) Secure Boot certificate status could not be determined."
+            $statusEmoji = "$($script:Emoji.QuestionWhite)"
         }
     }
     
@@ -6365,8 +6475,8 @@ end {
                 $cardIconColor = '#26A644'
                 $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant'
                 $detailRowHtml = 'Triggered OS-side update.<br />2023 certificates successfully applied to BIOS firmware.'
-                $plainText     = '✅ Secure Boot Enabled. Triggered OS update; confirmed compliant. Certificates up to date.'
-                $statusEmoji = '✅'
+                $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. Triggered OS update; confirmed compliant. Certificates up to date."
+                $statusEmoji = "$($script:Emoji.Check)"
             }
             'Pending1808' {
                 # 1799 found - update is in progress
@@ -6374,27 +6484,27 @@ end {
                 $cardIconColor = '#F0AD4E'
                 $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                 $detailRowHtml = 'Triggered OS-side update.<br />Boot manager installed (Event 1799).<br />Update in progress - servicing will confirm when complete.'
-                $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; boot manager installed. Update in progress.'
-                $statusEmoji = '⚠️'
+                $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Triggered OS update; boot manager installed. Update in progress."
+                $statusEmoji = "$($script:Emoji.Warning)"
             }
             default {
                 # No events yet - update may need a reboot to proceed
                 $rebootStatus = Get-PendingRebootStatus
                 $statusKey     = 'Pending'
                 $cardIconColor = '#F0AD4E'
-                $statusEmoji = '⚠️'
+                $statusEmoji = "$($script:Emoji.Warning)"
                 if ($rebootStatus.Pending) {
                     $sourceList = $rebootStatus.Sources -join ', '
                     Write-Log "INFO" "Reboot pending from: $sourceList"
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending Cert Reboot'
                     $detailRowHtml = 'Triggered OS-side update.<br />A system reboot is pending (' + $sourceList + ').<br />Reboot may be required before update can proceed.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; reboot pending (' + $sourceList + ').'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Triggered OS update; reboot pending (" + $sourceList + ').'
                 }
                 else {
                     Write-Log "INFO" "No pending reboot detected; update may still be processing"
                     $statusRowHtml = '<i class="fas fa-clock" style="color:#F0AD4E;"></i> Pending'
                     $detailRowHtml = 'Triggered OS-side update.<br />Update is processing - servicing will confirm when complete.'
-                    $plainText     = '⚠️ Secure Boot Enabled. Triggered OS update; processing.'
+                    $plainText     = "$($script:Emoji.Warning) Secure Boot Enabled. Triggered OS update; processing."
                 }
             }
         }
@@ -6541,22 +6651,10 @@ end {
         if ($preAvVal -band 0x0004)  { $certsUnconfirmed += 'KEK 2K CA 2023' }
     }
     
-    # PK is the blocker when: Event 1795 (firmware rejected write) is firing AND the KEK 2K CA 2023
-    # is still missing from the firmware KEK database. The PK itself is a legitimate OEM cert, but
-    # it does not carry the authority chain needed to authorize the new Microsoft KEK 2K CA 2023 -
-    # an OEM BIOS/firmware update is required to extend PK trust. Used by Build-CertInventorySection
-    # to flip the PK row from green check to red X and by the plaintext summary downstream.
-    # NOTE: Event 1803 is deliberately NOT a PK-blocker. 1803 means the OS could not locate a
-    # PK-signed KEK 2023 update to install - the PK itself is valid, the OEM simply has not
-    # published a PK-signed KEK update to Microsoft for Windows Update to serve.
-    $pkBlockingKek = $false
-    if ($secureBoot -eq 'Enabled' -and $pkCerts.Count -gt 0 -and $pkIsTrusted -and $null -eq $hypervisor) {
-        $has1795ForPk = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1795)
-        if ($has1795ForPk -and -not $has2023InKek) {
-            $pkBlockingKek = $true
-        }
-    }
-    
+    # ($pkBlockingKek is computed earlier, before the state-resolution switch, so the
+    # State 5b-pre-blocker case at the top of the switch can consult it. See the
+    # block above the switch for the full rationale.)
+
     # Certificate inventory (all four 2023 certs - only when Secure Boot is Enabled)
     if ($secureBoot -eq 'Enabled') {
         $cardProperties['Certificates'] = Build-CertInventorySection -Format 'Html'
@@ -6822,7 +6920,7 @@ end {
             $localCardProperties['Certificates'] = Convert-FaIconsToEmoji (Build-CertInventorySection -Format 'Html')
         }
         # PK Security Alert - parity with Ninja card. Built with 'Local' Format so the header icon renders
-        # as an emoji (Format-CardIcon -> '❌') instead of FontAwesome. Rest of the body is format-agnostic
+        # as an emoji (Format-CardIcon -> '[Times]') instead of FontAwesome. Rest of the body is format-agnostic
         # HTML (details/links/code) that renders identically in both targets.
         if ($statusKey -eq 'PKUntrusted') {
             $localCardProperties['PK Security Alert'] = Build-PkSecurityAlertSection -Format 'Local'
