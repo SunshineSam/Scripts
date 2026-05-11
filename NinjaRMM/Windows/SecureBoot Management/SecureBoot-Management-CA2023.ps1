@@ -1,9 +1,12 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-07-2026
+    Last Edit: 05-11-2026
     
     Note:
+    05-11-2026: HP BIOS configuration test for stuck devices. Run in Opt-In mode to
+                apply misconfigured HP BIOS settings (if needed).
+                This also includes a new HPBIOS card section for visual clarity.
     05-07-2026: Addressed parsing errors for emojies in some environments. Now fully
                 supports the Windows Powershell 5.1 without any catches.
     04-30-2026: PK-blocks-KEK now overrides the "all mitigations applied -> Compliant
@@ -1030,7 +1033,182 @@ $($sectionsHtml.ToString())
             return $null
         }
     }
-    
+
+    # ---------------------------------------------------------------------------
+    # HP-specific BIOS check (CA 2023 interface settings)
+    # ---------------------------------------------------------------------------
+    # Background: HP shipped many laptop/desktop models with the 4 BIOS CA 2023
+    # toggles defaulted Disabled / "No". After the Enable Opt-in stage of this
+    # script runs, those devices entered repeated BitLocker recovery and the
+    # Boot Manager 2023 transition repeatedly stalled. Event signature when
+    # stuck: 1796 + 1800 + 1801 firing on repeat, AvailableUpdates pinned at
+    # 17664 (0x4500). The HP fix is to flip the 4 BIOS settings via
+    # HP_BIOSSettingInterface and suspend BitLocker for 3 reboots so the cert
+    # rotation can complete without recovery prompts.
+    #
+    # Expected enabled state (working HP devices):
+    #   Windows UEFI CA 2023              = Enable
+    #   Microsoft Option ROM UEFI CA 2023 = Enable
+    #   Microsoft UEFI CA 2023            = Enable
+    #   Enable MS UEFI CA key             = Yes
+    # ---------------------------------------------------------------------------
+    $script:HpExpectedBiosSettings = [ordered]@{
+        'Windows UEFI CA 2023'              = 'Enable'
+        'Microsoft Option ROM UEFI CA 2023' = 'Enable'
+        'Microsoft UEFI CA 2023'            = 'Enable'
+        'Enable MS UEFI CA key'             = 'Yes'
+    }
+
+    # Helper function: Read the four HP BIOS CA 2023 settings via HP_BIOSSetting WMI.
+    # Returns a result object regardless of WMI availability so callers can
+    # branch on .Available without try/catch. NonCompliant lists the settings
+    # whose CurrentValue does not match the expected enabled state.
+    function Get-HpBiosCa2023Settings {
+        $result = [pscustomobject]@{
+            Available    = $false
+            Settings     = [ordered]@{}
+            AllCompliant = $false
+            NonCompliant = @()
+            Error        = $null
+        }
+        $hpSettings = $null
+        try {
+            $hpSettings = Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName 'HP_BIOSSetting' -ErrorAction Stop
+        }
+        catch {
+            $result.Error = $_.Exception.Message
+            Write-Log "INFO" "HP_BIOSSetting WMI not available: $($_.Exception.Message)"
+            return $result
+        }
+        if ($null -eq $hpSettings -or @($hpSettings).Count -eq 0) {
+            $result.Error = 'HP_BIOSSetting returned no instances'
+            Write-Log "INFO" "HP_BIOSSetting returned no instances - cannot inspect HP BIOS CA 2023 toggles"
+            return $result
+        }
+        $result.Available = $true
+        foreach ($name in $script:HpExpectedBiosSettings.Keys) {
+            $row = $hpSettings | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+            if ($null -eq $row) {
+                $result.Settings[$name] = [pscustomobject]@{
+                    Present   = $false
+                    Current   = $null
+                    Expected  = $script:HpExpectedBiosSettings[$name]
+                    Compliant = $false
+                }
+                $result.NonCompliant += $name
+                Write-Log "WARNING" "HP BIOS setting not exposed by firmware: $name"
+                continue
+            }
+            $current = $row.CurrentValue
+            $isCompliant = ($current -eq $script:HpExpectedBiosSettings[$name])
+            $result.Settings[$name] = [pscustomobject]@{
+                Present   = $true
+                Current   = $current
+                Expected  = $script:HpExpectedBiosSettings[$name]
+                Compliant = $isCompliant
+            }
+            if (-not $isCompliant) {
+                $result.NonCompliant += $name
+                Write-Log "WARNING" "HP BIOS setting non-compliant: '$name' is '$current' (expected '$($script:HpExpectedBiosSettings[$name])')"
+            }
+            else {
+                Write-Log "INFO" "HP BIOS setting OK: '$name' = '$current'"
+            }
+        }
+        $result.AllCompliant = ($result.NonCompliant.Count -eq 0)
+        return $result
+    }
+
+    # Helper function: Apply the four HP BIOS CA 2023 settings via
+    # HP_BIOSSettingInterface.SetBIOSSetting and suspend BitLocker for the next
+    # three reboots (recovery-prompt safety net while firmware absorbs the change).
+    # Only call when the stuck-state signature has been confirmed by
+    # Test-HpStuckEventPattern - this is a BIOS-level write.
+    function Set-HpBiosCa2023Settings {
+        param ([string[]]$NamesToFix)
+        $result = [pscustomobject]@{
+            SettingsApplied    = @()
+            SettingsFailed     = @()
+            BitLockerSuspended = $false
+            BitLockerError     = $null
+            InterfaceError     = $null
+        }
+        $interface = $null
+        try {
+            $interface = Get-CimInstance -Namespace 'root\HP\InstrumentedBIOS' -ClassName 'HP_BIOSSettingInterface' -ErrorAction Stop
+        }
+        catch {
+            $result.InterfaceError = $_.Exception.Message
+            Write-Log "ERROR" "HP_BIOSSettingInterface not available: $($_.Exception.Message)"
+            return $result
+        }
+        foreach ($name in $NamesToFix) {
+            if (-not $script:HpExpectedBiosSettings.Contains($name)) { continue }
+            $value = $script:HpExpectedBiosSettings[$name]
+            try {
+                $invokeRes = Invoke-CimMethod -InputObject $interface -MethodName 'SetBIOSSetting' -Arguments @{
+                    Name  = $name
+                    Value = $value
+                } -ErrorAction Stop
+                if ($invokeRes.Return -eq 0) {
+                    Write-Log "SUCCESS" "HP BIOS: $name => $value (rc=0)"
+                    $result.SettingsApplied += [pscustomobject]@{ Name = $name; Value = $value; Return = 0 }
+                }
+                else {
+                    Write-Log "WARNING" "HP BIOS: $name => $value (rc=$($invokeRes.Return))"
+                    $result.SettingsFailed += [pscustomobject]@{ Name = $name; Value = $value; Return = $invokeRes.Return; Error = $null }
+                }
+            }
+            catch {
+                Write-Log "ERROR" "HP BIOS: SetBIOSSetting for '$name' threw: $($_.Exception.Message)"
+                $result.SettingsFailed += [pscustomobject]@{ Name = $name; Value = $value; Return = -1; Error = $_.Exception.Message }
+            }
+        }
+        # Suspend BitLocker for 3 reboots so firmware absorption of the new
+        # boot path does not land users in repeated recovery prompts.
+        try {
+            $null = & manage-bde.exe -protectors -disable C: -RebootCount 3 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "SUCCESS" "BitLocker protectors suspended on C: for next 3 reboots (manage-bde rc=0)"
+                $result.BitLockerSuspended = $true
+            }
+            else {
+                $result.BitLockerError = "manage-bde exited rc=$LASTEXITCODE"
+                Write-Log "WARNING" "manage-bde exited rc=$LASTEXITCODE while suspending BitLocker"
+            }
+        }
+        catch {
+            $result.BitLockerError = $_.Exception.Message
+            Write-Log "WARNING" "manage-bde threw while suspending BitLocker: $($_.Exception.Message)"
+        }
+        return $result
+    }
+
+    # Helper function: Detect the HP "BIOS CA 2023 disabled + Boot Manager 2023
+    # stuck" pattern. Signature is all three of 1796/1800/1801 present with at
+    # least one of them repeating (Count >= 2), confirmed when present by
+    # AvailableUpdates pinned at 0x4500 (17664).
+    function Test-HpStuckEventPattern {
+        param (
+            $CertStatus,
+            [int]$AvailableUpdatesBits = 0
+        )
+        if ($null -eq $CertStatus) { return $false }
+        $hasAll = (Test-HasSecureBootEvent -CertStatus $CertStatus -EventId 1796) -and
+                  (Test-HasSecureBootEvent -CertStatus $CertStatus -EventId 1800) -and
+                  (Test-HasSecureBootEvent -CertStatus $CertStatus -EventId 1801)
+        if (-not $hasAll) { return $false }
+        $repeated = $false
+        if ($null -ne $CertStatus.EventSummary) {
+            $hot = @($CertStatus.EventSummary | Where-Object {
+                ($_.Id -eq 1796 -or $_.Id -eq 1800 -or $_.Id -eq 1801) -and $_.Count -ge 2
+            })
+            $repeated = $hot.Count -ge 1
+        }
+        $confirmedByAv = ($AvailableUpdatesBits -eq 0x4500)
+        return ($repeated -or $confirmedByAv)
+    }
+
     # Helper function: Build card section content for both HTML and plain-text formats
     # Returns formatted content lines using the appropriate icons and separators
     # $Format: 'Html' for FontAwesome icons + <br />, 'Local' for emoji + newline
@@ -1305,6 +1483,106 @@ $($sectionsHtml.ToString())
         return Join-CardLines -Lines $lines -Format $Format
     }
     
+    # Helper function: Build HP BIOS CA 2023 interface section for card display.
+    # Branches:
+    #   - WMI not available / not HP -> returns $null (caller skips the section)
+    #   - All four settings compliant -> green "configured correctly"
+    #   - Settings non-compliant AND stuck-event pattern detected -> red "Action Required"
+    #     plus the per-setting state, remediation outcome (when supplied), BitLocker
+    #     suspend status, and HP OEM guide link.
+    #   - Settings non-compliant WITHOUT stuck-event pattern -> amber "Misconfigured"
+    #     plus per-setting state. No BIOS writes performed - operator is directed
+    #     to consult HP OEM before changing BIOS-level toggles.
+    # $Remediation is optional and, when present, is the object returned by
+    # Set-HpBiosCa2023Settings (rendered as a sub-branch of the Action Required path).
+    function Build-HpBiosSection {
+        param (
+            [string]$Format,
+            $HpBios,
+            [bool]$StuckPattern,
+            $Remediation
+        )
+        if ($null -eq $HpBios -or -not $HpBios.Available) { return $null }
+        $lines = @()
+        if ($HpBios.AllCompliant) {
+            $ic = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+            $lines += "$ic HP BIOS CA 2023 interface configured correctly"
+            foreach ($name in $script:HpExpectedBiosSettings.Keys) {
+                $s = $HpBios.Settings[$name]
+                $rowIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "&nbsp;&nbsp;$rowIc ${name}: $($s.Current)"
+            }
+            return Join-CardLines -Lines $lines -Format $Format
+        }
+        # Non-compliant - choose Action Required vs Misconfigured based on event pattern
+        if ($StuckPattern) {
+            $hdrIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+            $lines += "<span style='color:#D9534F;'>$hdrIc HP BIOS CA 2023 disabled while OS is stuck on Boot Manager 2023 (1796 + 1800 + 1801 repeating)</span>"
+        }
+        else {
+            $hdrIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
+            $lines += "<span style='color:#F0AD4E;'>$hdrIc HP BIOS CA 2023 interface misconfigured (no stuck-state events - consult HP before changing)</span>"
+        }
+        foreach ($name in $script:HpExpectedBiosSettings.Keys) {
+            $s = $HpBios.Settings[$name]
+            if (-not $s.Present) {
+                $rowIc = Format-CardIcon -Type 'question' -Color '#D9534F' -Format $Format
+                $lines += "&nbsp;&nbsp;$rowIc ${name}: <span style='color:#D9534F;'>not exposed by firmware</span> (expected $($s.Expected))"
+            }
+            elseif ($s.Compliant) {
+                $rowIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "&nbsp;&nbsp;$rowIc ${name}: $($s.Current)"
+            }
+            else {
+                $rowIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $lines += "&nbsp;&nbsp;$rowIc ${name}: <span style='color:#D9534F;'>$($s.Current)</span> &rarr; expected <span style='color:#26A644;'>$($s.Expected)</span>"
+            }
+        }
+        if ($StuckPattern -and $null -ne $Remediation) {
+            $appliedCount = @($Remediation.SettingsApplied).Count
+            $failedCount  = @($Remediation.SettingsFailed).Count
+            if ($null -ne $Remediation.InterfaceError) {
+                $errIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $lines += "<span style='color:#D9534F;'>$errIc Remediation skipped: HP_BIOSSettingInterface unavailable ($($Remediation.InterfaceError))</span>"
+            }
+            elseif ($appliedCount -gt 0 -and $failedCount -eq 0) {
+                $okIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "<span style='color:#26A644;'>$okIc Remediation applied: $appliedCount setting(s) corrected via HP_BIOSSettingInterface</span>"
+            }
+            elseif ($appliedCount -gt 0 -and $failedCount -gt 0) {
+                $warnIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
+                $lines += "<span style='color:#F0AD4E;'>$warnIc Remediation partial: $appliedCount applied, $failedCount failed</span>"
+            }
+            elseif ($failedCount -gt 0) {
+                $errIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $lines += "<span style='color:#D9534F;'>$errIc Remediation failed: all $failedCount SetBIOSSetting calls returned non-zero</span>"
+            }
+            foreach ($r in @($Remediation.SettingsFailed)) {
+                $rowIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
+                $detail = if ($null -ne $r.Error) { $r.Error } else { "rc=$($r.Return)" }
+                $lines += "&nbsp;&nbsp;$rowIc $($r.Name): <span style='color:#D9534F;'>$detail</span>"
+            }
+            if ($Remediation.BitLockerSuspended) {
+                $blIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
+                $lines += "$blIc BitLocker protectors suspended on C: for next 3 reboots (HP recovery-prompt mitigation)"
+            }
+            elseif ($null -ne $Remediation.BitLockerError) {
+                $blIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
+                $lines += "<span style='color:#F0AD4E;'>$blIc BitLocker suspend skipped: $($Remediation.BitLockerError)</span>"
+            }
+        }
+        elseif (-not $StuckPattern) {
+            $info = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
+            $lines += "$info No BIOS changes performed. Verify with HP support before toggling these settings."
+        }
+        $oemBiosGuide = Get-OemBIOSUpdateGuide
+        if ($oemBiosGuide) {
+            $linkIc = Format-CardIcon -Type 'building' -Color '#5BC0DE' -Format $Format
+            $lines += "$linkIc <a href='$oemBiosGuide' target='_blank' rel='nofollow noopener noreferrer'>HP BIOS / firmware update guide</a>"
+        }
+        return Join-CardLines -Lines $lines -Format $Format
+    }
+
     # Helper function: Build servicing status section for card display
     function Build-ServicingSection {
         param ([string]$Format)
@@ -5535,7 +5813,73 @@ process {
             Write-Log "WARNING" "SVN reboot pending - firmware SVN has not yet absorbed the staged update (reboot required)"
         }
     }
-    
+
+    # =======================================================================
+    # Step 2.18: HP-specific BIOS CA 2023 interface check
+    # =======================================================================
+    # Vendor branch: HP shipped many models with the four CA 2023 BIOS toggles
+    # defaulted Disabled/No. After the Enable Opt-in stage, those devices
+    # entered repeated BitLocker recovery with the Boot Manager 2023 cert
+    # rotation stalled (1796 + 1800 + 1801 firing on repeat,
+    # AvailableUpdates pinned at 0x4500).
+    #
+    # Sub-branch:
+    #   - Settings non-compliant AND stuck-event pattern matched ->
+    #     SetBIOSSetting on each non-compliant entry + manage-bde suspend
+    #     (3 reboots). Surfaced in the card as a remediation result.
+    #   - Settings non-compliant WITHOUT the stuck-event pattern ->
+    #     read-only display only; operator must consult HP before changing
+    #     BIOS-level toggles. No SetBIOSSetting calls.
+    # Audit mode ($SecureBootAction = 'Audit SecureBoot management status')
+    # is treated as read-only throughout the script and is never permitted
+    # to write BIOS settings even if the stuck pattern matches.
+    # =======================================================================
+    $hpBios            = $null
+    $hpStuckPattern    = $false
+    $hpRemediation     = $null
+    $isHpManufacturer  = $false
+    if ($secureBoot -eq 'Enabled') {
+        $hpManufacturerName = $null
+        try {
+            $hpManufacturerName = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).Manufacturer
+        }
+        catch {
+            Write-Log "INFO" "Win32_BIOS lookup for HP detection failed: $($_.Exception.Message)"
+        }
+        if ($hpManufacturerName -match '(?i)HP|Hewlett-Packard') {
+            $isHpManufacturer = $true
+            Write-Host "`n === HP BIOS CA 2023 Interface Check ==="
+            Write-Log "INFO" "HP manufacturer detected ($hpManufacturerName); inspecting CA 2023 BIOS toggles"
+            $hpBios = Get-HpBiosCa2023Settings
+            if ($hpBios.Available) {
+                if ($hpBios.AllCompliant) {
+                    Write-Log "SUCCESS" "All HP CA 2023 BIOS toggles already in expected enabled state"
+                }
+                else {
+                    Write-Log "WARNING" "HP CA 2023 BIOS toggles non-compliant: $($hpBios.NonCompliant -join ', ')"
+                    $hpStuckPattern = Test-HpStuckEventPattern -CertStatus $certStatus -AvailableUpdatesBits ([int]$avBits)
+                    if ($hpStuckPattern) {
+                        Write-Log "WARNING" "HP stuck-state signature confirmed (1796 + 1800 + 1801 repeating$(if ($avBits -eq 0x4500) { ' / AvailableUpdates=0x4500' } else { '' }))"
+                        if ($SecureBootAction -eq 'Audit SecureBoot management status') {
+                            Write-Log "INFO" "Audit mode - skipping BIOS write. Recommend re-running without audit to apply remediation."
+                        }
+                        else {
+                            Write-Log "INFO" "Applying HP BIOS remediation (SetBIOSSetting on non-compliant toggles + BitLocker suspend)"
+                            $hpRemediation = Set-HpBiosCa2023Settings -NamesToFix $hpBios.NonCompliant
+                        }
+                    }
+                    else {
+                        Write-Log "INFO" "Stuck-state event pattern not present - reporting HP BIOS misconfiguration without writing. Consult HP before changing BIOS toggles."
+                    }
+                }
+            }
+            else {
+                Write-Log "INFO" "HP_BIOSSetting WMI unavailable - cannot inspect HP CA 2023 BIOS toggles on this device"
+            }
+            Write-Host ""
+        }
+    }
+
     # =======================================================================
     # Step 2.2: SVN Enforcement (when $EnforceSvnCompliance -eq 'Enforce SVN')
     # =======================================================================
@@ -6654,7 +6998,7 @@ end {
     # ($pkBlockingKek is computed earlier, before the state-resolution switch, so the
     # State 5b-pre-blocker case at the top of the switch can consult it. See the
     # block above the switch for the full rationale.)
-
+    
     # Certificate inventory (all four 2023 certs - only when Secure Boot is Enabled)
     if ($secureBoot -eq 'Enabled') {
         $cardProperties['Certificates'] = Build-CertInventorySection -Format 'Html'
@@ -6668,6 +7012,11 @@ end {
     # Factory defaults - only surface when something is missing (healthy devices get no row)
     if ($secureBoot -eq 'Enabled' -and ($defaultsAllMissing -or $defaultsSomeMissing)) {
         $cardProperties['Factory Defaults'] = Build-FactoryDefaultsSection -Format 'Html'
+    }
+    # HP BIOS CA 2023 interface (only HP devices where WMI was readable)
+    if ($isHpManufacturer -and $null -ne $hpBios -and $hpBios.Available) {
+        $hpContent = Build-HpBiosSection -Format 'Html' -HpBios $hpBios -StuckPattern $hpStuckPattern -Remediation $hpRemediation
+        if ($null -ne $hpContent) { $cardProperties['HP BIOS CA 2023'] = $hpContent }
     }
     # Servicing status (only when Secure Boot is Enabled and servicing data exists)
     if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
@@ -6928,6 +7277,11 @@ end {
         # Factory defaults - parity with Ninja card. Only surfaced when something is missing.
         if ($secureBoot -eq 'Enabled' -and ($defaultsAllMissing -or $defaultsSomeMissing)) {
             $localCardProperties['Factory Defaults'] = Convert-FaIconsToEmoji (Build-FactoryDefaultsSection -Format 'Html')
+        }
+        # HP BIOS CA 2023 interface - parity with Ninja card.
+        if ($isHpManufacturer -and $null -ne $hpBios -and $hpBios.Available) {
+            $hpContent = Build-HpBiosSection -Format 'Html' -HpBios $hpBios -StuckPattern $hpStuckPattern -Remediation $hpRemediation
+            if ($null -ne $hpContent) { $localCardProperties['HP BIOS CA 2023'] = Convert-FaIconsToEmoji $hpContent }
         }
         if ($secureBoot -eq 'Enabled' -and $null -ne $servicingStatus) {
             $servContent = Build-ServicingSection -Format 'Html'
