@@ -1,9 +1,26 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-11-2026
+    Last Edit: 05-12-2026
     
     Note:
+    05-12-2026: HP BIOS remediation decoupled from the stuck-state filter. The four
+                CA 2023 BIOS toggles are now written via HP_BIOSSettingInterface on
+                any non-audit run when they report non-compliant - opt-in always
+                fixes the toggles regardless of whether the 1796 / 1800 / 1801
+                fingerprint is in the current event window. Test-HpStuckEventPattern
+                now controls only (a) whether manage-bde -RebootCount 3 fires
+                (unnecessary on already-1808 devices) and (b) card wording:
+                red Action Required (stuck) vs amber latent risk
+                (1808 but BIOS still Disabled) vs amber filter-not-matched
+                (BIOS write applies anyway). Set-HpBiosCa2023Settings now takes
+                -CertStatus / -AvailableUpdatesBits and calls the filter internally
+                to drive the manage-bde decision - no caller-side switch.
+                Build-HpBiosSection always renders the remediation result block
+                when a write was attempted, adds a "Why this is flagged"
+                significance paragraph on the non-stuck branches, and surfaces a
+                manual <details> fallback whenever the auto-write was skipped
+                (audit mode) or HP_BIOSSettingInterface was unavailable.
     05-11-2026: HP BIOS configuration test for stuck devices. Run in Opt-In mode to
                 apply misconfigured HP BIOS settings (if needed).
                 This also includes a new HPBIOS card section for visual clarity.
@@ -1120,12 +1137,18 @@ $($sectionsHtml.ToString())
     }
 
     # Helper function: Apply the four HP BIOS CA 2023 settings via
-    # HP_BIOSSettingInterface.SetBIOSSetting and suspend BitLocker for the next
-    # three reboots (recovery-prompt safety net while firmware absorbs the change).
-    # Only call when the stuck-state signature has been confirmed by
-    # Test-HpStuckEventPattern - this is a BIOS-level write.
+    # HP_BIOSSettingInterface.SetBIOSSetting. The BIOS write itself is safe to
+    # run on any non-compliant HP device and is invoked unconditionally.
+    # The BitLocker-suspend safety net (manage-bde -RebootCount 3) is gated
+    # by Test-HpStuckEventPattern on the same $CertStatus / $AvailableUpdatesBits
+    # the rest of the script uses - on already-1808 devices the suspend is
+    # unnecessary and manage-bde is flaky from PowerShell hosts.
     function Set-HpBiosCa2023Settings {
-        param ([string[]]$NamesToFix)
+        param (
+            [string[]]$NamesToFix,
+            $CertStatus,
+            [int]$AvailableUpdatesBits = 0
+        )
         $result = [pscustomobject]@{
             SettingsApplied    = @()
             SettingsFailed     = @()
@@ -1165,21 +1188,27 @@ $($sectionsHtml.ToString())
             }
         }
         # Suspend BitLocker for 3 reboots so firmware absorption of the new
-        # boot path does not land users in repeated recovery prompts.
-        try {
-            $null = & manage-bde.exe -protectors -disable C: -RebootCount 3 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "SUCCESS" "BitLocker protectors suspended on C: for next 3 reboots (manage-bde rc=0)"
-                $result.BitLockerSuspended = $true
+        # boot path does not land users in repeated recovery prompts. Driven
+        # by the same stuck-state filter the rest of the script uses - on
+        # already-1808 devices the safety net is unnecessary and the command
+        # itself is flaky in elevated PowerShell hosts.
+        $shouldSuspend = Test-HpStuckEventPattern -CertStatus $CertStatus -AvailableUpdatesBits $AvailableUpdatesBits
+        if ($shouldSuspend) {
+            try {
+                $null = & manage-bde.exe -protectors -disable C: -RebootCount 3 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log "SUCCESS" "BitLocker protectors suspended on C: for next 3 reboots (manage-bde rc=0)"
+                    $result.BitLockerSuspended = $true
+                }
+                else {
+                    $result.BitLockerError = "manage-bde exited rc=$LASTEXITCODE (try elevated cmd.exe if it persists)"
+                    Write-Log "WARNING" "manage-bde exited rc=$LASTEXITCODE while suspending BitLocker"
+                }
             }
-            else {
-                $result.BitLockerError = "manage-bde exited rc=$LASTEXITCODE"
-                Write-Log "WARNING" "manage-bde exited rc=$LASTEXITCODE while suspending BitLocker"
+            catch {
+                $result.BitLockerError = $_.Exception.Message
+                Write-Log "WARNING" "manage-bde threw while suspending BitLocker: $($_.Exception.Message)"
             }
-        }
-        catch {
-            $result.BitLockerError = $_.Exception.Message
-            Write-Log "WARNING" "manage-bde threw while suspending BitLocker: $($_.Exception.Message)"
         }
         return $result
     }
@@ -1514,14 +1543,30 @@ $($sectionsHtml.ToString())
             }
             return Join-CardLines -Lines $lines -Format $Format
         }
-        # Non-compliant - choose Action Required vs Misconfigured based on event pattern
+        # Non-compliant - choose Action Required vs Latent Risk based on event pattern
+        # Latent-risk branch covers two real-world cases:
+        #   1. Device has already completed cert rotation (Event 1808 present) but the
+        #      HP BIOS toggles are still Disabled. Currently passing; next cert/SVN
+        #      rotation that re-traverses the Boot Manager 2023 step is at risk of
+        #      stalling again on this same device.
+        #   2. Device has not yet hit 1808 but the stuck-loop fingerprint
+        #      (1796 + 1800 + 1801 repeating / AvailableUpdates = 0x4500) has not yet
+        #      surfaced in the log window we read. The script intentionally does NOT
+        #      write BIOS-level toggles in this branch - operator should run the
+        #      manual remediation block below after confirming with HP.
+        $currentlyCompliant = $false
+        if ($null -ne $certStatus -and $certStatus.EventId -eq 1808) { $currentlyCompliant = $true }
         if ($StuckPattern) {
             $hdrIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
             $lines += "<span style='color:#D9534F;'>$hdrIc HP BIOS CA 2023 disabled while OS is stuck on Boot Manager 2023 (1796 + 1800 + 1801 repeating)</span>"
         }
+        elseif ($currentlyCompliant) {
+            $hdrIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
+            $lines += "<span style='color:#F0AD4E;'>$hdrIc HP BIOS CA 2023 toggles disabled - device currently passing (Event 1808 compliant) but latent risk on the next cert/SVN rotation</span>"
+        }
         else {
             $hdrIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
-            $lines += "<span style='color:#F0AD4E;'>$hdrIc HP BIOS CA 2023 interface misconfigured (no stuck-state events - consult HP before changing)</span>"
+            $lines += "<span style='color:#F0AD4E;'>$hdrIc HP BIOS CA 2023 toggles disabled - stuck-state fingerprint not detected in current event window</span>"
         }
         foreach ($name in $script:HpExpectedBiosSettings.Keys) {
             $s = $HpBios.Settings[$name]
@@ -1538,24 +1583,47 @@ $($sectionsHtml.ToString())
                 $lines += "&nbsp;&nbsp;$rowIc ${name}: <span style='color:#D9534F;'>$($s.Current)</span> &rarr; expected <span style='color:#26A644;'>$($s.Expected)</span>"
             }
         }
-        if ($StuckPattern -and $null -ne $Remediation) {
+        # Significance line - non-stuck branches need to explain WHY the section
+        # is rendered when nothing is currently failing. Stuck branch is
+        # self-explanatory from the red header above.
+        if (-not $StuckPattern) {
+            $info = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
+            if ($currentlyCompliant) {
+                $lines += "$info <b>Why this is flagged:</b> the OS-side cert rotation completed against the existing UEFI db, " +
+                          "but the HP BIOS-level CA 2023 toggles never enabled. Future BIOS resets, key clears, or another " +
+                          "Microsoft-driven rotation (e.g. SVN enforcement, dbx revocation cycle) can re-enter the Boot Manager 2023 " +
+                          "transition - and on this device the firmware is configured to reject those writes, producing the " +
+                          "1796 / 1800 / 1801 loop and BitLocker recovery seen on other HP units. Corrected preemptively."
+            }
+            else {
+                $lines += "$info <b>Why this is flagged:</b> the HP BIOS-level CA 2023 toggles are disabled and the 1796 / 1800 / 1801 " +
+                          "stuck-loop fingerprint has not surfaced in the current event window. The BIOS write still applies - this " +
+                          "configuration consistently stalls the Boot Manager 2023 step and trips BitLocker recovery on the next " +
+                          "Windows Update reaching that transition, regardless of whether the fingerprint is visible yet."
+            }
+        }
+        # Remediation result - rendered whenever a write was attempted, on either
+        # branch. Set-HpBiosCa2023Settings is now invoked on any non-audit run
+        # where the four toggles are non-compliant; the stuck filter only
+        # controls whether manage-bde also fires (BitLocker line below).
+        if ($null -ne $Remediation) {
             $appliedCount = @($Remediation.SettingsApplied).Count
             $failedCount  = @($Remediation.SettingsFailed).Count
             if ($null -ne $Remediation.InterfaceError) {
                 $errIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
-                $lines += "<span style='color:#D9534F;'>$errIc Remediation skipped: HP_BIOSSettingInterface unavailable ($($Remediation.InterfaceError))</span>"
+                $lines += "<span style='color:#D9534F;'>$errIc Auto-remediation skipped: HP_BIOSSettingInterface unavailable ($($Remediation.InterfaceError)). Use the manual block below.</span>"
             }
             elseif ($appliedCount -gt 0 -and $failedCount -eq 0) {
                 $okIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
-                $lines += "<span style='color:#26A644;'>$okIc Remediation applied: $appliedCount setting(s) corrected via HP_BIOSSettingInterface</span>"
+                $lines += "<span style='color:#26A644;'>$okIc Auto-remediation applied: $appliedCount setting(s) corrected via HP_BIOSSettingInterface (rc=0). Reboot to absorb.</span>"
             }
             elseif ($appliedCount -gt 0 -and $failedCount -gt 0) {
                 $warnIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
-                $lines += "<span style='color:#F0AD4E;'>$warnIc Remediation partial: $appliedCount applied, $failedCount failed</span>"
+                $lines += "<span style='color:#F0AD4E;'>$warnIc Auto-remediation partial: $appliedCount applied, $failedCount failed (see per-setting detail below).</span>"
             }
             elseif ($failedCount -gt 0) {
                 $errIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
-                $lines += "<span style='color:#D9534F;'>$errIc Remediation failed: all $failedCount SetBIOSSetting calls returned non-zero</span>"
+                $lines += "<span style='color:#D9534F;'>$errIc Auto-remediation failed: all $failedCount SetBIOSSetting calls returned non-zero. Escalate to HP with model + BIOS version.</span>"
             }
             foreach ($r in @($Remediation.SettingsFailed)) {
                 $rowIc = Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format
@@ -1564,16 +1632,42 @@ $($sectionsHtml.ToString())
             }
             if ($Remediation.BitLockerSuspended) {
                 $blIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
-                $lines += "$blIc BitLocker protectors suspended on C: for next 3 reboots (HP recovery-prompt mitigation)"
+                $lines += "$blIc BitLocker protectors suspended on C: for next 3 reboots (stuck-state safety net)"
             }
             elseif ($null -ne $Remediation.BitLockerError) {
                 $blIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
-                $lines += "<span style='color:#F0AD4E;'>$blIc BitLocker suspend skipped: $($Remediation.BitLockerError)</span>"
+                $lines += "<span style='color:#F0AD4E;'>$blIc BitLocker suspend failed: $($Remediation.BitLockerError). Re-run from elevated cmd.exe if recovery prompts appear on reboot.</span>"
+            }
+            elseif (-not $StuckPattern) {
+                $blIc = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
+                $lines += "$blIc BitLocker suspend not run - stuck-state filter not matched, no Boot Manager 2023 transition is imminent."
             }
         }
-        elseif (-not $StuckPattern) {
-            $info = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
-            $lines += "$info No BIOS changes performed. Verify with HP support before toggling these settings."
+        # Manual remediation fallback - always rendered on the non-stuck branch,
+        # and also on the stuck branch when the auto-write was skipped (audit
+        # mode) or the interface was unavailable. Gives operators the exact
+        # working command set whether or not the script could execute it.
+        $needsManualBlock = (-not $StuckPattern) -or
+                            ($null -eq $Remediation) -or
+                            ($null -ne $Remediation -and $null -ne $Remediation.InterfaceError)
+        if ($needsManualBlock) {
+            $manualBlock = @'
+<details><summary style="cursor:pointer;"><b>Manual remediation (run elevated)</b></summary>
+<div style="margin-top:6px;font-size:0.9em;">
+<b>Step 1.</b> Apply the four HP BIOS CA 2023 toggles via WMI:
+<pre style="background:var(--code-bg,#f4f4f4);color:var(--code-text,#272727);padding:8px;border-radius:4px;overflow-x:auto;">$bios = Get-CimInstance -Namespace root\HP\InstrumentedBIOS -ClassName HP_BIOSSettingInterface
+Invoke-CimMethod -InputObject $bios -MethodName SetBIOSSetting -Arguments @{Name='Windows UEFI CA 2023';Value='Enable'}
+Invoke-CimMethod -InputObject $bios -MethodName SetBIOSSetting -Arguments @{Name='Microsoft Option ROM UEFI CA 2023';Value='Enable'}
+Invoke-CimMethod -InputObject $bios -MethodName SetBIOSSetting -Arguments @{Name='Microsoft UEFI CA 2023';Value='Enable'}
+Invoke-CimMethod -InputObject $bios -MethodName SetBIOSSetting -Arguments @{Name='Enable MS UEFI CA key';Value='Yes'}</pre>
+Each call should return <code>Return = 0</code>. Anything non-zero means the setting was rejected (BIOS password set, model lockdown, or firmware too old) - escalate to HP support with the model and BIOS version.<br /><br />
+<b>Step 2 (only when not yet at Event 1808 / a Boot Manager 2023 transition is imminent).</b> Suspend BitLocker for the next three reboots so firmware absorption of the new boot path does not trip recovery. <code>manage-bde.exe</code> can return Access Denied from PowerShell on some hosts; if so, run from elevated <b>cmd.exe</b>:
+<pre style="background:var(--code-bg,#f4f4f4);color:var(--code-text,#272727);padding:8px;border-radius:4px;overflow-x:auto;">manage-bde -protectors -disable C: -RebootCount 3</pre>
+On a device already at Event 1808 this step is usually unnecessary - the cert rotation has already completed and no immediate transition is pending. Skip unless you observe stuck-loop events after the BIOS write.<br /><br />
+<b>Step 3.</b> Reboot. Re-run this script to confirm the toggles report as Enabled and to verify Event 1808 remains the latest state event.
+</div></details>
+'@
+            $lines += $manualBlock
         }
         $oemBiosGuide = Get-OemBIOSUpdateGuide
         if ($oemBiosGuide) {
@@ -1582,7 +1676,7 @@ $($sectionsHtml.ToString())
         }
         return Join-CardLines -Lines $lines -Format $Format
     }
-
+    
     # Helper function: Build servicing status section for card display
     function Build-ServicingSection {
         param ([string]$Format)
@@ -5823,16 +5917,19 @@ process {
     # rotation stalled (1796 + 1800 + 1801 firing on repeat,
     # AvailableUpdates pinned at 0x4500).
     #
-    # Sub-branch:
-    #   - Settings non-compliant AND stuck-event pattern matched ->
-    #     SetBIOSSetting on each non-compliant entry + manage-bde suspend
-    #     (3 reboots). Surfaced in the card as a remediation result.
-    #   - Settings non-compliant WITHOUT the stuck-event pattern ->
-    #     read-only display only; operator must consult HP before changing
-    #     BIOS-level toggles. No SetBIOSSetting calls.
-    # Audit mode ($SecureBootAction = 'Audit SecureBoot management status')
-    # is treated as read-only throughout the script and is never permitted
-    # to write BIOS settings even if the stuck pattern matches.
+    # Remediation policy:
+    #   - On any non-audit run, if the four HP BIOS toggles are non-compliant
+    #     the SetBIOSSetting writes ALWAYS execute. The fix is safe and the
+    #     toggles are required for the next cert / SVN rotation regardless of
+    #     whether the device is currently stuck.
+    #   - The stuck-state event filter (Test-HpStuckEventPattern) does NOT
+    #     gate the BIOS write. It only controls:
+    #       * Whether manage-bde suspends BitLocker for 3 reboots (only on
+    #         confirmed stuck signature - on already-1808 devices the suspend
+    #         is unnecessary and manage-bde is flaky from PowerShell hosts).
+    #       * The card wording (red Action Required vs amber latent risk).
+    #   - Audit mode is the one exception - never writes BIOS toggles, prints
+    #     a "re-run without audit" hint instead.
     # =======================================================================
     $hpBios            = $null
     $hpStuckPattern    = $false
@@ -5857,19 +5954,21 @@ process {
                 }
                 else {
                     Write-Log "WARNING" "HP CA 2023 BIOS toggles non-compliant: $($hpBios.NonCompliant -join ', ')"
+                    # Filter runs for wording / BitLocker-suspend decisions only - never gates the BIOS write.
                     $hpStuckPattern = Test-HpStuckEventPattern -CertStatus $certStatus -AvailableUpdatesBits ([int]$avBits)
                     if ($hpStuckPattern) {
                         Write-Log "WARNING" "HP stuck-state signature confirmed (1796 + 1800 + 1801 repeating$(if ($avBits -eq 0x4500) { ' / AvailableUpdates=0x4500' } else { '' }))"
-                        if ($SecureBootAction -eq 'Audit SecureBoot management status') {
-                            Write-Log "INFO" "Audit mode - skipping BIOS write. Recommend re-running without audit to apply remediation."
-                        }
-                        else {
-                            Write-Log "INFO" "Applying HP BIOS remediation (SetBIOSSetting on non-compliant toggles + BitLocker suspend)"
-                            $hpRemediation = Set-HpBiosCa2023Settings -NamesToFix $hpBios.NonCompliant
-                        }
                     }
                     else {
-                        Write-Log "INFO" "Stuck-state event pattern not present - reporting HP BIOS misconfiguration without writing. Consult HP before changing BIOS toggles."
+                        Write-Log "INFO" "Stuck-state event filter did not match - BIOS write still applies (filter controls wording + BitLocker suspend only)"
+                    }
+                    if ($SecureBootAction -eq 'Audit SecureBoot management status') {
+                        Write-Log "INFO" "Audit mode - skipping BIOS write. Re-run without audit to apply remediation."
+                    }
+                    else {
+                        $bitlockerNote = if ($hpStuckPattern) { ' + BitLocker suspend' } else { ' (BitLocker suspend skipped - filter not matched)' }
+                        Write-Log "INFO" "Applying HP BIOS remediation: SetBIOSSetting on non-compliant toggles$bitlockerNote"
+                        $hpRemediation = Set-HpBiosCa2023Settings -NamesToFix $hpBios.NonCompliant -CertStatus $certStatus -AvailableUpdatesBits ([int]$avBits)
                     }
                 }
             }
