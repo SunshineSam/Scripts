@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-21-2026
-
+    Last Edit: 05-20-2026
+    
     Note:
     05-20-2026: HP BIOS remediation now gates strictly on the Enable opt-in
                 action. Added $script:IsEnableAction (-like 'Enable*', same
@@ -1139,7 +1139,7 @@ $($sectionsHtml.ToString())
             return $null
         }
     }
-
+    
     # ---------------------------------------------------------------------------
     # HP-specific BIOS check (CA 2023 interface settings)
     # ---------------------------------------------------------------------------
@@ -1164,7 +1164,7 @@ $($sectionsHtml.ToString())
         'Microsoft UEFI CA 2023'            = 'Enable'
         'Enable MS UEFI CA key'             = 'Yes'
     }
-
+    
     # Helper function: Read the four HP BIOS CA 2023 settings via HP_BIOSSetting WMI.
     # Returns a result object regardless of WMI availability so callers can
     # branch on .Available without try/catch.
@@ -1232,7 +1232,7 @@ $($sectionsHtml.ToString())
         $result.AllCompliant = ($result.NonCompliant.Count -eq 0)
         return $result
     }
-
+    
     # Helper function: Apply the four HP BIOS CA 2023 settings via
     # HP_BIOSSettingInterface.SetBIOSSetting. The BIOS write itself is safe to
     # run on any non-compliant HP device.
@@ -1323,7 +1323,7 @@ $($sectionsHtml.ToString())
         }
         return $result
     }
-
+    
     # Helper function: Detect the HP "BIOS CA 2023 disabled + Boot Manager 2023
     # stuck" pattern. Signature is all three of 1796/1800/1801 present with at
     # least one of them repeating (Count >= 2), confirmed when present by
@@ -1657,14 +1657,14 @@ $($sectionsHtml.ToString())
         # the card. Other rows are short enough to not need the wrapper.
         $paraStyle = 'display:block;max-width:767px;'
         $lines = @()
-
+        
         $currentlyCompliant = $false
         if ($null -ne $certStatus -and $certStatus.EventId -eq 1808) { $currentlyCompliant = $true }
         $notExposedCount = @($HpBios.NotExposed).Count
         $notExposedNote = if ($notExposedCount -gt 0) {
             " <span style='color:#888;font-size:0.9em;'>($notExposedCount toggle$(if ($notExposedCount -ne 1) { 's' }) not exposed by this firmware - normal for many HP models)</span>"
         } else { '' }
-
+        
         # --- Header --------------------------------------------------------
         if ($HpBios.AllCompliant) {
             $ic = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
@@ -1682,7 +1682,7 @@ $($sectionsHtml.ToString())
             $hdrIc = Format-CardIcon -Type 'warning' -Color '#F0AD4E' -Format $Format
             $lines += "<span style='color:#F0AD4E;'>$hdrIc HP BIOS CA 2023 toggles disabled - stuck-state fingerprint not detected in current event window</span>$notExposedNote"
         }
-
+        
         # --- Per-setting state grid ----------------------------------------
         # NotExposed rows are blue/info, not red - this is firmware-normal on
         # many models (EliteBook 840 G7/G8, ProBook 450 G10 seem to only
@@ -1702,7 +1702,7 @@ $($sectionsHtml.ToString())
                 $lines += "&nbsp;&nbsp;$rowIc ${name}: <span style='color:#D9534F;'>$($s.Current)</span> &rarr; expected <span style='color:#26A644;'>$($s.Expected)</span>"
             }
         }
-
+        
         # --- Significance paragraph (non-stuck branches only) --------------
         # Stuck branch is self-explanatory from the red header. Non-stuck
         # branches need to explain WHY the section was rendered when nothing
@@ -1729,7 +1729,7 @@ $($sectionsHtml.ToString())
             }
             $lines += "$info <span style=`"$paraStyle`">$body</span>"
         }
-
+        
         # --- Remediation outcome (any run that attempted writes) -----------
         if ($null -ne $Remediation) {
             $appliedCount = @($Remediation.SettingsApplied).Count
@@ -1774,7 +1774,7 @@ $($sectionsHtml.ToString())
                 $lines += "$blIc BitLocker suspend not run - no BIOS settings were changed in this run."
             }
         }
-
+        
         # --- Manual fallback (audit mode or interface error) ---------------
         # Auto-write was the answer when it could run; only surface the manual
         # block when the script couldn't execute it. Removes noise from runs
@@ -1800,7 +1800,7 @@ Skip this step if every setting was already correct - no BIOS change means no PC
 '@
             $lines += $manualBlock
         }
-
+        
         $oemBiosGuide = Get-OemBIOSUpdateGuide
         if ($oemBiosGuide) {
             $linkIc = Format-CardIcon -Type 'building' -Color '#5BC0DE' -Format $Format
