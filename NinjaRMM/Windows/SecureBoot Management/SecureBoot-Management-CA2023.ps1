@@ -1,10 +1,19 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-20-2026
-    
+    Last Edit: 05-21-2026
+
     Note:
-    05-20-2026: Audit-mode guard hardening (root cause of an HP BitLocker
+    05-20-2026: HP BIOS remediation now gates strictly on the Enable opt-in
+                action. Added $script:IsEnableAction (-like 'Enable*', same
+                truncation-proof pattern as $script:IsAuditAction) and changed
+                Step 2.18 to write firmware toggles only when that flag is set.
+                Previously the write fired on any non-audit run, which meant
+                'Remove opt-in for SecureBoot management' also flipped the HP
+                BIOS toggles on - contradictory intent and a needless BIOS
+                write. Audit and Remove opt-in are now both no-ops for the HP
+                BIOS branch; only Enable opt-in performs the remediation.
+                Audit-mode guard hardening (root cause of an HP BitLocker
                 recovery report). Ninja's dropdown variable resolution requires
                 exact values, the "Audit" instead of "Audit SecureBoot management
                 status" in the [ValidateSet] had was being checked in the HP logic
@@ -770,10 +779,14 @@ begin {
             $SecureBootAction = $canonicalAction
         }
     }
-    # Pre-compute the read-only audit guard once so downstream callers cannot
+    # Pre-compute the action guards once so downstream callers cannot
     # accidentally re-introduce the same truncated-string bug. Any check that
-    # needs "is this an audit-mode run?" should consult $script:IsAuditAction.
-    $script:IsAuditAction = ($SecureBootAction -like 'Audit*')
+    # needs "is this an audit-mode run?" should consult $script:IsAuditAction;
+    # anything that performs a write-style remediation (e.g. the HP BIOS
+    # toggle fix) should gate on $script:IsEnableAction so it only ever fires
+    # under the Enable opt-in action - never under Audit or Remove opt-in.
+    $script:IsAuditAction  = ($SecureBootAction -like 'Audit*')
+    $script:IsEnableAction = ($SecureBootAction -like 'Enable*')
     
     #######################
     # Emoji table
@@ -6045,15 +6058,17 @@ process {
     #      Test-HpStuckEventPattern via the EventId==1808 freshness gate).
     #
     # Remediation policy:
-    #   - On any non-audit run, NonCompliant (Present-but-wrong) settings are
-    #     written via SetBIOSSetting. NotExposed settings are skipped entirely
+    #   - The BIOS write fires ONLY under the Enable opt-in action
+    #     ($script:IsEnableAction). Audit is read-only and Remove opt-in is the
+    #     opposite intent (tearing down WU management), so neither writes
+    #     firmware toggles. NonCompliant (Present-but-wrong) settings are
+    #     written via SetBIOSSetting; NotExposed settings are skipped entirely
     #     - the firmware lacks them and rc=4 is not actionable.
-    #   - Set-HpBiosCa2023Settings now decides BitLocker suspend internally:
+    #   - Set-HpBiosCa2023Settings decides BitLocker suspend internally:
     #     fires iff at least one SetBIOSSetting returned rc=0.
     #   - Test-HpStuckEventPattern still runs, but ONLY influences the card
     #     wording (red Action Required vs amber latent risk vs amber filter-
     #     not-matched). It no longer drives any code paths.
-    #   - Audit mode is the one exception: never writes BIOS toggles.
     # =======================================================================
     $hpBios            = $null
     $hpStuckPattern    = $false
@@ -6088,12 +6103,20 @@ process {
                     else {
                         Write-Log "INFO" "Stuck-state event filter did not match - filter only influences card wording, BIOS write still applies"
                     }
-                    if ($script:IsAuditAction) {
-                        Write-Log "INFO" "Audit mode - skipping BIOS write. Re-run without audit to apply remediation."
-                    }
-                    else {
+                    # HP BIOS toggle remediation is a write that can move the
+                    # boot-measured PCRs - only ever fire it under the Enable
+                    # opt-in action. Audit is read-only; Remove opt-in is the
+                    # opposite intent (tearing down WU management) and must not
+                    # be flipping firmware toggles on.
+                    if ($script:IsEnableAction) {
                         Write-Log "INFO" "Applying HP BIOS remediation: SetBIOSSetting on $($hpBios.NonCompliant.Count) non-compliant exposed toggle(s). BitLocker suspend will fire iff any write returns rc=0."
                         $hpRemediation = Set-HpBiosCa2023Settings -NamesToFix $hpBios.NonCompliant
+                    }
+                    elseif ($script:IsAuditAction) {
+                        Write-Log "INFO" "Audit mode - skipping BIOS write. Re-run with 'Enable opt-in' to apply remediation."
+                    }
+                    else {
+                        Write-Log "INFO" "Action '$SecureBootAction' is not 'Enable opt-in' - skipping HP BIOS write (remediation only runs under Enable opt-in)."
                     }
                 }
             }
