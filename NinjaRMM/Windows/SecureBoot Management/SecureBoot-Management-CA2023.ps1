@@ -1,9 +1,24 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-15-2026
+    Last Edit: 05-20-2026
     
     Note:
+    05-20-2026: Audit-mode guard hardening (root cause of an HP BitLocker
+                recovery report). Ninja's dropdown variable resolution requires
+                exact values, the "Audit" instead of "Audit SecureBoot management
+                status" in the [ValidateSet] had was being checked in the HP logic
+                with the full string, and falling through the filter, routing the
+                script into the non-audit branch of Step 2.18 and writing HP BIOS
+                toggles on an intended read-only audit run, which triggered BitLocker
+                recovery on the next reboot.
+                Fix: begin{} now normalizes any loose input strings up front via a
+                wildcard switch (Audit* / Enable* / Remove*) back to the
+                canonical ValidateSet string, and logs the rewrite when it
+                happens so operators can see the upstream resolution bug.
+                A pre-computed $script:IsAuditAction flag (-like 'Audit*') is
+                exposed for downstream filtering. Step 2.18 now consults it
+                instead of the raw string comparison.
     05-15-2026: HP BIOS handling reshaped around field testing.
                 - Get-HpBiosCa2023Settings now splits results into NonCompliant
                   (Present-but-wrong, eligible for SetBIOSSetting) and NotExposed
@@ -732,6 +747,33 @@ begin {
         exit 1
     }
     Write-Host "`nRunning as Administrator"
+    
+    #######################
+    # SecureBootAction normalization
+    #######################
+    # Defends against a Ninja variable-resolution filtering where the expected 
+    # dropdown value is not provided, passting throught input filters
+    # (e.g. "Audit" instead of "Audit SecureBoot management status")
+    # The [ValidateSet] on the param block validates the input value. 
+    # Normalize to the canonical ValidateSet string up front so every
+    # downstream comparison sees a known string. Logs the rewrite when it
+    # happens so operators can spot the upstream resolution bug.
+    if ($SecureBootAction) {
+        $canonicalAction = switch -Wildcard ($SecureBootAction.Trim()) {
+            'Audit*'  { 'Audit SecureBoot management status' ; break }
+            'Enable*' { 'Enable opt-in for SecureBoot management' ; break }
+            'Remove*' { 'Remove opt-in for SecureBoot management' ; break }
+            default   { $SecureBootAction }
+        }
+        if ($canonicalAction -ne $SecureBootAction) {
+            Write-Host "[INFO] SecureBootAction normalized: '$SecureBootAction' -> '$canonicalAction' (Ninja variable resolution has an indirect dropdown value)"
+            $SecureBootAction = $canonicalAction
+        }
+    }
+    # Pre-compute the read-only audit guard once so downstream callers cannot
+    # accidentally re-introduce the same truncated-string bug. Any check that
+    # needs "is this an audit-mode run?" should consult $script:IsAuditAction.
+    $script:IsAuditAction = ($SecureBootAction -like 'Audit*')
     
     #######################
     # Emoji table
@@ -6046,7 +6088,7 @@ process {
                     else {
                         Write-Log "INFO" "Stuck-state event filter did not match - filter only influences card wording, BIOS write still applies"
                     }
-                    if ($SecureBootAction -eq 'Audit SecureBoot management status') {
+                    if ($script:IsAuditAction) {
                         Write-Log "INFO" "Audit mode - skipping BIOS write. Re-run without audit to apply remediation."
                     }
                     else {
