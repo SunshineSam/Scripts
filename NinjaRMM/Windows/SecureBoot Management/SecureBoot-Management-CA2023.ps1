@@ -1,9 +1,26 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-20-2026
+    Last Edit: 05-26-2026
     
     Note:
+    05-26-2026: Post-compliance variable-cert refresh no longer reports as a
+                regression. Compliance requires only the two db certs
+                Windows UEFI CA 2023 + Microsoft UEFI CA 2023 (plus KEK 2023);
+                Microsoft Option ROM UEFI CA 2023 is variable per make/model/oem.
+                Field reports showed devices that reached Event 1808 then received
+                a fresh 1801 once Windows Update began serving the Option ROM cert.
+                The latest state event flipped to 1801 and the card downgraded
+                to Pending ("stuck on 1801") despite the required certs being
+                present and the device having booted compliant.
+                Fix: a new $variableCertRefresh precompute (required certs +
+                KEK present, Option ROM the only db cert missing, prior 1808 in
+                history, latest event 1801) and a new "State 3-pre" branch ahead
+                of the Compliant state that holds Compliant with an "(variable
+                cert update pending)" note instead of regressing. The Option ROM
+                row in the certificate inventory now renders blue/pending rather
+                than a red X in this case. KEK-present is required so genuine
+                1795/1803 OEM blockers are not masked.
     05-20-2026: HP BIOS remediation now gates strictly on the Enable opt-in
                 action. Added $script:IsEnableAction (-like 'Enable*', same
                 truncation-proof pattern as $script:IsAuditAction) and changed
@@ -5731,7 +5748,7 @@ process {
         Write-Log "INFO" "Skipping event log check (Secure Boot is $secureBoot)"
     }
     
-    # --- Augment dbCertsFound with event 1044/1045 for devices where raw byte parsing missed optional certs ---
+    # --- Augment dbCertsFound with event 1044/1045 for devices where raw byte parsing missed variable certs ---
     if ($null -ne $certStatus -and -not $allDbCertsPresent) {
         $eventAugmented = $false
         if ($dbCertsFound -notcontains 'Microsoft UEFI CA 2023' -and (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1045)) {
@@ -6176,7 +6193,7 @@ process {
         }
         
         # Re-read db certs after enforcement if supplementary certs were attempted
-        # This ensures the cert inventory card reflects newly-applied optional certs
+        # This ensures the cert inventory card reflects newly-applied variable certs
         if ($null -ne $svnEnforcementResult -and $svnEnforcementResult.SupplementaryCertsAttempted) {
             Write-Log "INFO" "Re-reading db certs after supplementary cert application"
             try {
@@ -6566,6 +6583,37 @@ end {
         }
     }
     
+    # Post-compliance variable-cert refresh detection.
+    # Compliance only requires the two db certs Windows UEFI CA 2023 +
+    # Microsoft UEFI CA 2023 (plus KEK 2K CA 2023 for the trust chain). The
+    # third db cert, Microsoft Option ROM UEFI CA 2023, is VARIABLE. A device
+    # is fully compliant without it. Event 1808, then receive Event 1801 when Windows
+    # Update later begins serving the Option ROM cert. Because 1801 becomes the
+    # latest state event, Get-CertUpdateEventStatus reports 'ActionRequired'
+    # and the card would otherwise downgrade to Pending ("stuck on 1801") even
+    # though the required certs are present and the device is compliant.
+    #
+    # Detect that specific case so the card maintains Compliant with a
+    # pending-cert note instead of a false regression:
+    #   - both required certs present
+    #   - KEK 2023 present (trust chain intact - rules out 1795/1803 blockers)
+    #   - the Option ROM cert is the one not yet in db
+    #   - history shows a prior Event 1808 (device was compliant)
+    #   - the current latest state event is 1801 (the new variable-cert serve)
+    $variableDbCertName  = 'Microsoft Option ROM UEFI CA 2023'
+    $variableCertRefresh = $false
+    if ($secureBoot -eq 'Enabled' -and $null -ne $certStatus) {
+        $requiredCertsPresent = ($dbCertsFound -contains 'Windows UEFI CA 2023') -and
+                                ($dbCertsFound -contains 'Microsoft UEFI CA 2023')
+        $optionalCertMissing  = ($dbCertsFound -notcontains $variableDbCertName)
+        $hadPrior1808         = (Test-HasSecureBootEvent -CertStatus $certStatus -EventId 1808)
+        $latestIs1801         = ($certStatus.EventId -eq 1801)
+        if ($requiredCertsPresent -and $has2023InKek -and $optionalCertMissing -and $hadPrior1808 -and $latestIs1801) {
+            $variableCertRefresh = $true
+            Write-Log "INFO" "Post-compliance variable cert refresh detected: required 2023 certs + KEK present, prior 1808, latest 1801 serving $variableDbCertName. Maintaining Compliant with pending cert note."
+        }
+    }
+    
     switch ($true) {
       
         # State 1: Not Applicable (non-UEFI / unsupported hardware)
@@ -6638,6 +6686,32 @@ end {
             
             $plainText   = "$($script:Emoji.Times) Secure Boot Enabled but PK is a AMI test key (PKFail / CVE-2024-8105). Chain of trust broken. BIOS update required."
             $statusEmoji = "$($script:Emoji.Times)"
+            break
+        }
+        
+        # State 3-pre: Compliant with a pending variable-cert refresh.
+        # The two required db certs are present and the device previously
+        # reached Event 1808, but Windows Update is now serving the VARIABLE
+        # Microsoft Option ROM UEFI CA 2023 cert, producing a fresh 1801. The
+        # device is still compliant. Hold Compliant and note the pending cert
+        # rather than regressing to Pending. Placed before State 3 so the note
+        # is shown even when the servicing registry still reports 'Updated'.
+        ($secureBoot -eq 'Enabled' -and $variableCertRefresh) {
+            $statusKey     = 'Compliant'
+            $cardIconColor = '#26A644'
+            $variableShort = $variableDbCertName -replace 'Microsoft ', ''
+            $statusRowHtml = '<i class="fas fa-check-circle" style="color:#26A644;"></i> Compliant <span style="color:#5BC0DE;">(variable cert update pending)</span>'
+            $eventTime     = if ($certStatus.EventTime) { $certStatus.EventTime.ToString('yyyy-MM-dd HH:mm') } else { 'Unknown' }
+            $eventRowHtml  = '<i class="fas fa-calendar-check" style="color:#26A644;"></i> Event 1801 (' + $variableShort + ') at ' + $eventTime + ' <span style="color:#5BC0DE;">| prior Event 1808 compliant</span>'
+            $detailRowHtml = 'The two required 2023 certificates (Windows UEFI CA 2023 and<br />' +
+                             'Microsoft UEFI CA 2023) are present and the device previously<br />' +
+                             'reached compliance (Event 1808).<br /><br />' +
+                             'Windows Update is now serving the variable ' + $variableShort + '<br />' +
+                             'certificate (Event 1801). This does not affect compliance. The<br />' +
+                             'variable cert will apply automatically on a following Windows<br />' +
+                             'Update cycle (a reboot may be required).'
+            $plainText     = "$($script:Emoji.Check) Secure Boot Enabled. Compliant (required 2023 certs + prior 1808). Variable $variableShort update pending (Event 1801)."
+            $statusEmoji   = "$($script:Emoji.Check)"
             break
         }
         
@@ -7240,6 +7314,12 @@ end {
         if ($preAvVal -band 0x1000)  { $certsUnconfirmed += 'UEFI CA 2023' }
         # KEK: test bit 0x0004 specifically - 0x4000 is the conditional qualifier (not the KEK bit)
         if ($preAvVal -band 0x0004)  { $certsUnconfirmed += 'KEK 2K CA 2023' }
+    }
+    # Post-compliance variable-cert refresh: render the Option ROM row as
+    # pending (blue) rather than missing (red X). Build-CertInventorySection
+    # matches the full cert name, so add the full name here.
+    if ($variableCertRefresh -and ($certsUnconfirmed -notcontains $variableDbCertName)) {
+        $certsUnconfirmed += $variableDbCertName
     }
     
     # ($pkBlockingKek is computed earlier, before the state-resolution switch, so the
