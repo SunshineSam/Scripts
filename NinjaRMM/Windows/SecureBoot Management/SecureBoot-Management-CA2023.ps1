@@ -21,6 +21,10 @@
                 row in the certificate inventory now renders blue/pending rather
                 than a red X in this case. KEK-present is required so genuine
                 1795/1803 OEM blockers are not masked.
+                Also: the HP BIOS section no longer prints a row for toggles the
+                firmware does not expose. Absence is the indicator. Only exposed
+                settings are listed. The not-exposed count remains summarized
+                in the header parenthesis.
     05-20-2026: HP BIOS remediation now gates strictly on the Enable opt-in
                 action. Added $script:IsEnableAction (-like 'Enable*', same
                 truncation-proof pattern as $script:IsAuditAction) and changed
@@ -1701,16 +1705,14 @@ $($sectionsHtml.ToString())
         }
         
         # --- Per-setting state grid ----------------------------------------
-        # NotExposed rows are blue/info, not red - this is firmware-normal on
-        # many models (EliteBook 840 G7/G8, ProBook 450 G10 seem to only
-        # expose 'Enable MS UEFI CA key' and still rotate certs cleanly).
+        # Only exposed settings get a row. NotExposed toggles are omitted
+        # entirely - listing every "not exposed by firmware" line wastes card
+        # space and the absence of the row is itself the indicator. The
+        # not-exposed count is still summarized in the header parenthetical.
         foreach ($name in $script:HpExpectedBiosSettings.Keys) {
             $s = $HpBios.Settings[$name]
-            if (-not $s.Present) {
-                $rowIc = Format-CardIcon -Type 'info' -Color '#5BC0DE' -Format $Format
-                $lines += "&nbsp;&nbsp;$rowIc ${name}: <span style='color:#888;'>not exposed by firmware</span>"
-            }
-            elseif ($s.Compliant) {
+            if (-not $s.Present) { continue }
+            if ($s.Compliant) {
                 $rowIc = Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format
                 $lines += "&nbsp;&nbsp;$rowIc ${name}: $($s.Current)"
             }
