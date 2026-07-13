@@ -786,7 +786,7 @@ param(
     
     # BitLocker safety for irreversible SVN stages (Stage 3/4 only)
     # Checked/enabled suspends all encrypted OS/fixed-data volumes for two reboots
-    [switch]$SuspendBitlockerForSVN = $(if ($env:suspendBitlockerForSVN) { [Convert]::ToBoolean($env:suspendBitlockerForSVN) } else { $true }), # Optional Ninja Script Variable; Checkbox
+    [switch]$SuspendBitlockerForSVN = $(if ($env:suspendBitlockerForSvn) { [Convert]::ToBoolean($env:suspendBitlockerForSvn) } else { $true }), # Optional Ninja Script Variable; Checkbox
     
     # Boot media deep scan: enumerate WIM images inside USB/recovery media for 2011-signed bootmgr
     # Off by default (surface-level EFI file check is fast; WIM scanning requires DISM and is slow)
