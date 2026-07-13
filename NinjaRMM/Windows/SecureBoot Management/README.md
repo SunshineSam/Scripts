@@ -34,7 +34,7 @@ _Audits CA 2023 rotation state, optionally configures Windows Update opt-in or a
 |-----------------------------|--------------|-------------------------------------------------------------------------------------------------------|
 | **$securebootAction**       | *dropdown*   | Windows Update opt-in action: Enable, Remove, or Audit. See [`securebootAction`](#securebootaction).  |
 | **$enforceSvnCompliance**   | *dropdown*   | SVN hardening mode: Enforce SVN or Passive. See [`enforceSvnCompliance`](#enforcesvncompliance).      |
-| **$suspendBitlockerForSVN** | *checkbox*   | Suspend encrypted OS/fixed-data BitLocker volumes for two reboots before SVN Stage 3/4. Checked by default. |
+| **$suspendBitlockerForSvn** | *checkbox*   | Suspend encrypted OS/fixed-data BitLocker volumes for two reboots before SVN Stage 3/4. Checked by default. |
 | **$saveStatusLocal**        | *switch*     | Save status card and plain-text summary to `C:\Logs\SecureBoot\`. Defaults to false.                  |
 | **$saveLogToDevice**        | *switch*     | Save a timestamped activity log to `C:\Logs\SecureBoot\SecureBootStatus.log`. Defaults to true.       |
 | **$includeDefaultHive**     | *switch*     | Apply per-user telemetry keys to the Default profile template (SYSTEM context only). Defaults to true.|
