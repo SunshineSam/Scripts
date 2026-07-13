@@ -1,9 +1,28 @@
 #Requires -Version 5.1
 <#
     === Created by Sam ===
-    Last Edit: 05-26-2026
+    Last Edit: 07-13-2026
     
     Note:
+    07-13-2026: Added SuspendBitlockerForSVN switch (checked/enabled by default). Immediately
+                before a new or already-pending Stage 3/4 SVN operation, the
+                script suspends every encrypted OS/fixed-data BitLocker
+                volume for two reboots. Combined Stage 3+4, Stage 3-only, and
+                Stage 4-only paths share the same safety boundary. A suspension
+                failure blocks a new irreversible trigger, and the affected
+                volumes/results are reported in a separate card section and log.
+                A shared pre-mode/post-repair manifest pass also applies this
+                protection in Passive/Audit mode when Stage 3/4 bits were pushed
+                by Windows Update, policy, or another tool; audit remains non-enforcing.
+              - Replaced the runtime-compiled native UEFI attribute reader with
+                the Attributes property already returned by Windows' inbox
+                Get-SecureBootUEFI cmdlet during the existing db read. This
+                removes custom native interop and token-privilege manipulation
+                while preserving the original RUNTIME_ACCESS (0x04),
+                TIME_BASED_AUTHENTICATED_WRITE_ACCESS (0x20), KEK authority,
+                $dbIsOsWritable, Event 1795, PK, state, and SVN logic unchanged.
+              - Bumped the SVN baseline version from 7.0 to 8.0 following the
+                release of version 9.0 in June, 2026.
     05-26-2026: Post-compliance variable-cert refresh no longer reports as a
                 regression. Compliance requires only the two db certs
                 Windows UEFI CA 2023 + Microsoft UEFI CA 2023 (plus KEK 2023);
@@ -576,9 +595,9 @@
         - Reference: https://support.microsoft.com/en-us/topic/updating-windows-bootable-media-to-use-the-pca2023-signed-boot-manager-d4064779-0e4e-43ac-b2ce-24f434fcfa0f
       
       UEFI variable attributes (passive, read-only):
-        - Uses GetFirmwareEnvironmentVariableExA (P/Invoke) with
-          SeSystemEnvironmentPrivilege to read the db variable attributes under the
-          EFI Image Security Database GUID.
+        - Reuses the Attributes property returned by Windows' inbox
+          Get-SecureBootUEFI cmdlet during the existing db read. No custom native
+          interop or direct token-privilege manipulation is used.
         - Checks for RUNTIME_ACCESS (0x04) and TIME_BASED_AUTHENTICATED_WRITE_ACCESS (0x20).
         - Combined with the KEK 2023 check, determines whether Windows Update can
           effectively write to the BIOS cert db from the OS.
@@ -650,7 +669,7 @@
                                   OS update triggered where applicable
       8. Pending (Trigger)      - OS-side update triggered; monitoring for event progression,
                                   with reboot detection if stalled
-
+    
     SVN sub-state overlays (can decorate any of the above when Secure Boot is Enabled):
       - (Pending SVN Update)     amber - firmware at a prior SVN, 1-2 components missing
                                  the next increment; reboot will absorb.
@@ -719,6 +738,17 @@
           For enterprise & environments, it is reccommended to enforce SVN for
           security purposes. Test 
 
+.PARAMETER SuspendBitlockerForSVN
+    Controls automatic BitLocker suspension immediately before irreversible SVN
+    Stage 3 and/or Stage 4 processing. Switch/checkbox; default: $true
+    (or env:suspendBitlockerForSVN when supplied by NinjaRMM).
+    
+    When enabled, every encrypted OperatingSystem and FixedData volume
+    reported by Get-BitLockerVolume is suspended with RebootCount 2. This applies
+    to combined Stage 3+4, Stage 3-only, Stage 4-only, and already-pending Stage
+    3/4 manifest bits regardless of whether enforcement is Active or Passive/Audit.
+    Volumes and failures are reported in the status card/log.
+
 .PARAMETER IncludeDefaultHive
     Switch: Include the Default user profile template (C:\Users\Default) when applying
     per-user telemetry keys. Only effective when running as SYSTEM. Default: $false.
@@ -753,6 +783,10 @@ param(
     # "Passive" = audit only; report current stage; wait for Microsoft's scheduled enforcement (Step 3, June 2026 - Step 4, 2027)
     [ValidateSet('Enforce SVN','Passive')]
     [string]$EnforceSvnCompliance = $(if ($env:enforceSvnCompliance) { $env:enforceSvnCompliance } else { 'Passive' }), # Optional Ninja Script Variable; Drop-down
+    
+    # BitLocker safety for irreversible SVN stages (Stage 3/4 only)
+    # Checked/enabled suspends all encrypted OS/fixed-data volumes for two reboots
+    [switch]$SuspendBitlockerForSVN = $(if ($env:suspendBitlockerForSVN) { [Convert]::ToBoolean($env:suspendBitlockerForSVN) } else { $true }), # Optional Ninja Script Variable; Checkbox
     
     # Boot media deep scan: enumerate WIM images inside USB/recovery media for 2011-signed bootmgr
     # Off by default (surface-level EFI file check is fast; WIM scanning requires DISM and is slow)
@@ -1986,6 +2020,88 @@ Skip this step if every setting was already correct - no BIOS change means no PC
         return $lines
     }
     
+    # =======================================================================
+    # SVN BITLOCKER SAFETY CARD SECTION
+    # =======================================================================
+    function Build-SvnBitLockerSection {
+        param (
+            [string]$Format,
+            $Result
+        )
+        
+        if ($null -eq $Result) { return $null }
+        
+        $status = [string]$Result.Status
+        $statusLine = switch ($status) {
+            'Suspended' {
+                "$(Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format) BitLocker safety window prepared"
+            }
+            'SuspendedWithExisting' {
+                "$(Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format) BitLocker safety window prepared"
+            }
+            'AlreadySuspended' {
+                "$(Format-CardIcon -Type 'info' -Color '#3B82F6' -Format $Format) Eligible volumes were already suspended"
+            }
+            'NoProtectedVolumes' {
+                "$(Format-CardIcon -Type 'check' -Color '#26A644' -Format $Format) No encrypted OS/fixed-data BitLocker volumes found"
+            }
+            'Disabled' {
+                "$(Format-CardIcon -Type 'warning' -Color '#F59E0B' -Format $Format) Automatic suspension disabled by SuspendBitlockerForSVN"
+            }
+            'Failed' {
+                if ($Result.PendingManifest) {
+                    "$(Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format) BitLocker suspension failed - Stage 3/4 is already pending; do not reboot"
+                }
+                else {
+                    "$(Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format) BitLocker suspension failed - Stage 3/4 trigger blocked"
+                }
+            }
+            'UnsafeManifest' {
+                "$(Format-CardIcon -Type 'times' -Color '#D9534F' -Format $Format) Unsafe Stage 3/4 bits could not be cleared - task blocked; do not reboot"
+            }
+            default {
+                if (-not $Result.Enabled) {
+                    "$(Format-CardIcon -Type 'warning' -Color '#F59E0B' -Format $Format) Automatic suspension is disabled; no Stage 3/4 bits require action this run"
+                }
+                else {
+                    "$(Format-CardIcon -Type 'info' -Color '#6B7280' -Format $Format) No Stage 3/4 BitLocker suspension required this run"
+                }
+            }
+        }
+        
+        $lines = @($statusLine)
+        $stages = @($Result.Stages | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        if ($stages.Count -gt 0) {
+            $lines += "&nbsp;&nbsp;&bull; SVN operation: $($stages -join ' + ')"
+        }
+        
+        $suspended = @($Result.SuspendedVolumes | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        if ($suspended.Count -gt 0) {
+            $rebootCount = [int]$Result.RebootCount
+            $lines += "&nbsp;&nbsp;&bull; Suspended for $rebootCount reboots: $($suspended -join ', ')"
+        }
+        
+        $alreadySuspended = @($Result.AlreadySuspendedVolumes | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        if ($alreadySuspended.Count -gt 0) {
+            $lines += "&nbsp;&nbsp;&bull; Already suspended (left unchanged): $($alreadySuspended -join ', ')"
+        }
+        
+        $skipped = @($Result.SkippedVolumes | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        if ($skipped.Count -gt 0) {
+            $lines += "&nbsp;&nbsp;&bull; Skipped: $($skipped -join ', ')"
+        }
+        
+        $failed = @($Result.FailedVolumes | ForEach-Object { [System.Net.WebUtility]::HtmlEncode([string]$_) })
+        if ($failed.Count -gt 0) {
+            $lines += "<span style='color:#D9534F;'>&nbsp;&nbsp;&bull; Failed: $($failed -join ', ')</span>"
+        }
+        
+        return Join-CardLines -Lines $lines -Format $Format
+    }
+    # =======================================================================
+    # END SVN BITLOCKER SAFETY CARD SECTION
+    # =======================================================================
+    
     # Helper function: Build SVN compliance section for card display
     function Build-SvnComplianceSection {
         param ([string]$Format)
@@ -2597,9 +2713,9 @@ Skip this step if every setting was already correct - no BIOS change means no PC
     # Microsoft pushes a newer-than-enforcement-target SVN into the staged file.
     #
     # Bump these values as their SVNs increase.
-    # Last SVN iteration check: April 29th 2026
+    # Last SVN iteration check: 9.0 - June 2026
     $script:SVN_COMPLIANCE_FLOORS = @{
-        BootMgr = '7.0'
+        BootMgr = '8.0'
         CdBoot  = '3.0'
         WdsMgr  = '3.0'
     }
@@ -3387,14 +3503,16 @@ Skip this step if every setting was already correct - no BIOS change means no PC
         )
         # Step 1: always fetch raw bytes first. If this fails, the variable is
         # unavailable on this device. Nothing else will work either, bail early.
-        $rawBytes = $null
+        $rawBytes      = $null
+        $rawAttributes = $null
         try {
-            $uefiVar  = Get-SecureBootUEFI -Name $Name -ErrorAction Stop
-            $rawBytes = $uefiVar.Bytes
+            $uefiVar       = Get-SecureBootUEFI -Name $Name -ErrorAction Stop
+            $rawBytes      = $uefiVar.Bytes
+            $rawAttributes = $uefiVar.Attributes
         }
         catch {
             Write-Log "WARNING" "Failed to read UEFI variable '$Name': $($_.Exception.Message)"
-            return @{ Certs = @(); Bytes = $null; UsedDecoded = $false }
+            return @{ Certs = @(); Bytes = $null; Attributes = $null; UsedDecoded = $false }
         }
         
         # Step 2: prefer -Decoded for cert parsing when available.
@@ -3419,7 +3537,7 @@ Skip this step if every setting was already correct - no BIOS change means no PC
                 if ($certs.Count -gt 0) {
                     $skipped = $entries.Count - $certs.Count
                     if ($skipped -gt 0) { Write-Log "INFO" "$Name -Decoded: $($certs.Count) certs, $skipped hash entries skipped" }
-                    return @{ Certs = $certs; Bytes = $rawBytes; UsedDecoded = $true }
+                    return @{ Certs = $certs; Bytes = $rawBytes; Attributes = $rawAttributes; UsedDecoded = $true }
                 }
                 Write-Log "INFO" "-Decoded returned no certificate entries for $Name ($($entries.Count) hash-only entries), falling back to raw parse"
             }
@@ -3432,7 +3550,44 @@ Skip this step if every setting was already correct - no BIOS change means no PC
         # or it returned hash-only entries. Parse-UefiSignatureDatabase handles both
         # cases (returns @() when no certs are present).
         $certs = Parse-UefiSignatureDatabase -Bytes $rawBytes
-        return @{ Certs = $certs; Bytes = $rawBytes; UsedDecoded = $false }
+        return @{ Certs = $certs; Bytes = $rawBytes; Attributes = $rawAttributes; UsedDecoded = $false }
+    }
+    
+    # Test an attribute returned by the inbox Get-SecureBootUEFI cmdlet. The
+    # Attributes property is normally a flags enum, but the text fallback keeps
+    # the check compatible with hosts that expose its display-name representation.
+    function Test-UefiVariableAttribute {
+        param (
+            [AllowNull()]
+            $Attributes,
+            [Parameter(Mandatory = $true)]
+            [uint32]$Mask,
+            [Parameter(Mandatory = $true)]
+            [string]$DisplayName
+        )
+        
+        if ($null -eq $Attributes) { return $false }
+        
+        try {
+            if ($Attributes -is [System.Enum] -or
+                $Attributes -is [byte] -or
+                $Attributes -is [uint16] -or
+                $Attributes -is [uint32] -or
+                $Attributes -is [uint64] -or
+                $Attributes -is [int16] -or
+                $Attributes -is [int32] -or
+                $Attributes -is [int64]) {
+                return (([uint32]$Attributes -band $Mask) -ne 0)
+            }
+        }
+        catch {
+            # Fall through to the display-name representation.
+        }
+        
+        $attributeText = (@($Attributes) | ForEach-Object { [string]$_ }) -join ' '
+        $normalizedText = ($attributeText.ToUpperInvariant() -replace '[^A-Z0-9]+', ' ').Trim()
+        $normalizedName = ($DisplayName.ToUpperInvariant() -replace '[^A-Z0-9]+', ' ').Trim()
+        return $normalizedText -match ('(^| )' + [regex]::Escape($normalizedName) + '( |$)')
     }
     
     # Consolidated accessor that wraps Get-UefiDatabaseCerts with common post-processing:
@@ -3536,169 +3691,12 @@ Skip this step if every setting was already correct - no BIOS change means no PC
     ###########
     # Sources #
     ###########
+    # Get-SecureBootUEFI returns Name, Bytes, and Attributes through Windows'
+    # inbox Microsoft.SecureBoot.Commands module. The existing db read therefore
+    # provides the stored UEFI attribute flags without script-supplied native
+    # interop or direct token-privilege manipulation.
+    # https://learn.microsoft.com/en-us/powershell/module/secureboot/get-securebootuefi
     # https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-secure-boot-key-creation-and-management-guidance?view=windows-11#appendix-b--secure-boot-apis
-    # https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/security-policy-settings/modify-firmware-environment-values
-    # https://superuser.com/questions/1045279/use-bcdedit-to-configure-pxe-boot-as-default-boot-option
-    # https://www.powershellgallery.com/packages/Set-Privilege/1.0.1/Content/Set-Privilege.ps1
-    # https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfirmwareenvironmentvariablea
-    # https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfirmwareenvironmentvariableexa
-    # https://github.com/perturbed-platypus/UEFIReadCPP/blob/master/uefiCPP/uefiCPP.cpp
-    # https://tools.thehacker.recipes/mimikatz/modules/privilege/sysenv
-    # https://www.powershellgallery.com/packages/HP.ClientManagement/1.7.2/Content/HP.UEFI.psm1
-    # https://wikileaks.org/ciav7p1/cms/page_26968084.html
-    # https://docs.system-transparency.org/st-1.3.0/docs/reference/efi-variables/
-    
-    # New Helper function: Get UEFI variable attributes (passive check)
-    # P/Invoke setup for GetFirmwareEnvironmentVariableExA and token privilege management
-    Add-Type -MemberDefinition @"
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
-        public static extern uint GetFirmwareEnvironmentVariableExA(
-            string lpName,
-            string lpGuid,
-            byte[] pBuffer,
-            uint nSize,
-            ref uint pdwAttributes
-        );
-        
-        [DllImport("kernel32.dll")]
-        public static extern IntPtr GetCurrentProcess();
-        
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool CloseHandle(IntPtr hObject);
-        
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool OpenProcessToken(
-            IntPtr ProcessHandle,
-            uint DesiredAccess,
-            out IntPtr TokenHandle
-        );
-        
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool LookupPrivilegeValue(
-            string lpSystemName,
-            string lpName,
-            out long lpLuid
-        );
-        
-        [DllImport("advapi32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool AdjustTokenPrivileges(
-            IntPtr TokenHandle,
-            [MarshalAs(UnmanagedType.Bool)] bool DisableAllPrivileges,
-            ref TOKEN_PRIVILEGES NewState,
-            uint BufferLength,
-            IntPtr PreviousState,
-            IntPtr ReturnLength
-        );
-        
-        [StructLayout(LayoutKind.Sequential, Pack = 1)]
-        public struct TOKEN_PRIVILEGES {
-            public uint PrivilegeCount;
-            public long Luid;
-            public uint Attributes;
-        }
-"@ -Namespace Win32 -Name NativeMethods
-    
-    # Helper function: Enable SeSystemEnvironmentPrivilege for the current process token
-    # Required before calling GetFirmwareEnvironmentVariableExA (Error 1314 without it)
-    function Enable-SeSystemEnvironmentPrivilege {
-        $tokenHandle = [IntPtr]::Zero
-        try {
-            $processHandle = [Win32.NativeMethods]::GetCurrentProcess()
-            # TOKEN_ADJUST_PRIVILEGES (0x20) | TOKEN_QUERY (0x08)
-            if (-not [Win32.NativeMethods]::OpenProcessToken($processHandle, 0x0028, [ref]$tokenHandle)) {
-                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Log "WARNING" "OpenProcessToken failed: Win32 error $err"
-                return $false
-            }
-            
-            $luid = [long]0
-            if (-not [Win32.NativeMethods]::LookupPrivilegeValue($null, "SeSystemEnvironmentPrivilege", [ref]$luid)) {
-                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Log "WARNING" "LookupPrivilegeValue failed: Win32 error $err"
-                return $false
-            }
-            
-            $tp = New-Object Win32.NativeMethods+TOKEN_PRIVILEGES
-            $tp.PrivilegeCount = 1
-            $tp.Luid = $luid
-            $tp.Attributes = 2  # SE_PRIVILEGE_ENABLED
-            
-            if (-not [Win32.NativeMethods]::AdjustTokenPrivileges($tokenHandle, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero)) {
-                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                Write-Log "WARNING" "AdjustTokenPrivileges failed: Win32 error $err"
-                return $false
-            }
-            
-            # AdjustTokenPrivileges returns true even if not all privileges assigned (error 1300)
-            $lastErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            if ($lastErr -eq 1300) {
-                Write-Log "WARNING" "SeSystemEnvironmentPrivilege not held by this process token"
-                return $false
-            }
-            
-            Write-Log "INFO" "SeSystemEnvironmentPrivilege enabled successfully"
-            return $true
-        }
-        finally {
-            if ($tokenHandle -ne [IntPtr]::Zero) {
-                [Win32.NativeMethods]::CloseHandle($tokenHandle) | Out-Null
-            }
-        }
-    }
-    
-    # Utilize the invoke import
-    function Get-UefiVariableAttributes {
-        param (
-            [string]$VarName = "db",
-            [string]$Guid = "{d719b2cb-3d3a-4596-a3bc-dad00e67656f}"  # EFI_IMAGE_SECURITY_DATABASE_GUID (for db/dbx)
-        )
-        
-        # Enable SeSystemEnvironmentPrivilege (required for UEFI variable access)
-        $privEnabled = Enable-SeSystemEnvironmentPrivilege
-        if (-not $privEnabled) {
-            Write-Log "WARNING" "Could not enable SeSystemEnvironmentPrivilege; UEFI attributes check may fail"
-        }
-        
-        $buffer = New-Object byte[] 65536  # 64 KB - Dell/OEM db can exceed 4 KB
-        $attributes = [uint32]0
-        $result = [Win32.NativeMethods]::GetFirmwareEnvironmentVariableExA(
-            $VarName,
-            $Guid,
-            $buffer,
-            $buffer.Length,
-            [ref]$attributes
-        )
-        
-        if ($result -eq 0) {
-            $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            Write-Log "ERROR" "Failed to get $VarName attributes. Error: $errorCode (1=Invalid Function/legacy BIOS; 5=Access Denied; 122=Buffer too small; 1314=Privilege not held)"
-            return $null
-        }
-        
-        Write-Log "INFO" ("{0} attributes: 0x{1:X8}" -f $VarName, $attributes)
-        
-        # Interpret attributes
-        $hasRuntimeAccess = ($attributes -band 0x00000004) -ne 0  # OS can access at runtime
-        $hasTimeBasedAuth = ($attributes -band 0x00000020) -ne 0  # Authenticated writes supported (Windows handles signing)
-        $hasAppendWrite   = ($attributes -band 0x00000040) -ne 0  # Append write mode (not always reported in stored attributes)
-        
-        Write-Log "INFO" "Runtime Access: $hasRuntimeAccess (OS can access UEFI var at runtime)"
-        Write-Log "INFO" "Time-Based Authenticated Write: $hasTimeBasedAuth (Windows can sign and push updates)"
-        if ($hasAppendWrite) { Write-Log "INFO" "Append Write: True (firmware reports append mode)" }
-        
-        if ($hasRuntimeAccess -and $hasTimeBasedAuth) {
-            Write-Log "SUCCESS" "$VarName is runtime-writable via authenticated updates`n    Windows is CAPABLE of (and eventually will) update the cert without a manual BIOS upgrade"
-        }
-        else {
-            Write-Log "WARNING" "$VarName may not be writable from Windows (missing Runtime Access or Authenticated Write)"
-        }
-        
-        return $attributes
-    }
     
     # -----------------------------------------------
     # Secure Boot Event ID Reference (Microsoft-Windows-TPM-WMI)
@@ -4969,6 +4967,162 @@ Skip this step if every setting was already correct - no BIOS change means no PC
     }
     
     # =======================================================================
+    # SVN BITLOCKER SAFETY BOUNDARY
+    # =======================================================================
+    # Runs only when Stage 3 and/or Stage 4 will be newly triggered or their
+    # manifest bits are already pending reboot. Stages 1/2 and Passive/Audit runs
+    # without pending Stage 3/4 bits do not enter this function. Volume selection is
+    # aligned with the requested SVN safety scope: OS and fixed-data volumes
+    # are handled (including USB-connected FixedData); removable volumes are excluded.
+    function New-SvnBitLockerSafetyResult {
+        param (
+            [bool]$Enabled = $true,
+            [ValidateRange(1,15)]
+            [int]$RebootCount = 2,
+            [string[]]$Stages = @()
+        )
+
+        return [ordered]@{
+            Status                  = 'NotRequired'
+            Enabled                 = $Enabled
+            RebootCount             = $RebootCount
+            Stages                  = @($Stages)
+            EligibleVolumes         = @()
+            SuspendedVolumes        = @()
+            AlreadySuspendedVolumes = @()
+            SkippedVolumes          = @()
+            FailedVolumes           = @()
+            CanProceed              = $true
+            PendingManifest         = $false
+            UnsafePendingManifest   = $false
+        }
+    }
+    
+    function Suspend-SystemBitLockerVolumesForSvn {
+        param (
+            [bool]$Enabled = $true,
+            [ValidateRange(1,15)]
+            [int]$RebootCount = 2,
+            [string[]]$Stages = @()
+        )
+        
+        $result = New-SvnBitLockerSafetyResult -Enabled $Enabled -RebootCount $RebootCount -Stages $Stages
+        
+        Write-Host "`n ==================================================================="
+        Write-Host " ===       SVN Stage 3/4 BitLocker Safety Boundary               ==="
+        Write-Host " ==================================================================="
+        Write-Log "INFO" "SVN BitLocker safety requested for $($Stages -join ' + ') (two-reboots)"
+        
+        if (-not $Enabled) {
+            $result.Status = 'Disabled'
+            Write-Log "WARNING" "SuspendBitlockerForSVN is Disabled; continuing without automatic suspension"
+            return $result
+        }
+        
+        if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) -or
+            -not (Get-Command Suspend-BitLocker -ErrorAction SilentlyContinue)) {
+            $result.Status = 'Failed'
+            $result.CanProceed = $false
+            $result.FailedVolumes += 'BitLocker PowerShell cmdlets unavailable'
+            Write-Log "ERROR" "Cannot verify or suspend BitLocker volumes; Stage 3/4 trigger is blocked"
+            return $result
+        }
+        
+        try {
+            $allVolumes = @(Get-BitLockerVolume -ErrorAction Stop)
+        }
+        catch {
+            $result.Status = 'Failed'
+            $result.CanProceed = $false
+            $result.FailedVolumes += "Volume enumeration failed: $($_.Exception.Message)"
+            Write-Log "ERROR" "Failed to enumerate BitLocker volumes: $($_.Exception.Message)"
+            return $result
+        }
+        
+        $systemVolumes = @($allVolumes | Where-Object {
+            ([string]$_.VolumeType) -in @('OperatingSystem','FixedData')
+        })
+        
+        foreach ($volume in $systemVolumes) {
+            $mountPoint       = [string]$volume.MountPoint
+            $volumeStatus     = [string]$volume.VolumeStatus
+            $protectionStatus = [string]$volume.ProtectionStatus
+            
+            if ($volumeStatus -eq 'FullyDecrypted') {
+                if (-not [string]::IsNullOrWhiteSpace($mountPoint)) {
+                    $result.SkippedVolumes += "$mountPoint (not encrypted)"
+                }
+                continue
+            }
+            
+            if ([string]::IsNullOrWhiteSpace($mountPoint)) {
+                $result.FailedVolumes += '<unmounted encrypted system volume>'
+                Write-Log "ERROR" "Found an encrypted internal BitLocker volume without a mount point; cannot suspend it"
+                continue
+            }
+            
+            $result.EligibleVolumes += $mountPoint
+            
+            if ($volumeStatus -eq 'EncryptionInProgress') {
+                $result.FailedVolumes += "$mountPoint (encryption in progress)"
+                Write-Log "ERROR" "Cannot suspend $mountPoint while BitLocker encryption is in progress"
+                continue
+            }
+            
+            if ($protectionStatus -in @('Off','Suspended')) {
+                $result.AlreadySuspendedVolumes += $mountPoint
+                Write-Log "INFO" "BitLocker protection is already suspended on $mountPoint; existing suspension left in place"
+                continue
+            }
+            
+            if ($protectionStatus -ne 'On') {
+                $result.FailedVolumes += "$mountPoint (protection status: $protectionStatus)"
+                Write-Log "ERROR" "Cannot safely classify BitLocker protection on $mountPoint (status: $protectionStatus)"
+                continue
+            }
+            
+            try {
+                Suspend-BitLocker -MountPoint $mountPoint -RebootCount $RebootCount -Confirm:$false -ErrorAction Stop -InformationAction SilentlyContinue | Out-Null
+                $refreshed = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+                if ([string]$refreshed.ProtectionStatus -notin @('Off','Suspended')) {
+                    throw "Protection status remained $($refreshed.ProtectionStatus) after Suspend-BitLocker"
+                }
+                $result.SuspendedVolumes += $mountPoint
+                Write-Log "SUCCESS" "BitLocker suspended on $mountPoint for $RebootCount reboots"
+            }
+            catch {
+                $result.FailedVolumes += "$mountPoint ($($_.Exception.Message))"
+                Write-Log "ERROR" "Failed to suspend BitLocker on ${mountPoint}: $($_.Exception.Message)"
+            }
+        }
+        
+        if ($result.FailedVolumes.Count -gt 0) {
+            $result.Status = 'Failed'
+            $result.CanProceed = $false
+            Write-Log "ERROR" "BitLocker suspension failed for one or more system volumes; a new Stage 3/4 trigger will not be written"
+        }
+        elseif ($result.SuspendedVolumes.Count -gt 0 -and $result.AlreadySuspendedVolumes.Count -gt 0) {
+            $result.Status = 'SuspendedWithExisting'
+        }
+        elseif ($result.SuspendedVolumes.Count -gt 0) {
+            $result.Status = 'Suspended'
+        }
+        elseif ($result.AlreadySuspendedVolumes.Count -gt 0) {
+            $result.Status = 'AlreadySuspended'
+        }
+        else {
+            $result.Status = 'NoProtectedVolumes'
+            Write-Log "INFO" "No encrypted internal BitLocker volumes require suspension"
+        }
+        
+        return $result
+    }
+    
+    # =======================================================================
+    # END SVN BITLOCKER SAFETY BOUNDARY
+    # =======================================================================
+    
+    # =======================================================================
     # SVN Enforcement Function
     # =======================================================================
     # Applies the KB5025885 Secure Boot hardening mitigations (CVE-2023-24932 enterprise deployment guidance).
@@ -4994,10 +5148,18 @@ Skip this step if every setting was already correct - no BIOS change means no PC
             [hashtable]$CertStatus,
             [byte[]]$DbxBytes,
             [array]$Ca2011RevokedInDbx,
-            [string[]]$DbCertsFound = @()
+            [string[]]$DbCertsFound = @(),
+            [bool]$SuspendBitlockerForSVN = $true,
+            $InitialBitLockerSuspension = $null
         )
         
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot"
+        $initialSafetyResult = if ($null -ne $InitialBitLockerSuspension) {
+            $InitialBitLockerSuspension
+        }
+        else {
+            New-SvnBitLockerSafetyResult -Enabled $SuspendBitlockerForSVN -RebootCount 2
+        }
         $results = [ordered]@{
             Mitigation1 = $null   # DB cert
             Mitigation2 = $null   # Boot manager
@@ -5011,6 +5173,33 @@ Skip this step if every setting was already correct - no BIOS change means no PC
             SupplementaryCertsAttempted = $false
             ActionsApplied = @()
             ActionsSkipped = @()
+            BitLockerSuspension = $initialSafetyResult
+        }
+
+        # A pre-existing Stage 3/4 manifest is evaluated before this function is
+        # called. If BitLocker preparation failed, do not trigger any Secure Boot
+        # task: it could process those already-pending irreversible bits.
+        if ($results.BitLockerSuspension.PendingManifest -and
+            ($results.BitLockerSuspension.UnsafePendingManifest -or -not $results.BitLockerSuspension.CanProceed)) {
+            $preflightBlockReason = if ($results.BitLockerSuspension.UnsafePendingManifest) {
+                'Stage 1/2 prerequisites incomplete and pending Stage 3/4 bits could not be cleared'
+            }
+            else {
+                'BitLocker suspension failed; pending Stage 3/4 bits must not be processed'
+            }
+            if (@($results.BitLockerSuspension.Stages) -contains 'Stage 3') {
+                $results.Mitigation3 = 'Blocked'
+                $results.Mitigation3BlockedReason = $preflightBlockReason
+                $results.ActionsSkipped += 'Mitigation 3 (pending manifest; safety preflight blocked)'
+            }
+            if (@($results.BitLockerSuspension.Stages) -contains 'Stage 4') {
+                $results.Mitigation4 = 'Blocked'
+                $results.Mitigation4BlockedReason = $preflightBlockReason
+                $results.ActionsSkipped += 'Mitigation 4 (pending manifest; safety preflight blocked)'
+            }
+            $results.RebootRequired = $true
+            Write-Log "ERROR" "SVN Enforcement stopped before task trigger: $preflightBlockReason. DO NOT REBOOT."
+            return $results
         }
         
         # --- Pre-flight: trigger scheduled task to capture post-reboot events ---
@@ -5288,20 +5477,57 @@ Skip this step if every setting was already correct - no BIOS change means no PC
         elseif ((-not $mit3Done -and $prereqs.Stage3BitPending) -or (-not $mit4Done -and $prereqs.Stage4BitPending)) {
             # Bits already in manifest, just waiting for reboot - don't re-trigger
             $pendingParts = @()
-            if (-not $mit3Done -and $prereqs.Stage3BitPending) { $pendingParts += 'Mitigation 3 (0x80)' }
-            if (-not $mit4Done -and $prereqs.Stage4BitPending) { $pendingParts += 'Mitigation 4 (0x200)' }
-            Write-Log "INFO" "Mitigation 3+4: Already pending in manifest ($($pendingParts -join ', ')) - reboot required to finalize"
-            if (-not $mit3Done) {
-                $results.Mitigation3 = 'PendingReboot'
-                $results.ActionsSkipped += 'Mitigation 3 (pending reboot)'
-            } else {
+            $pendingStages = @()
+            if (-not $mit3Done -and $prereqs.Stage3BitPending) {
+                $pendingParts += 'Mitigation 3 (0x80)'
+                $pendingStages += 'Stage 3'
+            }
+            if (-not $mit4Done -and $prereqs.Stage4BitPending) {
+                $pendingParts += 'Mitigation 4 (0x200)'
+                $pendingStages += 'Stage 4'
+            }
+            Write-Log "INFO" "SVN enforcement: Already pending in manifest ($($pendingParts -join ', ')) - reboot required to finalize"
+            if ($results.BitLockerSuspension.Status -eq 'NotRequired') {
+                $results.BitLockerSuspension = Suspend-SystemBitLockerVolumesForSvn `
+                    -Enabled $SuspendBitlockerForSVN `
+                    -RebootCount 2 `
+                    -Stages $pendingStages
+            }
+            $results.BitLockerSuspension.PendingManifest = $true
+            
+            $bitLockerReady = $results.BitLockerSuspension.CanProceed
+            $bitLockerBlockReason = 'BitLocker suspension failed; do not reboot until the failed volumes are protected or manually suspended'
+            if (-not $bitLockerReady) {
+                Write-Log "ERROR" "Stage 3/4 bits are already pending, but BitLocker safety preparation failed. Do not reboot this device until resolved."
+            }
+            
+            if (-not $mit3Done -and $prereqs.Stage3BitPending) {
+                if ($bitLockerReady) {
+                    $results.Mitigation3 = 'PendingReboot'
+                    $results.ActionsSkipped += 'Mitigation 3 (pending reboot)'
+                }
+                else {
+                    $results.Mitigation3 = 'Blocked'
+                    $results.Mitigation3BlockedReason = $bitLockerBlockReason
+                    $results.ActionsSkipped += 'Mitigation 3 (pending manifest; BitLocker suspension failed)'
+                }
+            }
+            elseif ($mit3Done) {
                 $results.Mitigation3 = 'AlreadyApplied'
                 $results.ActionsSkipped += 'Mitigation 3 (2011 revocation)'
             }
-            if (-not $mit4Done) {
-                $results.Mitigation4 = 'PendingReboot'
-                $results.ActionsSkipped += 'Mitigation 4 (pending reboot)'
-            } else {
+            if (-not $mit4Done -and $prereqs.Stage4BitPending) {
+                if ($bitLockerReady) {
+                    $results.Mitigation4 = 'PendingReboot'
+                    $results.ActionsSkipped += 'Mitigation 4 (pending reboot)'
+                }
+                else {
+                    $results.Mitigation4 = 'Blocked'
+                    $results.Mitigation4BlockedReason = $bitLockerBlockReason
+                    $results.ActionsSkipped += 'Mitigation 4 (pending manifest; BitLocker suspension failed)'
+                }
+            }
+            elseif ($mit4Done) {
                 $results.Mitigation4 = 'AlreadyApplied'
                 $results.ActionsSkipped += 'Mitigation 4 (SVN update)'
             }
@@ -5313,71 +5539,103 @@ Skip this step if every setting was already correct - no BIOS change means no PC
                 # Apply both together (0x280) per CVE-2023-24932 enterprise guidance
                 $triggerValue = 0x280
                 $desc = "Mitigation 3+4 combined (revoke 2011 CA + apply SVN) (0x280)"
+                $targetStages = @('Stage 3','Stage 4')
             }
             elseif (-not $mit3Done) {
                 $triggerValue = 0x80
                 $desc = "Mitigation 3 only (revoke 2011 CA in DBX) (0x80)"
+                $targetStages = @('Stage 3')
             }
             else {
                 $triggerValue = 0x200
                 $desc = "Mitigation 4 only (apply SVN to DBX) (0x200)"
+                $targetStages = @('Stage 4')
             }
             
-            Write-Log "INFO" "$desc"
-            try {
-                # OR with current AvailableUpdates to preserve existing bits
-                $currentAv34 = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
-                                Select-Object -ExpandProperty 'AvailableUpdates' -ErrorAction SilentlyContinue)
-                if ($null -eq $currentAv34) { $currentAv34 = 0 }
-                $mergedValue = $currentAv34 -bor $triggerValue
-                if ($mergedValue -ne $triggerValue) {
-                    Write-Log "INFO" "Mitigation 3+4: OR with existing 0x$($currentAv34.ToString('X4')) = 0x$($mergedValue.ToString('X4'))"
-                }
-                $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedValue
-                $null = Trigger-SecureBootTask
-                Write-Log "SUCCESS" "Triggered $desc"
+            # Suspend immediately before the irreversible registry/task trigger. This
+            # covers combined Stage 3+4 as well as either stage applied by itself.
+            $results.BitLockerSuspension = Suspend-SystemBitLockerVolumesForSvn `
+                -Enabled $SuspendBitlockerForSVN `
+                -RebootCount 2 `
+                -Stages $targetStages
+            
+            if (-not $results.BitLockerSuspension.CanProceed) {
+                $bitLockerBlockReason = 'BitLocker suspension failed; Stage 3/4 trigger was not written'
+                Write-Log "ERROR" "$desc blocked: $bitLockerBlockReason"
                 if (-not $mit3Done) {
-                    $results.Mitigation3 = 'Applied'
-                    $results.ActionsApplied += 'Mitigation 3 (2011 revocation)'
+                    $results.Mitigation3 = 'Blocked'
+                    $results.Mitigation3BlockedReason = $bitLockerBlockReason
+                    $results.ActionsSkipped += 'Mitigation 3 (BitLocker suspension failed)'
                 }
                 else {
                     $results.Mitigation3 = 'AlreadyApplied'
                 }
                 if (-not $mit4Done) {
-                    $results.Mitigation4 = 'Applied'
-                    $results.ActionsApplied += 'Mitigation 4 (SVN update)'
+                    $results.Mitigation4 = 'Blocked'
+                    $results.Mitigation4BlockedReason = $bitLockerBlockReason
+                    $results.ActionsSkipped += 'Mitigation 4 (BitLocker suspension failed)'
                 }
                 else {
                     $results.Mitigation4 = 'AlreadyApplied'
                 }
-                $results.RebootRequired = $true
-                
-                Write-Log "INFO" "Waiting 30 seconds for update to process"
-                Start-Sleep -Seconds 30
-                
-                # Verify via event log
-                $postCheck1037 = @(Get-WinEvent -FilterHashtable @{
-                    LogName = 'System'; ProviderName = 'Microsoft-Windows-TPM-WMI'; Id = 1037
-                    StartTime = (Get-Date).AddMinutes(-2)
-                } -ErrorAction SilentlyContinue)
-                $postCheck1042 = @(Get-WinEvent -FilterHashtable @{
-                    LogName = 'System'; ProviderName = 'Microsoft-Windows-TPM-WMI'; Id = 1042
-                    StartTime = (Get-Date).AddMinutes(-2)
-                } -ErrorAction SilentlyContinue)
-                if ($postCheck1037.Count -gt 0) {
-                    Write-Log "SUCCESS" "Event 1037 confirmed - 2011 CA revoked in DBX"
-                }
-                if ($postCheck1042.Count -gt 0) {
-                    Write-Log "SUCCESS" "Event 1042 confirmed - SVN applied to DBX"
-                }
-                if ($postCheck1037.Count -eq 0 -and $postCheck1042.Count -eq 0) {
-                    Write-Log "INFO" "Events 1037/1042 not yet observed - reboot required to complete"
-                }
             }
-            catch {
-                Write-Log "ERROR" "Mitigation 3+4 failed: $($_.Exception.Message)"
-                if (-not $mit3Done) { $results.Mitigation3 = 'Failed' }
-                if (-not $mit4Done) { $results.Mitigation4 = 'Failed' }
+            else {
+                Write-Log "INFO" "$desc"
+                try {
+                    # OR with current AvailableUpdates to preserve existing bits
+                    $currentAv34 = (Get-ItemProperty -Path $regPath -Name 'AvailableUpdates' -ErrorAction SilentlyContinue |
+                                    Select-Object -ExpandProperty 'AvailableUpdates' -ErrorAction SilentlyContinue)
+                    if ($null -eq $currentAv34) { $currentAv34 = 0 }
+                    $mergedValue = $currentAv34 -bor $triggerValue
+                    if ($mergedValue -ne $triggerValue) {
+                        Write-Log "INFO" "Mitigation 3+4: OR with existing 0x$($currentAv34.ToString('X4')) = 0x$($mergedValue.ToString('X4'))"
+                    }
+                    $null = RegistryShouldBe -KeyPath $regPath -Name "AvailableUpdates" -Value $mergedValue
+                    $null = Trigger-SecureBootTask
+                    Write-Log "SUCCESS" "Triggered $desc"
+                    if (-not $mit3Done) {
+                        $results.Mitigation3 = 'Applied'
+                        $results.ActionsApplied += 'Mitigation 3 (2011 revocation)'
+                    }
+                    else {
+                        $results.Mitigation3 = 'AlreadyApplied'
+                    }
+                    if (-not $mit4Done) {
+                        $results.Mitigation4 = 'Applied'
+                        $results.ActionsApplied += 'Mitigation 4 (SVN update)'
+                    }
+                    else {
+                        $results.Mitigation4 = 'AlreadyApplied'
+                    }
+                    $results.RebootRequired = $true
+                    
+                    Write-Log "INFO" "Waiting 30 seconds for update to process"
+                    Start-Sleep -Seconds 30
+                    
+                    # Verify via event log
+                    $postCheck1037 = @(Get-WinEvent -FilterHashtable @{
+                        LogName = 'System'; ProviderName = 'Microsoft-Windows-TPM-WMI'; Id = 1037
+                        StartTime = (Get-Date).AddMinutes(-2)
+                    } -ErrorAction SilentlyContinue)
+                    $postCheck1042 = @(Get-WinEvent -FilterHashtable @{
+                        LogName = 'System'; ProviderName = 'Microsoft-Windows-TPM-WMI'; Id = 1042
+                        StartTime = (Get-Date).AddMinutes(-2)
+                    } -ErrorAction SilentlyContinue)
+                    if ($postCheck1037.Count -gt 0) {
+                        Write-Log "SUCCESS" "Event 1037 confirmed - 2011 CA revoked in DBX"
+                    }
+                    if ($postCheck1042.Count -gt 0) {
+                        Write-Log "SUCCESS" "Event 1042 confirmed - SVN applied to DBX"
+                    }
+                    if ($postCheck1037.Count -eq 0 -and $postCheck1042.Count -eq 0) {
+                        Write-Log "INFO" "Events 1037/1042 not yet observed - reboot required to complete"
+                    }
+                }
+                catch {
+                    Write-Log "ERROR" "Mitigation 3+4 failed: $($_.Exception.Message)"
+                    if (-not $mit3Done) { $results.Mitigation3 = 'Failed' }
+                    if (-not $mit4Done) { $results.Mitigation4 = 'Failed' }
+                }
             }
         }
         
@@ -5389,7 +5647,12 @@ Skip this step if every setting was already correct - no BIOS change means no PC
             Write-Log "INFO" "SVN Enforcement skipped: $($results.ActionsSkipped -join ', ')"
         }
         if ($results.RebootRequired) {
-            Write-Log "WARNING" "A reboot is required to complete the applied mitigations"
+            if ($results.BitLockerSuspension.Status -eq 'Failed' -and $results.BitLockerSuspension.PendingManifest) {
+                Write-Log "ERROR" "Stage 3/4 is pending, but this device MUST NOT REBOOT until the BitLocker suspension failures are resolved"
+            }
+            else {
+                Write-Log "WARNING" "A reboot is required to complete the applied mitigations"
+            }
         }
         
         return $results
@@ -5709,9 +5972,15 @@ process {
         
         # --- Passive UEFI variable attributes check for 'db' ---
         Write-Host "`n === Windows UEFI DB Access Check ==="
-        Write-Log "INFO" "Performing passive UEFI variable attributes check for 'db'"
-        $dbAttributes = Get-UefiVariableAttributes -VarName "db"
-        $uefiAllowsWrite = $null -ne $dbAttributes -and (($dbAttributes -band 0x00000004) -ne 0) -and (($dbAttributes -band 0x00000020) -ne 0)
+        Write-Log "INFO" "Reading passive UEFI variable attributes for 'db' from the inbox Get-SecureBootUEFI result"
+        $dbAttributes     = $dbResult.Attributes
+        $hasRuntimeAccess = Test-UefiVariableAttribute -Attributes $dbAttributes -Mask 0x00000004 -DisplayName 'RUNTIME ACCESS'
+        $hasTimeBasedAuth = Test-UefiVariableAttribute -Attributes $dbAttributes -Mask 0x00000020 -DisplayName 'TIME BASED AUTHENTICATED WRITE ACCESS'
+        $uefiAllowsWrite  = $null -ne $dbAttributes -and $hasRuntimeAccess -and $hasTimeBasedAuth
+        $dbAttributeDisplay = if ($null -eq $dbAttributes) { 'Unavailable' } else { (@($dbAttributes) -join ', ') }
+        Write-Log "INFO" "db attributes:`n$dbAttributeDisplay"
+        Write-Log "INFO" "Runtime Access: $hasRuntimeAccess (OS can access UEFI var at runtime)"
+        Write-Log "INFO" "Time-Based Authenticated Write: $hasTimeBasedAuth (Windows can sign and push updates)"
         
         # db is truly OS-writable only if UEFI attributes allow it AND the 2023 KEK authority is present
         # (KEK authorizes the signed payload Windows Update uses to write to db)
@@ -6160,6 +6429,45 @@ process {
     # Source: https://support.microsoft.com/en-us/topic/enterprise-deployment-guidance-for-cve-2023-24932-88b8f034-20b7-4a45-80cb-c6049b0f9967
     # =======================================================================
     $svnEnforcementResult = $null
+    $svnBitLockerSafetyResult = $null
+    if ($secureBoot -eq 'Enabled') {
+        $svnBitLockerSafetyResult = New-SvnBitLockerSafetyResult `
+            -Enabled ([bool]$SuspendBitlockerForSVN) `
+            -RebootCount 2
+        
+        # Handle pre-existing Stage 3/4 bits before Enforce mode can trigger the
+        # Secure-Boot-Update task. Unsafe premature bits are cleared first. Any
+        # unapplied bits that remain receive the same BitLocker protection in
+        # Enforce and Passive/Audit modes.
+        $preExistingSvnPrereqs = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
+        if (-not $preExistingSvnPrereqs.AllPrereqsMet -and
+            ($preExistingSvnPrereqs.Stage3BitPending -or $preExistingSvnPrereqs.Stage4BitPending)) {
+            Write-Log "WARNING" "Shared SVN safety: Premature Stage 3/4 bits detected before mode processing; attempting repair first"
+            $svnRepairResult = Repair-SvnEnforcement -Has2023InDb $has2023InDb -CertStatus $certStatus
+            $preExistingSvnPrereqs = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
+        }
+        
+        $preExistingPendingStages = @()
+        if ($preExistingSvnPrereqs.Stage3BitPending) { $preExistingPendingStages += 'Stage 3' }
+        if ($preExistingSvnPrereqs.Stage4BitPending) { $preExistingPendingStages += 'Stage 4' }
+        if ($preExistingPendingStages.Count -gt 0) {
+            Write-Log "WARNING" "Shared SVN safety: Pre-existing $($preExistingPendingStages -join ' + ') manifest bits detected; preparing BitLocker before mode processing"
+            $svnBitLockerSafetyResult = Suspend-SystemBitLockerVolumesForSvn `
+                -Enabled ([bool]$SuspendBitlockerForSVN) `
+                -RebootCount 2 `
+                -Stages $preExistingPendingStages
+            $svnBitLockerSafetyResult.PendingManifest = $true
+            if (-not $preExistingSvnPrereqs.AllPrereqsMet) {
+                $svnBitLockerSafetyResult.UnsafePendingManifest = $true
+                $svnBitLockerSafetyResult.Status = 'UnsafeManifest'
+                $svnBitLockerSafetyResult.CanProceed = $false
+                Write-Log "ERROR" "Shared SVN safety: Premature Stage 3/4 bits could not be cleared. No Secure Boot task will be triggered; DO NOT REBOOT."
+            }
+            elseif (-not $svnBitLockerSafetyResult.CanProceed) {
+                Write-Log "ERROR" "Shared SVN safety: Stage 3/4 bits remain pending, but BitLocker suspension failed. No Secure Boot task will be triggered; DO NOT REBOOT."
+            }
+        }
+    }
     $enforceMissingOptIn  = $false
     if ($EnforceSvnCompliance -eq 'Enforce SVN' -and $secureBoot -eq 'Enabled') {
         # Check if opt-in is set (Step 2.3 hasn't run yet, read directly)
@@ -6182,7 +6490,9 @@ process {
             -CertStatus       $certStatus `
             -DbxBytes         $dbxBytes `
             -Ca2011RevokedInDbx $ca2011RevokedInDbx `
-            -DbCertsFound     $dbCertsFound
+            -DbCertsFound     $dbCertsFound `
+            -SuspendBitlockerForSVN ([bool]$SuspendBitlockerForSVN) `
+            -InitialBitLockerSuspension $svnBitLockerSafetyResult
         
         # Re-query event log after enforcement to capture new events (1037, 1042, etc.)
         # This ensures the event log summary and card show the full up-to-date picture
@@ -6260,29 +6570,73 @@ process {
                 }
             }
         }
-        # Post-enforcement safety check: if Mitigation 3+4 were blocked but their bits
-        # exist in the manifest (from this run or a previous run), attempt to clear them
-        # before the next reboot processes them prematurely.
-        if ($null -ne $svnEnforcementResult -and
-            ($svnEnforcementResult.Mitigation3 -eq 'Blocked' -or $svnEnforcementResult.Mitigation4 -eq 'Blocked')) {
-            $repairCheck = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
-            if (-not $repairCheck.AllPrereqsMet -and ($repairCheck.Stage3BitPending -or $repairCheck.Stage4BitPending)) {
-                Write-Log "WARNING" "SVN Repair: Stage 3+4 bits in manifest but prerequisites not met - clearing to prevent premature application"
-                $svnRepairResult = Repair-SvnEnforcement -Has2023InDb $has2023InDb -CertStatus $certStatus
-            }
-        }
         Write-Host ""
     }
     elseif ($EnforceSvnCompliance -eq 'Passive' -and $secureBoot -eq 'Enabled') {
         Write-Log "INFO" "SVN Enforcement: Passive mode - audit only (Microsoft enforcement: June 2026 - 2027)"
-        # Safety check: even in passive mode, if Stage 3+4 bits are in the manifest
-        # but Stage 1+2 aren't complete, clear them to prevent premature application on reboot
-        $passivePrereqs = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
-        if (-not $passivePrereqs.AllPrereqsMet -and ($passivePrereqs.Stage3BitPending -or $passivePrereqs.Stage4BitPending)) {
-            Write-Log "WARNING" "SVN Repair (Passive): Stage 3+4 bits in manifest but prerequisites not met - clearing"
+        # Pre-existing pending-bit repair and BitLocker preparation already ran
+        # in the shared pre-mode safety pass above. No SVN enforcement is initiated.
+    }
+
+    # =======================================================================
+    # FINAL SHARED STAGE 3/4 BITLOCKER SAFETY RECONCILIATION
+    # =======================================================================
+    # This pass is deliberately outside the Enforce/Passive branches. It catches
+    # Stage 3/4 manifest bits written by this script, Windows Update, policy, or
+    # another management tool. The shared pre-mode pass already repaired and
+    # protected pre-existing bits; this final pass captures bits written or changed
+    # during active processing without enabling SVN enforcement in Passive mode.
+    if ($secureBoot -eq 'Enabled') {
+        if ($null -ne $svnEnforcementResult) {
+            $svnBitLockerSafetyResult = $svnEnforcementResult.BitLockerSuspension
+        }
+        
+        $sharedSvnPrereqs = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
+        if (-not $sharedSvnPrereqs.AllPrereqsMet -and
+            ($sharedSvnPrereqs.Stage3BitPending -or $sharedSvnPrereqs.Stage4BitPending) -and
+            -not $svnBitLockerSafetyResult.UnsafePendingManifest) {
+            Write-Log "WARNING" "Final shared SVN safety: Newly detected premature Stage 3/4 bits require repair"
             $svnRepairResult = Repair-SvnEnforcement -Has2023InDb $has2023InDb -CertStatus $certStatus
+            $sharedSvnPrereqs = Test-SvnStagePrerequisites -Has2023InDb $has2023InDb -CertStatus $certStatus
+        }
+        
+        $sharedPendingStages = @()
+        if ($sharedSvnPrereqs.Stage3BitPending) { $sharedPendingStages += 'Stage 3' }
+        if ($sharedSvnPrereqs.Stage4BitPending) { $sharedPendingStages += 'Stage 4' }
+        
+        if ($sharedPendingStages.Count -gt 0) {
+            $safetyAlreadyHandled = ($null -ne $svnBitLockerSafetyResult -and
+                                     $svnBitLockerSafetyResult.Status -ne 'NotRequired')
+            if (-not $safetyAlreadyHandled) {
+                Write-Log "WARNING" "Shared SVN safety: Pending $($sharedPendingStages -join ' + ') manifest bits detected; preparing BitLocker regardless of enforcement mode"
+                $svnBitLockerSafetyResult = Suspend-SystemBitLockerVolumesForSvn `
+                    -Enabled ([bool]$SuspendBitlockerForSVN) `
+                    -RebootCount 2 `
+                    -Stages $sharedPendingStages
+            }
+            
+            $svnBitLockerSafetyResult.PendingManifest = $true
+            if (-not $sharedSvnPrereqs.AllPrereqsMet) {
+                $svnBitLockerSafetyResult.UnsafePendingManifest = $true
+                $svnBitLockerSafetyResult.Status = 'UnsafeManifest'
+                $svnBitLockerSafetyResult.CanProceed = $false
+            }
+            
+            if ($null -ne $svnEnforcementResult) {
+                $svnEnforcementResult.BitLockerSuspension = $svnBitLockerSafetyResult
+            }
+            
+            if ($svnBitLockerSafetyResult.UnsafePendingManifest) {
+                Write-Log "ERROR" "Shared SVN safety: Unsafe Stage 3/4 bits remain after repair. DO NOT REBOOT until resolved."
+            }
+            elseif (-not $svnBitLockerSafetyResult.CanProceed) {
+                Write-Log "ERROR" "Shared SVN safety: Stage 3/4 bits remain pending, but BitLocker suspension failed. DO NOT REBOOT until resolved."
+            }
         }
     }
+    # =======================================================================
+    # END FINAL SHARED STAGE 3/4 BITLOCKER SAFETY RECONCILIATION
+    # =======================================================================
     
     # -----------------------------------------------
     # Step 2.25: Execute SecureBootAction if specified
@@ -6812,7 +7166,7 @@ end {
                     $detailRowHtml = '2023 db certs are present, but KEK 2K CA 2023 is missing<br />' +
                                      'and no PK-signed KEK 2023 update was found via Windows<br />' +
                                      'Update (Event 1803).<br /><br />' +
-                                     'This is a service gap rathern than a firmware or PK issue:<br />' +
+                                     'This is a service gap separate from a firmware or PK issue:<br />' +
                                      'the OEM has not yet published a PK-signed KEK 2023 update<br />' +
                                      'to Microsoft for WU to serve. Resolution requires the OEM<br />' +
                                      'to ship that KEK update (via WU or bundled in firmware).<br /><br />' +
@@ -7431,6 +7785,12 @@ end {
     if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
         $cardProperties[$svnSectionTitle] = Build-SvnComplianceSection -Format 'Html'
     }
+    if ($null -ne $svnBitLockerSafetyResult) {
+        $svnBitLockerContent = Build-SvnBitLockerSection -Format 'Html' -Result $svnBitLockerSafetyResult
+        if ($null -ne $svnBitLockerContent) {
+            $cardProperties['SVN BitLocker Safety'] = $svnBitLockerContent
+        }
+    }
     
     # Boot media check: runs regardless of state to catch outdated 2011-signed bootable USB/CD
     # attached to the device. Only emits a card section when outdated media is detected.
@@ -7626,6 +7986,12 @@ end {
         if ($secureBoot -eq 'Enabled' -and $null -ne $svnStatus) {
             $localCardProperties[(Convert-FaIconsToEmoji $svnSectionTitle)] = Convert-FaIconsToEmoji (Build-SvnComplianceSection -Format 'Html')
         }
+        if ($null -ne $svnBitLockerSafetyResult) {
+            $svnBitLockerContent = Build-SvnBitLockerSection -Format 'Html' -Result $svnBitLockerSafetyResult
+            if ($null -ne $svnBitLockerContent) {
+                $localCardProperties['SVN BitLocker Safety'] = Convert-FaIconsToEmoji $svnBitLockerContent
+            }
+        }
         # Boot Media - parity with Ninja card. Reuses the cached $bootMediaResult from Step 4.
         if ($null -ne $bootMediaResult -and $bootMediaResult.Outdated.Count -gt 0) {
             $localCardProperties['Boot Media'] = Convert-FaIconsToEmoji (Build-BootMediaSection -Format 'Html' -Result $bootMediaResult)
@@ -7810,10 +8176,51 @@ end {
             }
         }
         if ($null -ne $svnEnforcementResult) {
-            Write-Host "SVN Enforce : $($svnEnforcementResult.ActionsApplied.Count) applied, $($svnEnforcementResult.ActionsSkipped.Count) skipped$(if ($svnEnforcementResult.RebootRequired) { ' (reboot required)' })"
+            $svnRebootMessage = if ($svnEnforcementResult.RebootRequired -and
+                                    $null -ne $svnBitLockerSafetyResult -and
+                                    $svnBitLockerSafetyResult.UnsafePendingManifest) {
+                ' (DO NOT REBOOT - unsafe Stage 3/4 manifest)'
+            }
+            elseif ($svnEnforcementResult.RebootRequired -and
+                                    $null -ne $svnBitLockerSafetyResult -and
+                                    $svnBitLockerSafetyResult.Status -eq 'Failed' -and
+                                    $svnBitLockerSafetyResult.PendingManifest) {
+                ' (DO NOT REBOOT - BitLocker suspension failed)'
+            }
+            elseif ($svnEnforcementResult.RebootRequired) {
+                ' (reboot required)'
+            }
+            else {
+                ''
+            }
+            Write-Host "SVN Enforce : $($svnEnforcementResult.ActionsApplied.Count) applied, $($svnEnforcementResult.ActionsSkipped.Count) skipped$svnRebootMessage"
         }
         elseif ($EnforceSvnCompliance -eq 'Passive') {
             Write-Host "SVN Enforce : Passive (MS enforcement: June 2026 - 2027)"
+        }
+        if ($null -ne $svnBitLockerSafetyResult) {
+            $svnBitLockerConsoleStatus = if ($svnBitLockerSafetyResult.Status -eq 'NotRequired' -and -not $svnBitLockerSafetyResult.Enabled) {
+                'Disabled (no Stage 3/4 bits pending)'
+            }
+            else {
+                $svnBitLockerSafetyResult.Status
+            }
+            Write-Host "SVN BitLocker: $svnBitLockerConsoleStatus"
+            if (@($svnBitLockerSafetyResult.SuspendedVolumes).Count -gt 0) {
+                Write-Host "  Suspended : $($svnBitLockerSafetyResult.SuspendedVolumes -join ', ') ($($svnBitLockerSafetyResult.RebootCount) reboots)"
+            }
+            if (@($svnBitLockerSafetyResult.AlreadySuspendedVolumes).Count -gt 0) {
+                Write-Host "  Existing  : $($svnBitLockerSafetyResult.AlreadySuspendedVolumes -join ', ') (already suspended; left unchanged)"
+            }
+            if (@($svnBitLockerSafetyResult.FailedVolumes).Count -gt 0) {
+                Write-Host "  Failed    : $($svnBitLockerSafetyResult.FailedVolumes -join ', ')"
+            }
+            if ($svnBitLockerSafetyResult.UnsafePendingManifest) {
+                Write-Host "  WARNING   : Unsafe Stage 3/4 bits could not be cleared - DO NOT REBOOT"
+            }
+            elseif ($svnBitLockerSafetyResult.Status -eq 'Failed' -and $svnBitLockerSafetyResult.PendingManifest) {
+                Write-Host "  WARNING   : Stage 3/4 bits are already pending - DO NOT REBOOT until resolved"
+            }
         }
         if ($null -ne $optInStatus -and $null -ne $optInStatus.HighConfidenceOptOut -and $optInStatus.HighConfidenceOptOut -ne 0) {
             Write-Host "HC Opt-Out  : Yes"
