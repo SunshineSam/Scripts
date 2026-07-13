@@ -64,7 +64,7 @@ Controls whether the script actively applies Microsoft's Secure Boot hardening m
 | **Enforce SVN** | Applies all 4 mitigations in 2 step sequence, only when safe to do so. Checks current state first (won't re-apply what's already done). Has built-in prerequisite and BitLocker safety gates to prevent dangerous application. |
 | **Passive** | Audit only - reports which stage the device is at and what's left. Does **not** apply any mitigations, but **does** run a safety check to clean up any prematurely triggered bits. This is the recommended default until Microsoft begins enforcement (June 2026). |
 
-### `suspendBitlockerForSVN`
+### `suspendBitlockerForSvn`
 
 Controls the BitLocker safety boundary immediately before irreversible SVN Stage 3 and/or Stage 4 processing. This checkbox is checked (`$true`) by default.
 
@@ -82,7 +82,7 @@ Newly suspended volumes, already-suspended volumes, skipped unencrypted volumes,
 | **Variable**                | **Type**     | **Description**                                                                                       |
 |-----------------------------|--------------|-------------------------------------------------------------------------------------------------------|
 | **$enforceSvnCompliance**   | *dropdown*   | In **Passive** mode (default), runs a safety repair to clean up prematurely staged Stage 3/4 bits before the next reboot can process them. In **Enforce SVN** mode, applies mitigations only when strict prerequisites are met - see [SVN Enforcement](#svn-enforcement). |
-| **$suspendBitlockerForSVN** | *checkbox*   | **Checked by default.** Before combined Stage 3+4, Stage 3-only, or Stage 4-only processing, suspend all encrypted OS/fixed-data volumes for 2 reboots and report each affected volume. |
+| **$suspendBitlockerForSvn** | *checkbox*   | **Checked by default.** Before combined Stage 3+4, Stage 3-only, or Stage 4-only processing, suspend all encrypted OS/fixed-data volumes for 2 reboots and report each affected volume. |
 
 > **Stages 3 and 4 are irreversible.** Once the 2011 CAs are revoked (Stage 3) or SVN is written to firmware (Stage 4), there's no going back without a BIOS SecureBoot key reset. The safety gate is enforced automatically in both modes.
 >
@@ -489,7 +489,7 @@ Both the ground truth (is the cert there?) and the manifest (did Windows finish 
 
 ### BitLocker Safety Boundary
 
-With `$suspendBitlockerForSVN` checked (`$true`, the default), the script enumerates encrypted Operating System and Fixed Data BitLocker volumes immediately before Stage 3/4. It calls `Suspend-BitLocker` with `-RebootCount 2`, refreshes each volume, and verifies that protection is suspended before writing the irreversible `AvailableUpdates` bits.
+With `$suspendBitlockerForSvn` checked (`$true`, the default), the script enumerates encrypted Operating System and Fixed Data BitLocker volumes immediately before Stage 3/4. It calls `Suspend-BitLocker` with `-RebootCount 2`, refreshes each volume, and verifies that protection is suspended before writing the irreversible `AvailableUpdates` bits.
 
 The same boundary is used for combined Stage 3+4 (`0x280`), Stage 3-only (`0x80`), and Stage 4-only (`0x200`) operations. A shared manifest safety pass runs in both Enforce and Passive/Audit modes, so pending bits written by Microsoft/WU, policy, or another tool receive the same BitLocker protection. Passive/Audit still does not initiate SVN enforcement.
 
