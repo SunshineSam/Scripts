@@ -14,8 +14,6 @@
 - ✅ **Outputs formatted WYSIWYG/HTML cards** for fleet-wide visibility in NinjaRMM or local use-case
 
 > ⚙️ Gain full auditing insight to the firmware state, and reports exactly what (if anything) needs to happen next.
-
-> ⚠️ When running the script file locally without NinjaRMM (this is paired with -saveStatusLocal), please see [Local Run Fix](#️-running-local)
 ---
 
 ## 📦 Prerequisites
@@ -36,6 +34,7 @@ _Audits CA 2023 rotation state, optionally configures Windows Update opt-in or a
 |-----------------------------|--------------|-------------------------------------------------------------------------------------------------------|
 | **$securebootAction**       | *dropdown*   | Windows Update opt-in action: Enable, Remove, or Audit. See [`securebootAction`](#securebootaction).  |
 | **$enforceSvnCompliance**   | *dropdown*   | SVN hardening mode: Enforce SVN or Passive. See [`enforceSvnCompliance`](#enforcesvncompliance).      |
+| **$suspendBitlockerForSVN** | *checkbox*   | Suspend encrypted OS/fixed-data BitLocker volumes for two reboots before SVN Stage 3/4. Checked by default. |
 | **$saveStatusLocal**        | *switch*     | Save status card and plain-text summary to `C:\Logs\SecureBoot\`. Defaults to false.                  |
 | **$saveLogToDevice**        | *switch*     | Save a timestamped activity log to `C:\Logs\SecureBoot\SecureBootStatus.log`. Defaults to true.       |
 | **$includeDefaultHive**     | *switch*     | Apply per-user telemetry keys to the Default profile template (SYSTEM context only). Defaults to true.|
@@ -62,8 +61,19 @@ Controls whether the script actively applies Microsoft's Secure Boot hardening m
 
 | Value | What It Does |
 |-------|--------------|
-| **Enforce SVN** | Applies all 4 mitigations in 2 step sequence, only when safe to do so. Checks current state first (won't re-apply what's already done). Has built-in safety gates to prevent dangerous out-of-order application. **If you use BitLocker, make sure recovery keys are backed up first.** |
+| **Enforce SVN** | Applies all 4 mitigations in 2 step sequence, only when safe to do so. Checks current state first (won't re-apply what's already done). Has built-in prerequisite and BitLocker safety gates to prevent dangerous application. |
 | **Passive** | Audit only - reports which stage the device is at and what's left. Does **not** apply any mitigations, but **does** run a safety check to clean up any prematurely triggered bits. This is the recommended default until Microsoft begins enforcement (June 2026). |
+
+### `suspendBitlockerForSVN`
+
+Controls the BitLocker safety boundary immediately before irreversible SVN Stage 3 and/or Stage 4 processing. This checkbox is checked (`$true`) by default.
+
+| Value | What It Does |
+|-------|--------------|
+| **Checked (`$true`)** | Suspends every encrypted Operating System and Fixed Data BitLocker volume for **2 reboots** before writing a new Stage 3/4 trigger. It also prepares BitLocker whenever Stage 3 or Stage 4 bits are already pending in `AvailableUpdates`, including Microsoft/WU, policy, or third-party pushes detected during Passive/Audit. A failure blocks a new trigger; if bits are already pending, the script reports **do not reboot** until the failed volume is resolved. |
+| **Unchecked (`$false`)** | Leaves BitLocker unchanged and permits otherwise-safe SVN enforcement to continue. The status card and log clearly report that automatic suspension was disabled. |
+
+Newly suspended volumes, already-suspended volumes, skipped unencrypted volumes, and failures are reported separately in the **SVN BitLocker Safety** card section and console/log output. Existing suspensions are left unchanged rather than being silently reset.
 
 > **The certificate audit always runs** regardless of `$securebootAction`. That parameter controls only whether the script *also* configures the Windows Update opt-in flow. The audit itself is non-destructive.
 
@@ -72,10 +82,11 @@ Controls whether the script actively applies Microsoft's Secure Boot hardening m
 | **Variable**                | **Type**     | **Description**                                                                                       |
 |-----------------------------|--------------|-------------------------------------------------------------------------------------------------------|
 | **$enforceSvnCompliance**   | *dropdown*   | In **Passive** mode (default), runs a safety repair to clean up prematurely staged Stage 3/4 bits before the next reboot can process them. In **Enforce SVN** mode, applies mitigations only when strict prerequisites are met - see [SVN Enforcement](#svn-enforcement). |
+| **$suspendBitlockerForSVN** | *checkbox*   | **Checked by default.** Before combined Stage 3+4, Stage 3-only, or Stage 4-only processing, suspend all encrypted OS/fixed-data volumes for 2 reboots and report each affected volume. |
 
 > **Stages 3 and 4 are irreversible.** Once the 2011 CAs are revoked (Stage 3) or SVN is written to firmware (Stage 4), there's no going back without a BIOS SecureBoot key reset. The safety gate is enforced automatically in both modes.
 >
-> **BitLocker warning**: If the device uses BitLocker, ensure recovery keys are backed up before running in Enforce mode. Firmware changes can trigger recovery prompts on next boot.
+> **BitLocker safety**: With `$suspendBitlockerForSVN` checked, encrypted OS and fixed-data volumes are automatically suspended for 2 reboots at the Stage 3/4 safety boundary. Recovery keys should still be escrowed and verified before irreversible enforcement.
 
 ### 🔐 Custom-Field Options
 
@@ -255,7 +266,7 @@ Whenever Secure Boot is Enabled, the script parses every `dbx*.bin` file Windows
 | Status | Meaning |
 |--------|---------|
 | **matched** | Signature is present in firmware DBX - the revocation landed. |
-| **superseded** | SVN-keyed entry already covered by firmware. Two routes: (1) firmware SVN ≥ the staged entry's SVN (direct supersede), or (2) firmware SVN ≥ the documented [compliance floor](#svn-compliance-floor) for that component (floor supersede - prevents false flags when Microsoft pushes a staged file ahead of any actual enforcement bump, e.g. staged `8.0` while Stage 4 still enforces `7.0`). Not counted as missing. |
+| **superseded** | SVN-keyed entry already covered by firmware. Two routes: (1) firmware SVN ≥ the staged entry's SVN (direct supersede), or (2) firmware SVN ≥ the documented [compliance floor](#svn-compliance-floor) for that component (floor supersede - prevents false flags when Microsoft pushes a staged file ahead of any actual enforcement bump, e.g. staged `8.0` while Stage 4 still enforces `8.0`). Not counted as missing. |
 | **missing** | Signature is staged but firmware has not absorbed it yet. Deduped across `.bin` variants (Legacy twin counts once). |
 
 A per-file breakdown surfaces on the card when anything is outstanding, so operators can see which `.bin` didn't land.
@@ -271,7 +282,7 @@ When any of the three SVN-keyed entries (`BootMgr` / `CdBoot` / `WdsMgr`) are ou
 | **SVN Update Not Applied** | All 3 missing, firmware has a prior SVN, and `LastBootUpTime > max(Event 1034, Event 1042)` | Firmware booted after the DBX write and still refused the SVN. OEM BIOS/firmware update may be required - surfaced in red to override "Compliant". |
 | **Pending SVN Reboot** | All 3 missing, firmware has not booted past the DBX write yet | Staged update waiting on the next reboot. Generic catch-all - the three more-specific states above take precedence. |
 
-> **Floor takes precedence over all four states.** When firmware SVN ≥ the documented [compliance floor](#svn-compliance-floor), every staged-but-firmware-newer SVN entry is reclassified as `superseded` (route 2 in the DBX Validation table above). With nothing left in `MissingComponents`, none of the four states fire and no overlay is rendered - the device is simply Compliant. The staged-vs-firmware delta still shows on the card as `Staged SVN: 8.0` next to `Firmware SVN: 7.0`, but it's informational only.
+> **Floor takes precedence over all four states.** When firmware SVN ≥ the documented [compliance floor](#svn-compliance-floor), every staged-but-firmware-newer SVN entry is reclassified as `superseded` (route 2 in the DBX Validation table above). With nothing left in `MissingComponents`, none of the four states fire and no overlay is rendered - the device is simply Compliant. The staged-vs-firmware delta still shows on the card as `Staged SVN: 8.0` next to `Firmware SVN: 8.0`, but it's informational only.
 
 The pre-rollout branch is gated strictly on the SVN components having no firmware SVN. Unrelated missing hashes in `dbxupdate.bin` (a separate pre-1808 signal) do not block the reassurance - they surface under their own per-file row.
 
@@ -325,6 +336,8 @@ The script reads the UEFI `db` variable attributes using a low-level system call
 It checks two things:
 1. **UEFI attributes** - Does the firmware allow runtime writes? (`RUNTIME_ACCESS` + `TIME_BASED_AUTHENTICATED_WRITE_ACCESS`)
 2. **KEK authority** - Is the 2023 KEK present to sign the payload?
+
+The UEFI attributes come from the `Attributes` property returned by Windows' inbox `Get-SecureBootUEFI -Name db` cmdlet during the script's existing database read. The script does not compile native firmware or token-management code at runtime.
 
 If both pass, the machine is marked as OS-writable, which downgrades "Action Required" to "Action Optional" (Windows will handle it automatically).
 
@@ -388,17 +401,17 @@ The two raw-only components (`CdBoot` / `WdsMgr`) are useful as a parity readout
 
 #### SVN Compliance Floor
 
-Compliance is authoritative from `$script:SVN_COMPLIANCE_FLOORS` (default `7.0` for all three boot components, reviewed April 2026). **Firmware SVN ≥ floor → Compliant**, regardless of what value `DBXUpdateSVN.bin` happens to ship.
+Compliance is authoritative from `$script:SVN_COMPLIANCE_FLOORS` (default `8.0` for all three boot components, reviewed April 2026). **Firmware SVN ≥ floor → Compliant**, regardless of what value `DBXUpdateSVN.bin` happens to ship.
 
-This matters because Microsoft sometimes bumps the staged file's SVN ahead of any actual enforcement change (e.g. the file ships `8.0` while Stage 4 still enforces `7.0`). A device at the prior level is *at the enforcement target*, and must not be flagged as `(SVN Update Not Applied)` or `(Pending SVN Reboot)`. Bump the floor in the script per documented Microsoft milestones; one constant covers every consumer (the DBX classifier's "superseded" route 2, the headline compliance check, and the gate that suppresses the pending-reboot overlays).
+This matters because Microsoft sometimes bumps the staged file's SVN ahead of any actual enforcement change (e.g. the file ships `9.0` while Stage 4 still enforces `8.0`). This is per-model, and impossible to automate in a fleet, however the reccommended baseline as of current is 8.0. A device at the prior level is *at the enforcement target*, and must not be flagged as `(SVN Update Not Applied)` or `(Pending SVN Reboot)`. Bump the floor in the script per documented Microsoft milestones; one constant covers every consumer (the DBX classifier's "superseded" route 2, the headline compliance check, and the gate that suppresses the pending-reboot overlays).
 
 #### PowerShell#27058 - cmdlet bug + cmdlet narrative both quarantined
 
-[`Get-SecureBootSVN`](https://learn.microsoft.com/en-us/powershell/module/secureboot/get-securebootsvn?view=windowsserver2025-ps) returns the **DBX-order-last** BootMgr SVN entry instead of the numeric maximum. Symptom: `cmdlet=2.0` on a device the raw DBX clearly puts at `7.0`. The script:
+[`Get-SecureBootSVN`](https://learn.microsoft.com/en-us/powershell/module/secureboot/get-securebootsvn?view=windowsserver2025-ps) returns the **DBX-order-last** BootMgr SVN entry instead of the numeric maximum. Symptom: `cmdlet=2.0` on a device the raw DBX clearly puts at `8.0`. The script:
 
 1. **Replicates the cmdlet's parse logic** in `Get-DbxComponentSVNs` (mirrors [`SVN_Order.ps1`](https://github.com/microsoft/secureboot_objects) byte-for-byte: same GUID prefixes, same hex-substring SVN extraction, same `[version]` comparison) but does an explicit max-by-version select instead of letting DBX order decide.
 2. **Always uses the raw value** for `Firmware SVN` - the cmdlet's `FirmwareSVN` field is treated as untrusted on every device. When they disagree, a `WARNING` is logged with the `#27058` reference so the bug signature is visible in the audit trail.
-3. **Ignores the cmdlet's `ComplianceStatus` string** when the floor is met. The cmdlet computes its narrative ("Not compliant - Firmware does not match boot manager") from the same buggy `FirmwareSVN`, so a device at floor `7.0` would otherwise inherit a false "Not compliant" verdict. Floor met → script renders `Compliant (Firmware SVN 7.0 >= floor 7.0)` and the cmdlet's wording is dropped.
+3. **Ignores the cmdlet's `ComplianceStatus` string** when the floor is met. The cmdlet computes its narrative ("Not compliant - Firmware does not match boot manager") from the same buggy `FirmwareSVN`, so a device at floor `8.0` would otherwise inherit a false "Not compliant" verdict. Floor met → script renders `Compliant (Firmware SVN 8.0 >= floor 8.0)` and the cmdlet's wording is dropped.
 4. **Logs a per-component parity line every run**: `Raw DBX SVN per component (max-by-version): BootMgr=X | CdBoot=Y | WdsMgr=Z`. Identical format on every stage so the audit trail diffs cleanly against `SVN_Order.ps1` verbatim.
 
 > A fix is in flight on Microsoft's end (Secure Boot team confirmed; expected in an upcoming Windows monthly update). The workaround stays in place because the June 2026 enforcement deadline can't wait for that build to roll out fleet-wide.
@@ -474,6 +487,14 @@ The script enforces a strict prerequisite gate before allowing Mitigations 3+4:
 
 Both the ground truth (is the cert there?) and the manifest (did Windows finish processing it?) must pass. If anything fails, Mitigations 3+4 are blocked with a clear reason.
 
+### BitLocker Safety Boundary
+
+With `$suspendBitlockerForSVN` checked (`$true`, the default), the script enumerates encrypted Operating System and Fixed Data BitLocker volumes immediately before Stage 3/4. It calls `Suspend-BitLocker` with `-RebootCount 2`, refreshes each volume, and verifies that protection is suspended before writing the irreversible `AvailableUpdates` bits.
+
+The same boundary is used for combined Stage 3+4 (`0x280`), Stage 3-only (`0x80`), and Stage 4-only (`0x200`) operations. A shared manifest safety pass runs in both Enforce and Passive/Audit modes, so pending bits written by Microsoft/WU, policy, or another tool receive the same BitLocker protection. Passive/Audit still does not initiate SVN enforcement.
+
+Unsafe premature bits are repaired/cleared before either mode can trigger the Secure Boot task. Legitimate remaining bits honor the BitLocker checkbox. If an unsafe bit cannot be cleared, task execution is blocked and the script reports **do not reboot** regardless of the checkbox state; when suspension is enabled, BitLocker is also prepared as a fallback. A suspension failure with legitimate bits pending produces the same prominent warning. A failure during a new script-initiated operation prevents the Stage 3/4 registry/task trigger from being written.
+
 ### Safety Repair
 
 The script includes a repair function that runs automatically in **both Enforce and Passive modes**:
@@ -518,10 +539,10 @@ The script handles a lot of edge cases so you don't have to investigate them man
 - **Reboot correlation** - Confirms reboots happened between Event 1800 and 1799 using boot event cross-checks
 - **Three-way KEK logic** - Missing KEK with OS-writable = Action Optional; with Event 1803 (no PK-signed KEK 2023 update available via WU - awaiting OEM publication to Microsoft, or BIOS update) = Action Required; neither = Pending with opt-in guidance
 - **OEM-specific guidance** - BIOS update and key reset links for Dell, HP, Lenovo, ASUS, and Microsoft
-- **BitLocker warnings** - Surfaced before any key reset guidance
+- **BitLocker safety** - Automatically suspends encrypted OS/fixed-data volumes for 2 reboots at the Stage 3/4 boundary, blocks new triggers on failure, and reports each affected volume upstream
 - **SVN safety** - Stage 1+2 prerequisite gate, passive mode safety checks, post-enforcement repair, boot-time cross-reference for reboot-pending detection, three-way SVN miss classification (PendingUpdate / SvnNotApplied / PartialCommit) so "firmware refused after reboot" never hides behind "pending reboot"
 - **SVN firmware readout** - Works around [PowerShell#27058](https://github.com/PowerShell/PowerShell/issues/27058) by parsing the DBX bytes directly, picking the max by `[version]` across all three SVN-keyed GUIDs (BootMgr / CdBoot / WdsMgr) via the canonical `Get-DbxComponentSVNs` helper (mirrors [`SVN_Order.ps1`](https://github.com/microsoft/secureboot_objects) byte-for-byte). The cmdlet's `FirmwareSVN` is treated as untrusted on every device - the raw value always wins, with a `WARNING` logged on disagreement so the bug signature is visible. Card surfaces all five SVNs (Firmware / Boot Manager / Staged / CdBoot / WdsMgr) in the same shape regardless of cmdlet availability
-- **SVN compliance floor** - `$script:SVN_COMPLIANCE_FLOORS` (default `7.0` for BootMgr / CdBoot / WdsMgr) is the authoritative compliance signal, not the cmdlet's `ComplianceStatus` string. Floor met → `Compliant (Firmware SVN X >= floor Y)`. The floor also feeds the DBX classifier's "superseded" route 2 and gates the `(Pending SVN Reboot)` / `(SVN update pending)` overlays so a higher-numbered staged SVN doesn't generate false-flag callouts on already-compliant devices. Bump per documented Microsoft milestones
+- **SVN compliance floor** - `$script:SVN_COMPLIANCE_FLOORS` (default `8.0` for BootMgr / CdBoot / WdsMgr) is the authoritative compliance signal, not the cmdlet's `ComplianceStatus` string. Floor met → `Compliant (Firmware SVN X >= floor Y)`. The floor also feeds the DBX classifier's "superseded" route 2 and gates the `(Pending SVN Reboot)` / `(SVN update pending)` overlays so a higher-numbered staged SVN doesn't generate false-flag callouts on already-compliant devices. Bump per documented Microsoft milestones
 - **PK trust detection** - Parses the Platform Key and surfaces PKFail / CVE-2024-8105 (AMI Test PK) as a dedicated red **PK Untrusted** state that overrides "Compliant" - structural cert presence is moot when the chain of trust is broken
 - **PK-blocks-KEK signal** - When Event 1795 fires and the 2023 KEK is still missing on a *legitimate* OEM PK, the PK row is re-labeled "does not authorize KEK 2K CA 2023 - BIOS update required" so the real blocker is obvious (distinct from PKFail)
 - **Hypervisor-aware** - VMware (via PK owner GUID) and VirtualBox (via PK subject regex) guests are routed to a neutral **Virtualized** state instead of being false-flagged as Action Required
@@ -566,7 +587,7 @@ The status card is built from modular `Build-*` functions that accept a `-Format
 The `Get-UefiDatabaseCerts` function handles cert parsing transparently:
 - Uses `Get-SecureBootUEFI -Decoded` when available (KB5077241+)
 - Falls back to raw `EFI_SIGNATURE_LIST` byte parsing on older systems
-- Returns X509 certificate objects either way
+- Returns X509 certificate objects either way and preserves the inbox cmdlet's UEFI `Attributes` value for the passive OS-writability check
 
 ---
 
